@@ -26,7 +26,7 @@ build-tool:
 
 webapp:
 	cd $(WEB_DIR)
-	npm i --force @freenetorg/freenet-stdlib
+	npm install
 	npm run build
 	fdev build
 

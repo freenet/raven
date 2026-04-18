@@ -17,8 +17,6 @@ import {
 
 import "./scss/styles.scss";
 
-// import * as bootstrap from "bootstrap";
-
 function getDocument(): Document {
     if (document) {
         return document;
@@ -30,7 +28,7 @@ function getDocument(): Document {
 const DOCUMENT: Document = getDocument();
 
 
-const MODEL_CONTRACT = `${process.env.MODEL_CONTRACT}`;
+const MODEL_CONTRACT = __MODEL_CONTRACT__;
 const KEY = ContractKey.fromInstanceId(MODEL_CONTRACT);
 
 function getState(hostResponse: GetResponse) {
@@ -137,6 +135,8 @@ const handler = {
     onContractUpdate: (_up: UpdateResponse) => {
     },
     onContractUpdateNotification: getUpdateNotification,
+    onContractNotFound: (_instanceId: Uint8Array) => {
+    },
     onDelegateResponse: (_response: DelegateResponse) => {
     },
     onErr: (err: HostError) => {
