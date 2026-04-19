@@ -13,8 +13,10 @@ endif
 build: \
 	posts \
 	follows \
+	identity \
 	publish-posts \
 	publish-follows \
+	publish-identity \
 	webapp \
 	publish-webapp
 
@@ -58,6 +60,12 @@ publish-follows:
 
 identity:
 	cd $(IDENTITY_DIR) && fdev build --package-type delegate
+	hash=$$(fdev inspect $(IDENTITY_DIR)/build/freenet/freenet_microblogging_identity key | grep 'code key:' | cut -d' ' -f3) && \
+		echo "Delegate key: $$hash" && \
+		printf '%s' $$hash > $(WEB_DIR)/delegate_key.txt
+
+publish-identity:
+	fdev publish --code $(IDENTITY_DIR)/build/freenet/freenet_microblogging_identity delegate
 
 run-node:
 	RUST_BACKTRACE=1 RUST_LOG=freenet=debug,locutus_core=debug,locutus_node=debug,info freenet local --ws-api-address 127.0.0.1

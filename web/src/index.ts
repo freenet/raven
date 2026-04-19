@@ -4,12 +4,20 @@ import { FreenetConnection } from "./freenet-api";
 import { Post } from "./types";
 import { createPostCard } from "./components/post-card";
 import { createOnboarding } from "./components/onboarding";
-import { hasIdentity, getIdentity, createIdentity, Identity } from "./identity";
+import {
+  hasIdentity,
+  getIdentity,
+  createIdentity,
+  applyDelegateIdentity,
+  connectDelegate,
+  Identity,
+} from "./identity";
+import { parseDelegateResponse } from "./delegate-api";
+import { DelegateResponse } from "@freenetorg/freenet-stdlib";
 
 const appRoot = document.getElementById("app");
 if (!appRoot) throw new Error("No #app element");
 
-// Track known post IDs to avoid duplicates
 const knownPostIds = new Set<string>();
 
 const connection = new FreenetConnection({
@@ -26,9 +34,8 @@ const connection = new FreenetConnection({
     }
   },
   onNewPost: (post: Post) => {
-    if (knownPostIds.has(post.id)) return; // dedup
+    if (knownPostIds.has(post.id)) return;
     knownPostIds.add(post.id);
-    console.log(`[freenet] New post from @${post.author.handle}`);
     const postList = appElement.querySelector(".feed__posts") as HTMLElement | null;
     if (postList) {
       postList.insertBefore(createPostCard(post), postList.firstChild);
@@ -36,17 +43,30 @@ const connection = new FreenetConnection({
   },
   onStatusChange: (status) => {
     console.log(`[freenet] Status: ${status}`);
+    // Wire delegate after WebSocket connects
+    if (status === "connected" && __DELEGATE_KEY__) {
+      wireDelegateConnection();
+    }
+  },
+  onDelegateResponse: (response: DelegateResponse) => {
+    const payloads = parseDelegateResponse(response);
+    for (const payload of payloads) {
+      if (applyDelegateIdentity(payload)) {
+        const identity = getIdentity();
+        if (identity) {
+          connection.setUser(identity.publicKey, identity.displayName, identity.handle);
+          console.log(`[identity] Updated from delegate: ${identity.displayName}`);
+        }
+      }
+    }
   },
 });
 
 const appElement = createApp((content: string) => {
   connection.publishPost(content).then((ok) => {
     if (ok) {
-      console.log("[freenet] Post published to network");
-      // Reload state after a short delay to show the new post
+      console.log("[freenet] Post published");
       setTimeout(() => connection.loadState(), 300);
-    } else {
-      console.warn("[freenet] Post publish failed");
     }
   });
   return Promise.resolve(true);
@@ -54,26 +74,37 @@ const appElement = createApp((content: string) => {
 appRoot.appendChild(appElement);
 
 /**
- * Wire up the identity to the connection and then connect.
+ * Wire the identity delegate after WebSocket is connected.
+ * Decodes the delegate key (base58) and calls connectDelegate.
  */
+async function wireDelegateConnection(): Promise<void> {
+  const api = connection.wsApi;
+  if (!api || !__DELEGATE_KEY__) return;
+
+  try {
+    // Decode delegate key (base58) using ContractKey.fromInstanceId
+    // to get the raw 32 bytes. Pass as both key and codeHash.
+    const { ContractKey } = await import("@freenetorg/freenet-stdlib");
+    const tempKey = ContractKey.fromInstanceId(__DELEGATE_KEY__);
+    const keyBytes = Array.from(tempKey.bytes());
+
+    connectDelegate(api, keyBytes, keyBytes);
+    console.log(`[identity] Delegate wired: ${__DELEGATE_KEY__}`);
+  } catch (e) {
+    console.warn("[identity] Failed to wire delegate:", e);
+  }
+}
+
 function startWithIdentity(identity: Identity): void {
   connection.setUser(identity.publicKey, identity.displayName, identity.handle);
   connection.connect();
 }
 
-// Identity flow:
-//   1. Identity exists in memory → connect immediately
-//   2. No identity → show onboarding → create identity → connect
 if (hasIdentity()) {
-  const identity = getIdentity()!;
-  console.log(`[identity] Resuming as ${identity.displayName} (@${identity.handle})`);
-  startWithIdentity(identity);
+  startWithIdentity(getIdentity()!);
 } else {
   const onboarding = createOnboarding((displayName: string) => {
     const identity = createIdentity(displayName);
-    console.log(
-      `[identity] Created identity: ${identity.displayName} (@${identity.handle}) pubkey=${identity.publicKey.slice(0, 16)}…`
-    );
     startWithIdentity(identity);
   });
   document.body.appendChild(onboarding);
