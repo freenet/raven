@@ -73,6 +73,7 @@ jobs:
           cache: npm
           cache-dependency-path: |
             web/package-lock.json
+            web/tests/package-lock.json
       - name: Cache cargo-installed binaries
         id: cache-bins
         uses: actions/cache@v4

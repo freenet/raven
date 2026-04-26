@@ -19,9 +19,6 @@ web/tests/node_modules/
 web/tests/playwright-report/
 web/tests/test-results/
 
-# Package lock (app repo, regenerated on install)
-web/package-lock.json
-
 # IDE
 .idea/
 .vscode/
