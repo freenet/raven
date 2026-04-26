@@ -33,16 +33,18 @@ jobs:
             ~/.cargo/bin/cargo-make
             ~/.cargo/bin/cargo-binstall
             ~/.cargo/bin/fdev
+            ~/.cargo/bin/b3sum
           key: ${{ runner.os }}-cargo-bins-make-${{ env.CARGO_MAKE_VERSION }}-fdev-${{ env.FDEV_VERSION }}
       - name: Install cargo-binstall
         if: steps.cache-bins.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@cargo-binstall
-      - name: Install cargo-make + fdev
+      - name: Install cargo-make + fdev + b3sum
         if: steps.cache-bins.outputs.cache-hit != 'true'
         run: |
           cargo binstall -y --force --version ${{ env.CARGO_MAKE_VERSION }} cargo-make
           cargo binstall -y --force --version ${{ env.FDEV_VERSION }} fdev || \
             cargo install fdev --version ${{ env.FDEV_VERSION }} --locked
+          cargo binstall -y --force b3sum || cargo install b3sum --locked
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -82,16 +84,18 @@ jobs:
             ~/.cargo/bin/cargo-make
             ~/.cargo/bin/cargo-binstall
             ~/.cargo/bin/fdev
+            ~/.cargo/bin/b3sum
           key: ${{ runner.os }}-cargo-bins-make-${{ env.CARGO_MAKE_VERSION }}-fdev-${{ env.FDEV_VERSION }}-playwright
       - name: Install cargo-binstall
         if: steps.cache-bins.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@cargo-binstall
-      - name: Install cargo-make + fdev
+      - name: Install cargo-make + fdev + b3sum
         if: steps.cache-bins.outputs.cache-hit != 'true'
         run: |
           cargo binstall -y --force --version ${{ env.CARGO_MAKE_VERSION }} cargo-make
           cargo binstall -y --force --version ${{ env.FDEV_VERSION }} fdev || \
             cargo install fdev --version ${{ env.FDEV_VERSION }} --locked
+          cargo binstall -y --force b3sum || cargo install b3sum --locked
       - name: Build offline UI
         run: cargo make build-ui-offline
       - name: Install Playwright npm deps

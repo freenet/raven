@@ -35,11 +35,12 @@ jobs:
           fi
       - name: Install cargo-binstall
         uses: taiki-e/install-action@cargo-binstall
-      - name: Install cargo-make + fdev
+      - name: Install cargo-make + fdev + b3sum
         run: |
           cargo binstall -y --force cargo-make
           cargo binstall -y --force --version ${{ env.FDEV_VERSION }} fdev || \
             cargo install fdev --version ${{ env.FDEV_VERSION }} --locked
+          cargo binstall -y --force b3sum || cargo install b3sum --locked
       - name: Rebuild test-signed contract
         run: cargo make update-published-contract
       - name: Compare rebuilt snapshot against committed
