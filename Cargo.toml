@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["contracts/*", "delegates/*", "web/container", "tools/web-container-sign"]
+members = ["common", "contracts/*", "delegates/*", "web/container", "tools/web-container-sign"]
 
 [profile.dev.package."*"]
 opt-level = 3
@@ -13,7 +13,5 @@ codegen-units = 1
 panic = 'abort'
 
 [workspace.dependencies]
-freenet-stdlib = { version = "0.6.0", default-features = false, features = ["contract"] }
-
-#[target.wasm32-unknown-unknown]
-#rustflags = ["-C", "link-arg=--import-memory"]
+freenet-stdlib = { version = "0.6.1", default-features = false, features = ["contract"] }
+freenet-microblogging-common = { path = "common" }

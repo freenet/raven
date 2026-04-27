@@ -7,8 +7,24 @@ on:
       - "contracts/**"
       - "delegates/**"
       - "tools/web-container-sign/**"
+      - "published-contract/**"
+      - "test-contract/web-container-keys.toml"
       - "Makefile.toml"
       - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "contracts/**"
+      - "delegates/**"
+      - "tools/web-container-sign/**"
+      - "published-contract/**"
+      - "test-contract/web-container-keys.toml"
+      - "Makefile.toml"
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "rust-toolchain.toml"
 
 env:
@@ -45,22 +61,15 @@ jobs:
         run: cargo make update-published-contract
       - name: Compare rebuilt snapshot against committed
         run: |
-          # NOTE: this step is informational-only until the committed
-          # `published-contract/` snapshot is rebuilt on Linux CI. The
-          # initial snapshot was produced on macOS; Ubuntu-produced WASM
-          # may differ byte-for-byte until the snapshot is regenerated
-          # on Linux and committed. We print the diff as a warning and
-          # exit 0 so the job reports green.
           if ! git diff --exit-code -- published-contract/; then
-            echo "::warning::published-contract/ drifted from source."
+            echo "::error::published-contract/ drifted from source."
             echo ""
-            echo "Expected until the committed snapshot is rebuilt on Linux."
-            echo "Diff for context:"
+            echo "Diff:"
             git diff -- published-contract/ || true
             echo ""
-            echo "To refresh manually (run on Linux for CI parity):"
+            echo "Refresh with:"
             echo "  cargo make update-published-contract"
-            echo "  git add published-contract/"
-            exit 0
+            echo "  git add published-contract/ && git commit"
+            exit 1
           fi
-          echo "published-contract/ is in sync with source ✓"
+          echo "published-contract/ is in sync with source"

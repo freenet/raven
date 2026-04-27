@@ -1,0 +1,9 @@
+[package]
+name = "freenet-microblogging-common"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "serde"] }
+serde = { version = "1", features = ["derive"] }

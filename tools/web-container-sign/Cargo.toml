@@ -10,6 +10,7 @@ name = "web-container-sign"
 path = "src/main.rs"
 
 [dependencies]
+freenet-microblogging-common = { workspace = true }
 ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "serde", "rand_core", "pem", "std"] }
 ciborium = "0.2.2"
 rand = { version = "0.8.5", features = ["std", "std_rng"] }

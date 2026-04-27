@@ -31,17 +31,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use freenet_microblogging_common::web_container::WebContainerMetadata;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-
-/// Metadata stored alongside the webapp; must match what the on-chain contract
-/// at `web/container/src/lib.rs` deserializes.
-#[derive(Serialize, Deserialize)]
-struct WebContainerMetadata {
-    pub version: u32,
-    pub signature: Signature,
-}
 
 #[derive(Parser)]
 #[command(name = "web-container-sign")]
