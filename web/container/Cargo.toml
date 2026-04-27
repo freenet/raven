@@ -8,9 +8,17 @@ publish = false
 
 [dependencies]
 freenet-stdlib = { workspace = true, features = ["contract"] }
+freenet-microblogging-common = { workspace = true }
+byteorder = "1.5"
+ciborium = "0.2.2"
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "rand_core"] }
+rand = { version = "0.8", features = ["std", "std_rng"] }
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [features]
 freenet-main-contract = []

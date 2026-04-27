@@ -1,0 +1,86 @@
+name: check-contract-wasm
+
+on:
+  pull_request:
+    paths:
+      - "web/**"
+      - "contracts/**"
+      - "delegates/**"
+      - "tools/web-container-sign/**"
+      - "published-contract/**"
+      - "test-contract/web-container-keys.toml"
+      - "Makefile.toml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "contracts/**"
+      - "delegates/**"
+      - "tools/web-container-sign/**"
+      - "published-contract/**"
+      - "test-contract/web-container-keys.toml"
+      - "Makefile.toml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+
+env:
+  FDEV_VERSION: "0.3.212"
+
+jobs:
+  verify-published-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install GNU tar
+        run: |
+          if ! tar --version | grep -qi 'gnu tar'; then
+            sudo apt-get update && sudo apt-get install -y tar
+          fi
+      - name: Install cargo-binstall
+        uses: taiki-e/install-action@cargo-binstall
+      - name: Install cargo-make + fdev + b3sum
+        run: |
+          cargo binstall -y --force cargo-make
+          cargo binstall -y --force --version ${{ env.FDEV_VERSION }} fdev || \
+            cargo install fdev --version ${{ env.FDEV_VERSION }} --locked
+          cargo binstall -y --force b3sum || cargo install b3sum --locked
+      - name: Rebuild test-signed contract
+        run: cargo make update-published-contract
+      - name: Compare rebuilt snapshot against committed
+        id: drift
+        run: |
+          if ! git diff --exit-code -- published-contract/; then
+            echo "::error::published-contract/ drifted from source."
+            echo ""
+            echo "Diff:"
+            git diff -- published-contract/ || true
+            echo ""
+            echo "Refresh with:"
+            echo "  cargo make update-published-contract"
+            echo "  git add published-contract/ && git commit"
+            echo ""
+            echo "Or download the 'published-contract-rebuilt' artifact from this run"
+            echo "and commit it directly."
+            exit 1
+          fi
+          echo "published-contract/ is in sync with source"
+      - name: Upload rebuilt snapshot on drift
+        if: failure() && steps.drift.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-contract-rebuilt
+          path: published-contract/
+          retention-days: 14
