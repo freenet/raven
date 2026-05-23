@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet};
 /// State: maps post_id to the set of public keys that liked that post
 #[derive(Serialize, Deserialize)]
 struct LikeGraph {
+    // Schema-tolerance: defaults so older/newer wire shapes still decode.
+    // See AGENTS.md → "Contract migration".
+    #[serde(default)]
     likes: HashMap<String, HashSet<String>>,
 }
 
@@ -129,6 +132,18 @@ mod test {
         )
         .unwrap();
         assert!(matches!(result, ValidateResult::Valid));
+    }
+
+    #[test]
+    fn decodes_old_shape_state() {
+        // Schema-tolerance guard: an empty object decodes to an empty graph
+        // (likes defaults), and an unknown forward-compat field is ignored.
+        let empty: LikeGraph = serde_json::from_slice(b"{}").unwrap();
+        assert!(empty.likes.is_empty());
+
+        let forward = r#"{"likes":{"post_1":["alice"]},"version":2}"#;
+        let graph: LikeGraph = serde_json::from_slice(forward.as_bytes()).unwrap();
+        assert!(graph.likes["post_1"].contains("alice"));
     }
 
     #[test]

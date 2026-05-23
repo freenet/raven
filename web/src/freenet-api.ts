@@ -16,6 +16,17 @@ import {
   ResponseHandler,
 } from "@freenetorg/freenet-stdlib";
 import { Post } from "./types";
+import { runMigrations, type MigrationRunnerDeps } from "./migrations/run";
+import {
+  LocalStorageMigrationStateStore,
+  type MigrationStateStore,
+} from "./migrations/state-store";
+import {
+  CURRENT_POSTS_CODE_HASH,
+  LEGACY_POSTS_CODE_HASHES,
+  type ContractType,
+  type MigratableContract,
+} from "./migrations/legacy-hashes";
 
 // Contract post format (matches Rust contract)
 interface ContractPost {
@@ -74,6 +85,8 @@ export interface FreenetCallbacks {
   onStatusChange: (status: ConnectionStatus) => void;
   /** Optional: receives delegate responses forwarded from the node. */
   onDelegateResponse?: (response: DelegateResponse) => void;
+  /** Optional: one-line progress messages from the startup migration loop. */
+  onMigration?: (message: string) => void;
 }
 
 export class FreenetConnection {
@@ -85,6 +98,10 @@ export class FreenetConnection {
     name: string;
     handle: string;
   } | null = null;
+  private migrationStore: MigrationStateStore =
+    new LocalStorageMigrationStateStore();
+  /** True while the startup migration loop probes old contract keys. */
+  private migrating = false;
 
   constructor(callbacks: FreenetCallbacks) {
     this.callbacks = callbacks;
@@ -107,9 +124,7 @@ export class FreenetConnection {
       // fromInstanceId only sets instance — we need both for the node.
       // The published contract key (base58) decodes to 32 bytes that serve
       // as both instance ID and code hash (when no parameters are used).
-      const keyFromId = ContractKey.fromInstanceId(modelContract);
-      const instanceBytes = keyFromId.bytes();
-      this.contractKey = new ContractKey(instanceBytes, instanceBytes);
+      this.contractKey = this.deriveContractKey(modelContract);
       const wsUrl = new URL(`ws://${location.host}/v1/contract/command`);
 
       const handler: ResponseHandler = {
@@ -122,6 +137,9 @@ export class FreenetConnection {
           this.handleUpdateNotification(notification);
         },
         onContractNotFound: (_instanceId: Uint8Array) => {
+          // A migration probe against an old key that no longer exists is
+          // expected — the awaited get() rejects and is handled there.
+          if (this.migrating) return;
           console.warn("[freenet] Contract not found");
           this.callbacks.onStatusChange("error");
         },
@@ -135,8 +153,7 @@ export class FreenetConnection {
         onOpen: () => {
           console.log("[freenet] Connected to Freenet node");
           this.callbacks.onStatusChange("connected");
-          this.loadState();
-          this.subscribeToUpdates();
+          void this.startup();
         },
       };
       // Pass empty string as authToken to skip cookie reading (sandbox blocks it)
@@ -145,6 +162,117 @@ export class FreenetConnection {
       console.warn("[freenet] Connection failed:", e);
       this.callbacks.onStatusChange("error");
     }
+  }
+
+  /**
+   * Derive the node ContractKey from a base58 instance id. The published key
+   * decodes to 32 bytes that serve as both instance id and code hash when the
+   * contract uses no parameters.
+   */
+  private deriveContractKey(instanceId: string): ContractKey {
+    const keyFromId = ContractKey.fromInstanceId(instanceId);
+    const bytes = keyFromId.bytes();
+    return new ContractKey(bytes, bytes);
+  }
+
+  /** Run the migration loop, then load + subscribe to the current contract. */
+  private async startup(): Promise<void> {
+    await this.runStartupMigrations();
+    this.loadState();
+    this.subscribeToUpdates();
+  }
+
+  /**
+   * Detect a contract-hash bump since the last session and pull any state
+   * stranded under the old key into the current contract. Runs before
+   * subscribeToUpdates so the live feed reflects migrated state.
+   */
+  private async runStartupMigrations(): Promise<void> {
+    if (!this.api || !this.contractKey) return;
+
+    const log = (message: string) => {
+      console.log(message);
+      this.callbacks.onMigration?.(message);
+    };
+
+    const contracts: MigratableContract[] = [
+      {
+        type: "posts",
+        currentHash: CURRENT_POSTS_CODE_HASH,
+        legacyHashes: LEGACY_POSTS_CODE_HASHES,
+      },
+    ];
+
+    const deps: MigrationRunnerDeps = {
+      store: this.migrationStore,
+      getState: (type, candidateHash) =>
+        this.migrationGetState(type, candidateHash),
+      reinject: (type, state) => this.migrationReinject(type, state),
+      log,
+    };
+
+    this.migrating = true;
+    try {
+      await runMigrations(contracts, deps);
+    } catch (e) {
+      console.error("[migration] startup migration failed:", e);
+    } finally {
+      this.migrating = false;
+    }
+  }
+
+  /** GET the state stored under an old contract key; null if unavailable. */
+  private async migrationGetState(
+    _type: ContractType,
+    candidateHash: string,
+  ): Promise<unknown | null> {
+    if (!this.api) return null;
+    const key = this.deriveContractKey(candidateHash);
+    try {
+      const resp = await this.withTimeout(
+        this.api.get(new GetRequest(key, false)),
+        8000,
+      );
+      const json = new TextDecoder("utf8").decode(Uint8Array.from(resp.state));
+      return JSON.parse(json);
+    } catch (e) {
+      console.warn(`[migration] GET candidate ${candidateHash} failed:`, e);
+      return null;
+    }
+  }
+
+  /** Merge migrated state into the current contract via a delta update. */
+  private async migrationReinject(
+    type: ContractType,
+    state: unknown,
+  ): Promise<void> {
+    if (!this.api || !this.contractKey) return;
+    // Only posts is wired into the UI today; follows/likes land with #11/#13.
+    if (type !== "posts") return;
+    const posts = (state as PostsFeedState | null)?.posts;
+    if (!Array.isArray(posts) || posts.length === 0) return;
+    const deltaBytes = new TextEncoder().encode(JSON.stringify(posts));
+    const update = new UpdateData(
+      UpdateDataType.DeltaUpdate,
+      new DeltaUpdate(Array.from(deltaBytes)),
+    );
+    await this.api.update(new UpdateRequest(this.contractKey, update));
+  }
+
+  private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("timeout")), ms);
+      p.then(
+        (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      );
+    });
   }
 
   loadState(): void {
@@ -164,6 +292,11 @@ export class FreenetConnection {
   }
 
   private handleGetResponse(response: GetResponse): void {
+    // The startup migration loop issues GETs against old contract keys and
+    // consumes those responses via the awaited Promise returned by api.get().
+    // The same responses also reach this handler — skip them so old-version
+    // state never lands in the live feed.
+    if (this.migrating) return;
     try {
       const decoder = new TextDecoder("utf8");
       const stateJson = decoder.decode(Uint8Array.from(response.state));

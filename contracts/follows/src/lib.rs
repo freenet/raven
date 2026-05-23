@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet};
 /// State: maps user public keys to their set of followed public keys
 #[derive(Serialize, Deserialize)]
 struct FollowGraph {
+    // Schema-tolerance: defaults so older/newer wire shapes still decode.
+    // See AGENTS.md → "Contract migration".
+    #[serde(default)]
     follows: HashMap<String, HashSet<String>>,
 }
 
@@ -129,6 +132,18 @@ mod test {
         )
         .unwrap();
         assert!(matches!(result, ValidateResult::Valid));
+    }
+
+    #[test]
+    fn decodes_old_shape_state() {
+        // Schema-tolerance guard: an empty object decodes to an empty graph
+        // (follows defaults), and an unknown forward-compat field is ignored.
+        let empty: FollowGraph = serde_json::from_slice(b"{}").unwrap();
+        assert!(empty.follows.is_empty());
+
+        let forward = r#"{"follows":{"alice":["bob"]},"version":2}"#;
+        let graph: FollowGraph = serde_json::from_slice(forward.as_bytes()).unwrap();
+        assert!(graph.follows["alice"].contains("bob"));
     }
 
     #[test]

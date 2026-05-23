@@ -204,6 +204,75 @@ cd web && npm test                              # Web app (Vitest)
 - Rust toolchain with `wasm32-unknown-unknown` target
 - `freenet` and `fdev` CLI tools (`cargo install freenet fdev`)
 
+## Contract migration
+
+A contract's WASM hash changes whenever its source or any WASM-affecting
+dependency changes, and the contract key is derived from that hash. So a bump
+moves every user's state to a new key — stranding the old state unless we
+migrate it. The migration system (issue #20) detects a bump on startup and
+pulls stranded state into the new key. It runs in `FreenetConnection.connect`
+(`web/src/freenet-api.ts`) before subscribing.
+
+### Schema-tolerance policy (MANDATORY)
+
+Every additive field on a contract state struct MUST carry
+`#[serde(default, skip_serializing_if = …)]` (or at least `#[serde(default)]`
+for non-`Option` fields) so older wire shapes still decode under newer code.
+Never put `#[serde(deny_unknown_fields)]` on contract state — unknown
+forward-compat fields must be ignored, not rejected.
+
+- Audited structs: `PostsFeed` / `Post` (`contracts/posts/src/lib.rs`),
+  `FollowGraph` (`contracts/follows/src/lib.rs`), `LikeGraph`
+  (`contracts/likes/src/lib.rs`). Each has a `decodes_old_shape_state` test.
+- A schema change that CANNOT be expressed as an additive serde-default field
+  (renames, type changes, restructures) is **not** byte-compatible: it needs a
+  dedicated re-shape pass in the migration writer and cannot ride a plain hash
+  bump.
+
+### Build isolation
+
+Every dependency that influences WASM output is pinned to an exact version
+(`=x.y.z`) in each contract/delegate `Cargo.toml` and in the workspace
+`freenet-stdlib` entry. The committed workspace `Cargo.lock` pins transitive
+deps, and the Rust toolchain is fixed via `rust-toolchain.toml`. Together these
+guarantee a routine dependency bump cannot silently rotate a contract's WASM
+hash — a rotation is always a deliberate edit.
+
+### Bump recipe (rotating a contract deliberately)
+
+1. Make the change (edit contract source, or bump a `=x.y.z` pin in its
+   `Cargo.toml`).
+2. Keep the schema byte-compatible — additive serde-default fields only. A
+   JSON-schema change in the same release would fail `validate_state` per user;
+   split it out with a dedicated re-shape pass.
+3. `cargo make build-contracts` to regenerate the WASM + hashes.
+4. Append the **prior** hash (the previous current-hash value) to that
+   contract's legacy list in `web/src/migrations/legacy-hashes.ts`
+   (`LEGACY_POSTS_CODE_HASHES` / `LEGACY_FOLLOWS_CODE_HASHES` /
+   `LEGACY_LIKES_CODE_HASHES`). Append-only, oldest → newest — never reorder or
+   delete. The new current hash MUST NOT appear in the legacy list (enforced by
+   `legacy-hashes.test.ts`).
+5. Ship. On next load the migration loop GETs the old key, decodes its state,
+   and re-injects it under the new key.
+
+### Helpers
+
+- `web/src/migrations/legacy-hashes.ts` — per-contract legacy lists + current
+  hashes (wired from `web/vite.config.ts`) + the `MIGRATABLE_CONTRACTS` registry.
+- `web/src/migrations/candidates.ts` — pure `buildMigrationCandidates` /
+  `selectMigrateFrom` (ported from mail `ui/src/inbox.rs`).
+- `web/src/migrations/state-store.ts` — `MigrationStateStore` (localStorage-
+  backed today; a delegate-backed store swaps in for the per-identity era).
+- `web/src/migrations/run.ts` — `runMigrations`, the startup loop.
+
+### Deferred (per-identity — lands with #11/#13)
+
+Once profile/posts contracts become per-identity, extend the identity delegate's
+secret storage with a `{ contract_type → recorded_hash }` map (mirroring mail's
+`AliasInfo`) and run the same `selectMigrateFrom` / candidate-chain / re-inject
+flow against each identity's derived key. Cross-version contact interop follows
+then.
+
 ## Conventions
 
 - All Freenet protocol messages use FlatBuffers types from the stdlib

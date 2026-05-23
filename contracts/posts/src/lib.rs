@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 struct PostsFeed {
+    // Schema-tolerance: defaults so older/newer wire shapes still decode.
+    // See AGENTS.md → "Contract migration".
+    #[serde(default)]
     posts: Vec<Post>,
 }
 
@@ -19,12 +22,13 @@ impl<'a> TryFrom<State<'a>> for PostsFeed {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Post {
-    pub id: String,                   // unique ID: "{author_pubkey}-{timestamp_ms}"
-    pub author_pubkey: String,        // hex-encoded public key
-    pub author_name: String,          // display name
-    pub author_handle: String,        // @handle
-    pub content: String,              // post text (max 280 chars)
-    pub timestamp: u64,               // unix timestamp milliseconds
+    pub id: String,            // unique ID: "{author_pubkey}-{timestamp_ms}"
+    pub author_pubkey: String, // hex-encoded public key
+    pub author_name: String,   // display name
+    pub author_handle: String, // @handle
+    pub content: String,       // post text (max 280 chars)
+    pub timestamp: u64,        // unix timestamp milliseconds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Box<[u8]>>, // signature over content bytes
 }
 
@@ -202,6 +206,34 @@ mod test {
             ]
         }"#;
         let _feed = PostsFeed::try_from(State::from(json.as_bytes()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_old_shape_state() -> Result<(), Box<dyn std::error::Error>> {
+        // Schema-tolerance guard: a post missing `signature` (older wire shape)
+        // and a feed carrying an unknown forward-compat field must both decode.
+        let json = r#"{
+            "version": 2,
+            "posts": [
+                {
+                    "id": "deadbeef-1700000000000",
+                    "author_pubkey": "deadbeef",
+                    "author_name": "Alice",
+                    "author_handle": "@alice",
+                    "content": "Hello world",
+                    "timestamp": 1700000000000,
+                    "reply_to": "future-field"
+                }
+            ]
+        }"#;
+        let feed = PostsFeed::try_from(State::from(json.as_bytes()))?;
+        assert_eq!(feed.posts.len(), 1);
+        assert!(feed.posts[0].signature.is_none());
+
+        // An empty object decodes to an empty feed (posts defaults).
+        let empty = PostsFeed::try_from(State::from(b"{}".as_ref()))?;
+        assert!(empty.posts.is_empty());
         Ok(())
     }
 

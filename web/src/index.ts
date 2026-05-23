@@ -102,6 +102,32 @@ function showSplash(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Migration toast — surfaces startup contract-migration progress.
+// ---------------------------------------------------------------------------
+let migrationToastTimer: ReturnType<typeof setTimeout> | null = null;
+
+function showMigrationToast(message: string): void {
+  let toast = document.querySelector<HTMLElement>(".migration-toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.className = "migration-toast";
+    toast.style.cssText =
+      "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);" +
+      "z-index:1000;max-width:90vw;padding:8px 14px;border-radius:8px;" +
+      "background:var(--ink-1,#222);color:var(--paper,#fff);" +
+      "font-family:var(--font-mono,monospace);font-size:11px;" +
+      "box-shadow:0 4px 16px rgba(0,0,0,0.25);";
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message.replace(/^\[migration\]\s*/, "Migrating: ");
+  if (migrationToastTimer) clearTimeout(migrationToastTimer);
+  migrationToastTimer = setTimeout(() => {
+    toast?.remove();
+    migrationToastTimer = null;
+  }, 4000);
+}
+
+// ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
 const connection = new FreenetConnection({
@@ -132,6 +158,9 @@ const connection = new FreenetConnection({
         showOnboarding();
       }
     }
+  },
+  onMigration: (message: string) => {
+    showMigrationToast(message);
   },
   onDelegateResponse: (response: DelegateResponse) => {
     const payloads = parseDelegateResponse(response);

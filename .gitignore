@@ -10,6 +10,8 @@ node_modules/
 /target/webapp/
 web/dist/
 web/model_code_hash.txt
+web/follows_contract_id.txt
+web/likes_contract_id.txt
 web/delegate_key.txt
 web/delegate_key_bytes.json
 web/delegate_code_hash_bytes.json

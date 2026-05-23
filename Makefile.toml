@@ -14,7 +14,8 @@ set -euo pipefail
 ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
 cargo clean
 rm -rf "$ROOT/web/dist" "$ROOT/web/build" "$ROOT/build" "$ROOT/target/webapp"
-rm -f "$ROOT/web/model_code_hash.txt" "$ROOT/web/delegate_key.txt" \
+rm -f "$ROOT/web/model_code_hash.txt" "$ROOT/web/follows_contract_id.txt" \
+      "$ROOT/web/likes_contract_id.txt" "$ROOT/web/delegate_key.txt" \
       "$ROOT/web/delegate_key_bytes.json" "$ROOT/web/delegate_code_hash_bytes.json"
 '''
 
@@ -54,12 +55,18 @@ set -euo pipefail
 ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
 cd "$ROOT/contracts/follows"
 CARGO_TARGET_DIR="$ROOT/target" fdev build
+WASM="$ROOT/target/wasm32-unknown-unknown/release/freenet_microblogging_follows.wasm"
 hash=$(CARGO_TARGET_DIR="$ROOT/target" fdev inspect \
     "$ROOT/contracts/follows/build/freenet/freenet_microblogging_follows" code | \
     grep 'code hash:' | cut -d' ' -f3)
+# Contract instance id (empty parameters) — the migration system records this
+# as CURRENT_FOLLOWS_CODE_HASH via web/vite.config.ts.
+instance_id=$(CARGO_TARGET_DIR="$ROOT/target" fdev get-contract-id --code "$WASM")
 mkdir -p "$ROOT/build"
 printf '%s' "$hash" > "$ROOT/build/follows_code_hash"
+printf '%s' "$instance_id" > "$ROOT/web/follows_contract_id.txt"
 echo "wrote build/follows_code_hash: $hash"
+echo "wrote web/follows_contract_id.txt: $instance_id"
 '''
 
 [tasks.build-likes]
@@ -70,12 +77,18 @@ set -euo pipefail
 ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
 cd "$ROOT/contracts/likes"
 CARGO_TARGET_DIR="$ROOT/target" fdev build
+WASM="$ROOT/target/wasm32-unknown-unknown/release/freenet_microblogging_likes.wasm"
 hash=$(CARGO_TARGET_DIR="$ROOT/target" fdev inspect \
     "$ROOT/contracts/likes/build/freenet/freenet_microblogging_likes" code | \
     grep 'code hash:' | cut -d' ' -f3)
+# Contract instance id (empty parameters) — the migration system records this
+# as CURRENT_LIKES_CODE_HASH via web/vite.config.ts.
+instance_id=$(CARGO_TARGET_DIR="$ROOT/target" fdev get-contract-id --code "$WASM")
 mkdir -p "$ROOT/build"
 printf '%s' "$hash" > "$ROOT/build/likes_code_hash"
+printf '%s' "$instance_id" > "$ROOT/web/likes_contract_id.txt"
 echo "wrote build/likes_code_hash: $hash"
+echo "wrote web/likes_contract_id.txt: $instance_id"
 '''
 
 [tasks.build-identity]
