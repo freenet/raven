@@ -156,33 +156,44 @@ impl ContractInterface for UserShard {
         }
         let owner = owner_vk_hex(&parameters);
         let mut shard = UserShard::try_from(state)?;
-        shard.posts.sort_by_cached_key(post_hash);
 
         let delta_bytes = match &delta[0] {
             UpdateData::Delta(d) => d.as_ref(),
+            // NOTE: the `State` / `StateAndDelta` bytes are a full `UserShard`
+            // object (`{"posts":[...]}`), not a bare `Vec<Post>` array. They are
+            // parsed as `Vec<Post>` just below and therefore currently fail with
+            // `InvalidDelta` — a full-state merge is not yet supported. This is
+            // intentional for now (deltas are the only write path the delegate
+            // emits); a real `UserShard`-shaped merge would deserialize the
+            // object and fold its `posts`. Carried over from the posts contract.
             UpdateData::State(s) => s.as_ref(),
             UpdateData::StateAndDelta { delta, .. } => delta.as_ref(),
             _ => {
+                shard.posts.sort_by_cached_key(post_hash);
                 return Ok(UpdateModification::valid(State::from(
                     serde_json::to_vec(&shard).map_err(|e| ContractError::Other(format!("{e}")))?,
                 )));
             }
         };
-        let mut incoming = serde_json::from_slice::<Vec<Post>>(delta_bytes)
+        let incoming = serde_json::from_slice::<Vec<Post>>(delta_bytes)
             .map_err(|_| ContractError::InvalidDelta)?;
-        incoming.sort_by_cached_key(post_hash);
 
+        // Append every acceptable incoming post, then sort + dedup the whole
+        // combined set once. Deduping incrementally with binary_search while
+        // pushing to the tail is unsound — the push breaks the sort the search
+        // relies on, so an intra-batch duplicate of a *new* post (not yet in
+        // state) can slip past and double-count against the window. A single
+        // sort-then-dedup over the merged vec is order-independent and admits
+        // each distinct post exactly once.
         for post in incoming {
             // Skip anything not owner-authored / not self-verifying / over the
             // length bound; a bad post in the batch is dropped, not fatal.
-            if !post_is_acceptable(&post, &owner) {
-                continue;
-            }
-            let key = post_hash(&post);
-            if shard.posts.binary_search_by_key(&key, post_hash).is_err() {
+            if post_is_acceptable(&post, &owner) {
                 shard.posts.push(post);
             }
         }
+        shard.posts.sort_by_cached_key(post_hash);
+        shard.posts.dedup_by_key(|p| post_hash(p));
 
         // Post-merge truncation to the retention window.
         truncate_window(&mut shard.posts);
@@ -399,6 +410,40 @@ mod test {
             params_of(owner),
             new_state,
             vec![UpdateData::Delta(StateDelta::from(dup))],
+        )?
+        .unwrap_valid();
+        let updated2: UserShard = serde_json::from_slice(new_state2.as_ref())?;
+        assert_eq!(updated2.posts.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn update_dedups_intra_batch_duplicate_of_new_post() -> Result<(), Box<dyn std::error::Error>> {
+        // Regression guard: a single delta batch carrying the SAME new post
+        // twice must store it exactly once. (The old incremental
+        // binary_search-while-pushing dedup admitted both copies because the
+        // tail push broke the sort the search relied on — corrupting the
+        // MAX_POSTS count and diverging replicas.)
+        let owner = [1u8; 32];
+        let p = signed_post(owner, "dup me", 1);
+        let delta = serde_json::to_vec(&vec![p.clone(), p.clone()])?;
+        let new_state = UserShard::update_state(
+            params_of(owner),
+            State::from(b"{}".to_vec()),
+            vec![UpdateData::Delta(StateDelta::from(delta))],
+        )?
+        .unwrap_valid();
+        let updated: UserShard = serde_json::from_slice(new_state.as_ref())?;
+        assert_eq!(updated.posts.len(), 1);
+
+        // And a duplicate of an ALREADY-stored post (mixed with a genuinely new
+        // one) in the same batch is also collapsed correctly.
+        let p2 = signed_post(owner, "second", 2);
+        let delta2 = serde_json::to_vec(&vec![p.clone(), p2.clone(), p2.clone()])?;
+        let new_state2 = UserShard::update_state(
+            params_of(owner),
+            new_state,
+            vec![UpdateData::Delta(StateDelta::from(delta2))],
         )?
         .unwrap_valid();
         let updated2: UserShard = serde_json::from_slice(new_state2.as_ref())?;
