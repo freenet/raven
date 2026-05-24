@@ -364,8 +364,9 @@ export class FreenetConnection {
       content,
       timestamp,
     };
-    // Keyed by content+timestamp so the returned Signed (which echoes neither
-    // name nor handle) matches the right draft even with rapid posting.
+    // The Signed response echoes `timestamp`; completePublish matches on it
+    // rather than positionally, so a dropped/errored sign request can't shift
+    // the whole queue onto the wrong drafts.
     this.pendingPosts.push(draft);
 
     const requested = signPost(
@@ -391,14 +392,23 @@ export class FreenetConnection {
     post_id: string;
     signature: string;
     public_key: string;
+    timestamp: number;
   }): Promise<boolean> {
     if (!this.api || !this.contractKey) return false;
 
-    const draft = this.pendingPosts.shift();
-    if (!draft) {
-      console.warn("[freenet] Signed response with no pending post draft");
+    // Match the draft by the echoed timestamp, not position — robust to a
+    // dropped/errored sign request that never produced a Signed response.
+    const idx = this.pendingPosts.findIndex(
+      (d) => d.timestamp === signed.timestamp
+    );
+    if (idx === -1) {
+      console.warn(
+        "[freenet] Signed response with no matching pending draft",
+        signed.timestamp
+      );
       return false;
     }
+    const [draft] = this.pendingPosts.splice(idx, 1);
 
     const post: ContractPost = {
       id: signed.post_id,
@@ -422,6 +432,15 @@ export class FreenetConnection {
       console.error("[freenet] Failed to publish:", e);
       return false;
     }
+  }
+
+  /**
+   * Drop the oldest pending post draft. Called when the delegate returns an
+   * Error (e.g. a SignPost that failed), so a stranded draft can't desync the
+   * timestamp-matched pending queue.
+   */
+  dropOldestPendingPost(): void {
+    this.pendingPosts.shift();
   }
 
   /**

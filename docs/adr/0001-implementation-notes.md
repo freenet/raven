@@ -69,6 +69,25 @@ No custom hash primitive is introduced. Domain separation between shard types
 distinct WASM code hash of each shard binary — two shard types never share a
 binary, so the same owner VK yields three different contract keys.
 
+### Posts contract now self-verifies (and what that means for old data)
+
+The existing global `posts` contract is updated in this phase to use
+`common::post::Post`: `update_state` / `validate_state` now **reject any post
+that does not self-verify** (content-addressed id + valid ML-DSA-65 signature
+for `author_pubkey`) or exceeds the length bound. A bad post in a delta batch is
+skipped, not fatal to the whole update.
+
+This is a **non-byte-compatible schema change** (`signature` moves from a byte
+array to a hex string; `id` moves from a `{pubkey}-{ms}` string to a content
+address), so per AGENTS.md → "Contract migration" it cannot ride a plain
+hash-bump legacy append. It does not need a re-shape pass either: the only
+pre-existing posts are **unsigned** prototype data (`signature: null`), which by
+definition can never satisfy the new signed invariant and are intentionally not
+carried across. The posts WASM hash rotates on the next `cargo make
+build-contracts`; no entry is added to `LEGACY_POSTS_CODE_HASHES` because there
+is no migratable prior state. Signed-feed migration proper arrives with the
+shard cutover (Phase 4).
+
 ## Caveat: ADR vs. mail on windowing
 
 The ADR states the bounded-state window mirrors "how `freenet/mail` windows its

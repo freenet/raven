@@ -1,3 +1,4 @@
+use freenet_microblogging_common::post::{MAX_CONTENT_LEN, Post};
 use freenet_stdlib::prelude::{
     blake3::{Hasher as Blake3, traits::digest::Digest},
     *,
@@ -20,27 +21,23 @@ impl<'a> TryFrom<State<'a>> for PostsFeed {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Post {
-    pub id: String,            // unique ID: "{author_pubkey}-{timestamp_ms}"
-    pub author_pubkey: String, // hex-encoded public key
-    pub author_name: String,   // display name
-    pub author_handle: String, // @handle
-    pub content: String,       // post text (max 280 chars)
-    pub timestamp: u64,        // unix timestamp milliseconds
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<Box<[u8]>>, // signature over content bytes
+/// Dedup/summary key for a post: blake3 over its content-addressed id.
+/// (The id is itself a content address, so distinct ids are distinct posts;
+/// hashing it to a fixed `[u8; 32]` keeps the existing summary machinery.)
+fn post_hash(post: &Post) -> [u8; 32] {
+    let mut hasher = Blake3::new();
+    hasher.update(post.id.as_bytes());
+    let hash_val = hasher.finalize();
+    let mut key = [0; 32];
+    key.copy_from_slice(&hash_val[..]);
+    key
 }
 
-impl Post {
-    pub fn hash(&self) -> [u8; 32] {
-        let mut hasher = Blake3::new();
-        hasher.update(self.id.as_bytes());
-        let hash_val = hasher.finalize();
-        let mut key = [0; 32];
-        key.copy_from_slice(&hash_val[..]);
-        key
-    }
+/// A post is acceptable iff it is within the length bound and fully
+/// self-verifies: content-addressed id matches the signed fields and the
+/// ML-DSA-65 signature is valid for `author_pubkey` (ADR-0001 → owner-writes).
+fn post_is_acceptable(post: &Post) -> bool {
+    post.content.len() <= MAX_CONTENT_LEN && post.verify().is_ok()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,7 +49,7 @@ impl<'a> From<&'a mut PostsFeed> for FeedSummary {
     fn from(feed: &'a mut PostsFeed) -> Self {
         let mut summaries = Vec::with_capacity(feed.posts.len());
         for post in &feed.posts {
-            summaries.push(MessageSummary(post.hash()));
+            summaries.push(MessageSummary(post_hash(post)));
         }
         FeedSummary { summaries }
     }
@@ -77,10 +74,9 @@ impl ContractInterface for PostsFeed {
     ) -> Result<ValidateResult, ContractError> {
         let feed = PostsFeed::try_from(state)?;
         for post in &feed.posts {
-            if post.content.len() > 280 {
-                return Ok(ValidateResult::Invalid);
-            }
-            if post.id.is_empty() || post.author_pubkey.is_empty() {
+            // Every stored post must self-verify (content-address id + valid
+            // ML-DSA-65 signature) and respect the length bound.
+            if !post_is_acceptable(post) {
                 return Ok(ValidateResult::Invalid);
             }
         }
@@ -96,7 +92,7 @@ impl ContractInterface for PostsFeed {
             return Ok(UpdateModification::valid(state));
         }
         let mut feed = PostsFeed::try_from(state)?;
-        feed.posts.sort_by_cached_key(|p| p.hash());
+        feed.posts.sort_by_cached_key(post_hash);
 
         let delta_bytes = match &delta[0] {
             UpdateData::Delta(d) => d.as_ref(),
@@ -110,17 +106,16 @@ impl ContractInterface for PostsFeed {
         };
         let mut incoming = serde_json::from_slice::<Vec<Post>>(delta_bytes)
             .map_err(|_| ContractError::InvalidDelta)?;
-        incoming.sort_by_cached_key(|p| p.hash());
+        incoming.sort_by_cached_key(post_hash);
 
         for post in incoming {
-            if post.content.len() > 280 {
-                continue; // skip invalid posts
+            // Skip anything that doesn't self-verify or breaks the length bound;
+            // a bad post in the batch is dropped, not fatal to the whole update.
+            if !post_is_acceptable(&post) {
+                continue;
             }
-            if feed
-                .posts
-                .binary_search_by_key(&post.hash(), |o| o.hash())
-                .is_err()
-            {
+            let key = post_hash(&post);
+            if feed.posts.binary_search_by_key(&key, post_hash).is_err() {
                 feed.posts.push(post);
             }
         }
@@ -158,7 +153,7 @@ impl ContractInterface for PostsFeed {
         summary.summaries.sort();
         let mut final_posts = vec![];
         for post in feed.posts {
-            let hash = post.hash();
+            let hash = post_hash(&post);
             if summary
                 .summaries
                 .binary_search_by(|m| m.0.as_ref().cmp(&hash[..]))
@@ -177,35 +172,36 @@ impl ContractInterface for PostsFeed {
 #[cfg(test)]
 mod test {
     use super::*;
+    use ml_dsa::signature::{Keypair, Signer};
+    use ml_dsa::{KeyGen, MlDsa65};
 
-    fn make_post(id: &str, author_pubkey: &str, content: &str) -> Post {
-        Post {
-            id: id.to_string(),
-            author_pubkey: author_pubkey.to_string(),
+    /// Build a fully-signed post for `seed`'s identity (the way the delegate
+    /// would): content-addressed id + valid ML-DSA-65 signature.
+    fn signed_post(seed: [u8; 32], content: &str) -> Post {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let author_pubkey = hex::encode(sk.verifying_key().encode());
+        let mut p = Post {
+            id: String::new(),
+            author_pubkey,
             author_name: "Test User".to_string(),
             author_handle: "@testuser".to_string(),
             content: content.to_string(),
             timestamp: 1_700_000_000_000,
             signature: None,
-        }
+        };
+        p.id = p.compute_id();
+        let sig: ml_dsa::Signature<MlDsa65> = sk.sign(&p.signing_payload());
+        p.signature = Some(hex::encode(sig.encode()));
+        p
     }
 
     #[test]
     fn conversions() -> Result<(), Box<dyn std::error::Error>> {
-        let json = r#"{
-            "posts": [
-                {
-                    "id": "deadbeef-1700000000000",
-                    "author_pubkey": "deadbeef",
-                    "author_name": "Alice",
-                    "author_handle": "@alice",
-                    "content": "Hello world",
-                    "timestamp": 1700000000000,
-                    "signature": null
-                }
-            ]
-        }"#;
-        let _feed = PostsFeed::try_from(State::from(json.as_bytes()))?;
+        let feed = PostsFeed {
+            posts: vec![signed_post([1u8; 32], "Hello world")],
+        };
+        let bytes = serde_json::to_vec(&feed)?;
+        let _feed = PostsFeed::try_from(State::from(bytes))?;
         Ok(())
     }
 
@@ -213,11 +209,13 @@ mod test {
     fn decodes_old_shape_state() -> Result<(), Box<dyn std::error::Error>> {
         // Schema-tolerance guard: a post missing `signature` (older wire shape)
         // and a feed carrying an unknown forward-compat field must both decode.
+        // (Decoding tolerance is separate from acceptance — such a post would
+        // fail verification, but it must still deserialize.)
         let json = r#"{
             "version": 2,
             "posts": [
                 {
-                    "id": "deadbeef-1700000000000",
+                    "id": "deadbeef",
                     "author_pubkey": "deadbeef",
                     "author_name": "Alice",
                     "author_handle": "@alice",
@@ -239,44 +237,39 @@ mod test {
 
     #[test]
     fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
-        // Valid state
-        let post = make_post("pubkey1-1700000000000", "pubkey1", "Hello!");
-        let feed = PostsFeed { posts: vec![post] };
-        let state_bytes = serde_json::to_vec(&feed)?;
-
+        // A correctly-signed post is valid.
+        let feed = PostsFeed {
+            posts: vec![signed_post([1u8; 32], "Hello!")],
+        };
         let valid = PostsFeed::validate_state(
             [].as_ref().into(),
-            State::from(state_bytes),
+            State::from(serde_json::to_vec(&feed)?),
             RelatedContracts::new(),
         )?;
         assert!(matches!(valid, ValidateResult::Valid));
 
-        // Content too long (> 280 chars)
-        let long_content = "x".repeat(281);
-        let post_long = make_post("pubkey2-1700000000001", "pubkey2", &long_content);
-        let feed_long = PostsFeed {
-            posts: vec![post_long],
+        // Tampered content (signature no longer matches) is rejected.
+        let mut tampered = signed_post([1u8; 32], "Hello!");
+        tampered.content = "tampered".to_string();
+        let feed_t = PostsFeed {
+            posts: vec![tampered],
         };
-        let state_long = serde_json::to_vec(&feed_long)?;
-
         let invalid = PostsFeed::validate_state(
             [].as_ref().into(),
-            State::from(state_long),
+            State::from(serde_json::to_vec(&feed_t)?),
             RelatedContracts::new(),
         )?;
         assert!(matches!(invalid, ValidateResult::Invalid));
 
-        // Empty id
-        let mut post_empty_id = make_post("", "pubkey3", "content");
-        post_empty_id.id = "".to_string();
-        let feed_empty = PostsFeed {
-            posts: vec![post_empty_id],
+        // Unsigned post is rejected.
+        let mut unsigned = signed_post([1u8; 32], "Hello!");
+        unsigned.signature = None;
+        let feed_u = PostsFeed {
+            posts: vec![unsigned],
         };
-        let state_empty = serde_json::to_vec(&feed_empty)?;
-
         let invalid2 = PostsFeed::validate_state(
             [].as_ref().into(),
-            State::from(state_empty),
+            State::from(serde_json::to_vec(&feed_u)?),
             RelatedContracts::new(),
         )?;
         assert!(matches!(invalid2, ValidateResult::Invalid));
@@ -286,15 +279,14 @@ mod test {
 
     #[test]
     fn update_state() -> Result<(), Box<dyn std::error::Error>> {
-        let post1 = make_post("pubkey1-1700000000000", "pubkey1", "First post");
+        let post1 = signed_post([1u8; 32], "First post");
         let feed = PostsFeed {
             posts: vec![post1.clone()],
         };
         let state_bytes = serde_json::to_vec(&feed)?;
 
-        let post2 = make_post("pubkey2-1700000000001", "pubkey2", "Second post");
-        let delta_bytes = serde_json::to_vec(&vec![post2.clone()])?;
-        let delta = StateDelta::from(delta_bytes);
+        let post2 = signed_post([2u8; 32], "Second post");
+        let delta = StateDelta::from(serde_json::to_vec(&vec![post2.clone()])?);
 
         let new_state = PostsFeed::update_state(
             [].as_ref().into(),
@@ -302,11 +294,10 @@ mod test {
             vec![UpdateData::Delta(delta)],
         )?
         .unwrap_valid();
-
         let updated_feed: PostsFeed = serde_json::from_slice(new_state.as_ref())?;
         assert_eq!(updated_feed.posts.len(), 2);
 
-        // Verify commutativity: duplicate post should not be added
+        // Commutativity: re-applying an existing post adds no duplicate.
         let duplicate_delta = serde_json::to_vec(&vec![post1])?;
         let new_state2 = PostsFeed::update_state(
             [].as_ref().into(),
@@ -315,30 +306,33 @@ mod test {
         )?
         .unwrap_valid();
         let feed2: PostsFeed = serde_json::from_slice(new_state2.as_ref())?;
-        assert_eq!(feed2.posts.len(), 2); // no duplicate added
+        assert_eq!(feed2.posts.len(), 2);
 
-        // Content > 280 chars should be skipped
-        let long_post = make_post("pubkey3-1700000000002", "pubkey3", &"x".repeat(281));
-        let long_delta = serde_json::to_vec(&vec![long_post])?;
+        // A tampered post in the batch is skipped, not fatal.
+        let mut tampered = signed_post([3u8; 32], "Third post");
+        tampered.content = "tampered after signing".to_string();
+        let bad_delta = serde_json::to_vec(&vec![tampered])?;
         let new_state3 = PostsFeed::update_state(
             [].as_ref().into(),
             new_state2,
-            vec![UpdateData::Delta(StateDelta::from(long_delta))],
+            vec![UpdateData::Delta(StateDelta::from(bad_delta))],
         )?
         .unwrap_valid();
         let feed3: PostsFeed = serde_json::from_slice(new_state3.as_ref())?;
-        assert_eq!(feed3.posts.len(), 2); // long post skipped
+        assert_eq!(feed3.posts.len(), 2); // tampered post skipped
 
         Ok(())
     }
 
     #[test]
     fn summarize_state() -> Result<(), Box<dyn std::error::Error>> {
-        let post = make_post("pubkey1-1700000000000", "pubkey1", "Hello!");
-        let feed = PostsFeed { posts: vec![post] };
-        let state_bytes = serde_json::to_vec(&feed)?;
-
-        let summary = PostsFeed::summarize_state([].as_ref().into(), State::from(state_bytes))?;
+        let feed = PostsFeed {
+            posts: vec![signed_post([1u8; 32], "Hello!")],
+        };
+        let summary = PostsFeed::summarize_state(
+            [].as_ref().into(),
+            State::from(serde_json::to_vec(&feed)?),
+        )?;
         let feed_summary = serde_json::from_slice::<FeedSummary>(summary.as_ref()).unwrap();
         assert_eq!(feed_summary.summaries.len(), 1);
         Ok(())
@@ -346,17 +340,15 @@ mod test {
 
     #[test]
     fn get_state_delta() -> Result<(), Box<dyn std::error::Error>> {
-        let post1 = make_post("pubkey1-1700000000000", "pubkey1", "First post");
-        let post2 = make_post("pubkey2-1700000000001", "pubkey2", "Second post");
+        let post1 = signed_post([1u8; 32], "First post");
+        let post2 = signed_post([2u8; 32], "Second post");
         let feed = PostsFeed {
             posts: vec![post1.clone(), post2.clone()],
         };
         let state_bytes = serde_json::to_vec(&feed)?;
 
-        // Summary only contains post1 — delta should return post2
-        // Build summary via FeedSummary::from
+        // Summary only contains post1 — delta should return post2.
         let summary = FeedSummary::from(&mut PostsFeed { posts: vec![post1] });
-
         let delta = PostsFeed::get_state_delta(
             [].as_ref().into(),
             State::from(state_bytes),
@@ -365,8 +357,7 @@ mod test {
 
         let delta_posts: Vec<Post> = serde_json::from_slice(delta.as_ref())?;
         assert_eq!(delta_posts.len(), 1);
-        assert_eq!(delta_posts[0].id, "pubkey2-1700000000001");
-
+        assert_eq!(delta_posts[0].id, post2.id);
         Ok(())
     }
 }

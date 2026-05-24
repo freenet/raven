@@ -626,7 +626,10 @@ name = "freenet-microblogging-posts"
 version = "0.0.0"
 dependencies = [
  "byteorder",
+ "freenet-microblogging-common",
  "freenet-stdlib",
+ "hex",
+ "ml-dsa",
  "serde",
  "serde_json",
 ]

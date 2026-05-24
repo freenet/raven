@@ -183,29 +183,40 @@ const connection = new FreenetConnection({
         post_id?: string;
         signature?: string;
         public_key?: string;
+        timestamp?: number;
       };
       if (
         signed.type === "Signed" &&
         signed.post_id &&
         signed.signature &&
-        signed.public_key
+        signed.public_key &&
+        typeof signed.timestamp === "number"
       ) {
         connection
           .completePublish({
             post_id: signed.post_id,
             signature: signed.signature,
             public_key: signed.public_key,
+            timestamp: signed.timestamp,
           })
           .catch((e) => console.error("[delegate] completePublish failed:", e));
         return;
       }
 
-      // Check for "no identity" error from delegate
+      // Check for an error from the delegate.
       const p = payload as { type?: string; message?: string };
-      if (p.type === "Error" && p.message?.includes("no identity")) {
-        console.log("[identity] No identity in delegate — show onboarding");
-        if (!appRendered) {
-          showOnboarding();
+      if (p.type === "Error") {
+        // A signing failure leaves a draft stranded in the pending queue;
+        // drop the oldest so the queue can't desync. (Timestamp-matched
+        // completion means at worst we discard one stuck draft.)
+        connection.dropOldestPendingPost();
+        if (p.message?.includes("no identity")) {
+          console.log("[identity] No identity in delegate — show onboarding");
+          if (!appRendered) {
+            showOnboarding();
+          }
+        } else {
+          console.warn("[delegate] Error:", p.message);
         }
         return;
       }

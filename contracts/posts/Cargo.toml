@@ -11,12 +11,17 @@ publish = false
 # pairing it with the migration story. See AGENTS.md → "Contract migration".
 [dependencies]
 byteorder = "=1.5.0"
+freenet-microblogging-common = { workspace = true }
 freenet-stdlib = { workspace = true, features = ["contract"] }
 serde = "=1.0.228"
 serde_json = "=1.0.149"
 
 [lib]
 crate-type = ["cdylib"]
+
+[dev-dependencies]
+ml-dsa = { version = "=0.1.0-rc.8", default-features = false, features = ["alloc", "rand_core"] }
+hex = "=0.4.3"
 
 [build-dependencies]
 serde = "=1.0.228"

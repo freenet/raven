@@ -54,6 +54,7 @@ enum Response {
         post_id: String,    // content-addressed id = blake3(signing payload)
         signature: String,  // hex-encoded ML-DSA-65 signature (3309 bytes)
         public_key: String, // hex-encoded VK
+        timestamp: u64,     // echoed so the UI can match its pending draft
     },
     ExportedIdentity {
         secret_key: String, // hex-encoded 32-byte secret seed
@@ -239,6 +240,7 @@ fn sign_post(
         post_id: post.id,
         signature: hex::encode(signature.encode()),
         public_key,
+        timestamp,
     }
 }
 
