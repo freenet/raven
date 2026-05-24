@@ -53,7 +53,8 @@ pub struct Post {
     pub author_name: String,
     /// `@handle`.
     pub author_handle: String,
-    /// Post text (max [`MAX_CONTENT_LEN`] chars).
+    /// Post text (max [`MAX_CONTENT_LEN`] UTF-8 bytes — contracts bound
+    /// `content.len()`, which is the byte length).
     pub content: String,
     /// Unix timestamp, milliseconds. Part of the signed payload, so it cannot
     /// be altered without invalidating the signature; it is not read as a clock
@@ -66,7 +67,8 @@ pub struct Post {
     pub signature: Option<String>,
 }
 
-/// Maximum post length, in characters. Enforced in `validate_state` and the UI.
+/// Maximum post length, in UTF-8 bytes (`content.len()`). Enforced in
+/// `validate_state` and the UI.
 pub const MAX_CONTENT_LEN: usize = 280;
 
 impl Post {
