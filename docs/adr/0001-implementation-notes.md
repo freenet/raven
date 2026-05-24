@@ -88,6 +88,49 @@ build-contracts`; no entry is added to `LEGACY_POSTS_CODE_HASHES` because there
 is no migratable prior state. Signed-feed migration proper arrives with the
 shard cutover (Phase 4).
 
+## Phase 1 decisions (user shard)
+
+The user shard (`contracts/user-shard`) lands **posts-only** first; profile and
+follows are deferred to follow-up slices (they share the owner-writes / low-churn
+/ read-by-followers axis, so they belong in this same contract — they are not
+new contract types). The contract reuses the merge/summary machinery proven on
+the `posts` contract, adding two shard-specific rules:
+
+### Write authority — VK-param match
+
+The shard is parameterized by the **raw encoded owner ML-DSA-65 VK bytes**
+(`parameters = vk.encode()`). `update_state` / `validate_state` accept a post
+iff it self-verifies (`common::post::Post::verify`) **and** its `author_pubkey`
+hex equals `hex(parameters)`. A post signed by a *different* valid key
+self-verifies but is not the owner's, so it is rejected — this is what makes the
+shard owner-writes without a separate signed-envelope type (the `Post` already
+carries the ML-DSA-65 signature). Empty parameters yield an empty owner key that
+no real post can match, so an un-parameterized shard accepts nothing.
+
+This realizes the deferred key-derivation primitive: `contract_key =
+blake3(user_shard_wasm || owner_vk_bytes)` via native freenet derivation. No
+custom hash; domain separation between shard types comes from the distinct WASM
+code hash per shard binary (Phase 0 note).
+
+### Bounded state — post-merge count window
+
+`MAX_POSTS = 200` (ADR starting policy). Truncation is **post-merge**, not a
+pre-write check, and **count-based with a deterministic total order** — a
+contract has no clock (see windowing caveat below). The survival order is
+`(timestamp, id)` descending: timestamp is the author-supplied recency hint
+(safe to trust here — the shard is single-author owner-writes, so a lying owner
+only reorders their own feed), and the content-addressed `id` is a stable total
+tie-break so every replica truncates to the identical set regardless of the
+order deltas arrived in (covered by `truncation_is_deterministic_across_orderings`).
+`validate_state` deliberately does **not** enforce the window — a transiently
+over-bound merged state is normal and rejecting it would break convergence;
+authority + self-verification are the only validity invariants.
+
+No instance id is committed for this contract (unlike `posts`/`follows`/`likes`,
+which use empty parameters): per-owner parameterization means each owner derives
+a distinct key at runtime from the one build-stable `user_shard_code_hash`. UI
+wiring + migration of the existing global feed into per-user shards is Phase 4.
+
 ## Caveat: ADR vs. mail on windowing
 
 The ADR states the bounded-state window mirrors "how `freenet/mail` windows its
