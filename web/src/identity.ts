@@ -86,6 +86,7 @@ export function createIdentity(displayName: string, secretKey?: string): Identit
  * response routed through onDelegateResponse → freenet-api completePublish.
  */
 export function signPost(
+  nonce: string,
   content: string,
   authorName: string,
   authorHandle: string,
@@ -94,6 +95,7 @@ export function signPost(
   if (!isDelegateConnected()) return false;
   sendIdentityMessage(delegateApi!, delegateKeyBytes!, delegateCodeHashBytes!, {
     type: "SignPost",
+    nonce,
     content,
     author_name: authorName,
     author_handle: authorHandle,

@@ -25,8 +25,10 @@ enum Request {
     GetIdentity,
     /// Sign a post. The delegate builds the canonical signing payload from
     /// these fields (the single trusted encoder, `common::post`), derives the
-    /// content-addressed id, and returns id + signature + public key.
+    /// content-addressed id, and returns id + signature + public key. `nonce`
+    /// is echoed back so the UI can match the response to its pending draft.
     SignPost {
+        nonce: String,
         content: String,
         author_name: String,
         author_handle: String,
@@ -51,10 +53,10 @@ enum Response {
         display_name: String,
     },
     Signed {
+        nonce: String,      // echoed so the UI can match its pending draft
         post_id: String,    // content-addressed id = blake3(signing payload)
         signature: String,  // hex-encoded ML-DSA-65 signature (3309 bytes)
         public_key: String, // hex-encoded VK
-        timestamp: u64,     // echoed so the UI can match its pending draft
     },
     ExportedIdentity {
         secret_key: String, // hex-encoded 32-byte secret seed
@@ -64,6 +66,10 @@ enum Response {
     },
     Error {
         message: String,
+        // Present when the error is for a SignPost, so the UI can drop exactly
+        // the stranded draft. Absent for errors not tied to a pending post.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nonce: Option<String>,
     },
 }
 
@@ -121,11 +127,19 @@ impl DelegateInterface for IdentityDelegate {
                     } => create_identity(ctx, &handle, &display_name),
                     Request::GetIdentity => get_identity(ctx),
                     Request::SignPost {
+                        nonce,
                         content,
                         author_name,
                         author_handle,
                         timestamp,
-                    } => sign_post(ctx, &content, &author_name, &author_handle, timestamp),
+                    } => sign_post(
+                        ctx,
+                        &nonce,
+                        &content,
+                        &author_name,
+                        &author_handle,
+                        timestamp,
+                    ),
                     Request::ExportIdentity => export_identity(ctx),
                     Request::ImportIdentity {
                         secret_key,
@@ -150,6 +164,7 @@ fn load_signing_key(ctx: &DelegateCtx) -> Result<MlDsaSigningKey<MlDsa65>, Respo
     let Some(seed_bytes) = ctx.get_secret(SECRET_SEED) else {
         return Err(Response::Error {
             message: "no identity found — call CreateIdentity first".to_string(),
+            nonce: None,
         });
     };
     let seed: [u8; MLDSA_SEED_LEN] = match seed_bytes.as_slice().try_into() {
@@ -157,6 +172,7 @@ fn load_signing_key(ctx: &DelegateCtx) -> Result<MlDsaSigningKey<MlDsa65>, Respo
         Err(_) => {
             return Err(Response::Error {
                 message: "stored seed has unexpected length".to_string(),
+                nonce: None,
             });
         }
     };
@@ -211,6 +227,7 @@ fn get_identity(ctx: &DelegateCtx) -> Response {
 
 fn sign_post(
     ctx: &DelegateCtx,
+    nonce: &str,
     content: &str,
     author_name: &str,
     author_handle: &str,
@@ -218,6 +235,14 @@ fn sign_post(
 ) -> Response {
     let signing_key = match load_signing_key(ctx) {
         Ok(k) => k,
+        // Re-tag the load error with this request's nonce so the UI can drop
+        // exactly the stranded draft.
+        Err(Response::Error { message, .. }) => {
+            return Response::Error {
+                message,
+                nonce: Some(nonce.to_string()),
+            };
+        }
         Err(resp) => return resp,
     };
     let public_key = vk_hex(&signing_key);
@@ -237,10 +262,10 @@ fn sign_post(
     let signature: ml_dsa::Signature<MlDsa65> = signing_key.sign(&post.signing_payload());
 
     Response::Signed {
+        nonce: nonce.to_string(),
         post_id: post.id,
         signature: hex::encode(signature.encode()),
         public_key,
-        timestamp,
     }
 }
 
@@ -248,6 +273,7 @@ fn export_identity(ctx: &DelegateCtx) -> Response {
     let Some(seed_bytes) = ctx.get_secret(SECRET_SEED) else {
         return Response::Error {
             message: "no identity to export".to_string(),
+            nonce: None,
         };
     };
     let seed: [u8; MLDSA_SEED_LEN] = match seed_bytes.as_slice().try_into() {
@@ -255,6 +281,7 @@ fn export_identity(ctx: &DelegateCtx) -> Response {
         Err(_) => {
             return Response::Error {
                 message: "stored seed has unexpected length".to_string(),
+                nonce: None,
             };
         }
     };
@@ -274,12 +301,14 @@ fn import_identity(ctx: &mut DelegateCtx, secret_key_hex: &str, display_name: &s
             Err(_) => {
                 return Response::Error {
                     message: "invalid secret key: must be 64 hex characters (32 bytes)".to_string(),
+                    nonce: None,
                 };
             }
         },
         Err(_) => {
             return Response::Error {
                 message: "invalid secret key: must be 64 hex characters (32 bytes)".to_string(),
+                nonce: None,
             };
         }
     };

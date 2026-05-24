@@ -180,36 +180,36 @@ const connection = new FreenetConnection({
       // A signed post came back from the delegate — finish publishing it.
       const signed = payload as {
         type?: string;
+        nonce?: string;
         post_id?: string;
         signature?: string;
         public_key?: string;
-        timestamp?: number;
       };
       if (
         signed.type === "Signed" &&
+        signed.nonce &&
         signed.post_id &&
         signed.signature &&
-        signed.public_key &&
-        typeof signed.timestamp === "number"
+        signed.public_key
       ) {
         connection
           .completePublish({
+            nonce: signed.nonce,
             post_id: signed.post_id,
             signature: signed.signature,
             public_key: signed.public_key,
-            timestamp: signed.timestamp,
           })
           .catch((e) => console.error("[delegate] completePublish failed:", e));
         return;
       }
 
       // Check for an error from the delegate.
-      const p = payload as { type?: string; message?: string };
+      const p = payload as { type?: string; message?: string; nonce?: string };
       if (p.type === "Error") {
-        // A signing failure leaves a draft stranded in the pending queue;
-        // drop the oldest so the queue can't desync. (Timestamp-matched
-        // completion means at worst we discard one stuck draft.)
-        connection.dropOldestPendingPost();
+        // If the error carries a nonce it came from a failed SignPost — drop
+        // exactly that stranded draft. Errors without a nonce (GetIdentity,
+        // Export, …) leave the pending queue untouched.
+        if (p.nonce) connection.dropPendingPost(p.nonce);
         if (p.message?.includes("no identity")) {
           console.log("[identity] No identity in delegate — show onboarding");
           if (!appRendered) {

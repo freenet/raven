@@ -43,6 +43,7 @@ interface ContractPost {
 }
 
 interface PendingPostDraft {
+  nonce: string;
   author_name: string;
   author_handle: string;
   content: string;
@@ -358,18 +359,22 @@ export class FreenetConnection {
       return false;
     }
     const timestamp = Date.now();
+    // Per-request nonce uniquely identifies this draft. The Signed response
+    // echoes it, so completePublish matches the exact draft even when two posts
+    // share the same millisecond timestamp (Date.now() collision) — matching on
+    // timestamp alone could otherwise pair the wrong content with a signature.
+    const nonce = crypto.randomUUID();
     const draft: PendingPostDraft = {
+      nonce,
       author_name: this.currentUser.name,
       author_handle: this.currentUser.handle,
       content,
       timestamp,
     };
-    // The Signed response echoes `timestamp`; completePublish matches on it
-    // rather than positionally, so a dropped/errored sign request can't shift
-    // the whole queue onto the wrong drafts.
     this.pendingPosts.push(draft);
 
     const requested = signPost(
+      nonce,
       content,
       this.currentUser.name,
       this.currentUser.handle,
@@ -389,22 +394,20 @@ export class FreenetConnection {
    * the pending draft, assembles the signed ContractPost, and sends it.
    */
   async completePublish(signed: {
+    nonce: string;
     post_id: string;
     signature: string;
     public_key: string;
-    timestamp: number;
   }): Promise<boolean> {
     if (!this.api || !this.contractKey) return false;
 
-    // Match the draft by the echoed timestamp, not position — robust to a
-    // dropped/errored sign request that never produced a Signed response.
-    const idx = this.pendingPosts.findIndex(
-      (d) => d.timestamp === signed.timestamp
-    );
+    // Match the draft by its unique nonce, not position or timestamp — robust
+    // to a dropped/errored sign request and to same-millisecond posts.
+    const idx = this.pendingPosts.findIndex((d) => d.nonce === signed.nonce);
     if (idx === -1) {
       console.warn(
         "[freenet] Signed response with no matching pending draft",
-        signed.timestamp
+        signed.nonce
       );
       return false;
     }
@@ -435,12 +438,14 @@ export class FreenetConnection {
   }
 
   /**
-   * Drop the oldest pending post draft. Called when the delegate returns an
-   * Error (e.g. a SignPost that failed), so a stranded draft can't desync the
-   * timestamp-matched pending queue.
+   * Drop a specific pending post draft by nonce. Called when the delegate
+   * returns an Error carrying the originating nonce (a SignPost that failed),
+   * so only the stranded draft is removed — unrelated errors (GetIdentity,
+   * Export, …) carry no nonce and leave the queue untouched.
    */
-  dropOldestPendingPost(): void {
-    this.pendingPosts.shift();
+  dropPendingPost(nonce: string): void {
+    const idx = this.pendingPosts.findIndex((d) => d.nonce === nonce);
+    if (idx !== -1) this.pendingPosts.splice(idx, 1);
   }
 
   /**
