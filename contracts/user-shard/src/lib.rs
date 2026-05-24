@@ -35,7 +35,12 @@
 //!   bytes for determinism). Order-independent.
 //! * **follows** — each followed key records the `seq` of the op that last
 //!   touched it and whether that op was Follow; merge keeps the higher seq per
-//!   key. Convergent under reordering, unlike a bare add/remove set.
+//!   key, and an Unfollow wins on equal seq. This per-key rule is a join
+//!   semilattice, so it is convergent under reordering, unlike a bare add/remove
+//!   set. The `MAX_FOLLOWS` cap is enforced post-merge by `truncate_follows` as
+//!   a function of the key set (tombstones evicted first, then largest key) —
+//!   never by arrival order, which would diverge. Over-cap eviction is
+//!   best-effort lossy, the same trade-off as the post window.
 
 use freenet_microblogging_common::post::{MAX_CONTENT_LEN, Post};
 use freenet_microblogging_common::signed_op::{OpType, Profile, SignedOp, USER_SHARD_CONTEXT};
@@ -237,14 +242,11 @@ fn apply_op(shard: &mut UserShard, op: &SignedOp, owner: &str) -> bool {
                 if target.len() > MAX_TARGET_KEY_LEN {
                     continue; // skip malformed/oversized key, don't fail the batch
                 }
-                let existing = shard.follows.get(&target);
-                // Don't grow the map past the cap with brand-new keys (keeps the
-                // state within what validate_state accepts). Updates to existing
-                // keys are always allowed — they don't increase the size.
-                if existing.is_none() && shard.follows.len() >= MAX_FOLLOWS {
-                    continue;
-                }
-                let apply = match existing {
+                // Insert freely; the cap is enforced deterministically post-merge
+                // in `truncate_follows` (a function of the key set, not arrival
+                // order — see MAJOR-1 in review). Per-key convergence below the
+                // cap is exact via `follow_replaces`.
+                let apply = match shard.follows.get(&target) {
                     None => true,
                     Some(cur) => follow_replaces(op.seq, following, cur),
                 };
@@ -288,16 +290,13 @@ fn merge_state(shard: &mut UserShard, other: UserShard, owner: &str) {
         }
     }
     // Follows: higher seq wins per key, with the same equal-seq tie-break as
-    // apply_op so a delta-applied state and a full-state merge converge.
+    // apply_op so a delta-applied state and a full-state merge converge. The cap
+    // is applied deterministically post-merge in `truncate_follows`, not here.
     for (target, other_fs) in other.follows {
         if target.len() > MAX_TARGET_KEY_LEN {
             continue;
         }
-        let existing = shard.follows.get(&target);
-        if existing.is_none() && shard.follows.len() >= MAX_FOLLOWS {
-            continue;
-        }
-        let keep = match existing {
+        let keep = match shard.follows.get(&target) {
             None => true,
             Some(cur) => follow_replaces(other_fs.seq, other_fs.following, cur),
         };
@@ -307,11 +306,40 @@ fn merge_state(shard: &mut UserShard, other: UserShard, owner: &str) {
     }
 }
 
-/// Restore canonical storage order + dedup posts after any merge.
+/// Enforce `MAX_FOLLOWS` deterministically as a function of the key SET (never
+/// arrival order — that was review MAJOR-1: arrival-order admission diverges
+/// permanently across replicas at the cap). When over the cap, drop entries by
+/// (tombstones first, then largest key) until at the cap. Dropping tombstoned
+/// (unfollowed) entries first also bounds tombstone accumulation (review NIT).
+fn truncate_follows(follows: &mut BTreeMap<String, FollowState>) {
+    if follows.len() <= MAX_FOLLOWS {
+        return;
+    }
+    // Eviction order: a tombstone (following == false) is dropped before any
+    // active follow; within the same class, the lexicographically larger key is
+    // dropped first. This is a total order over the keys, so every replica with
+    // the same map evicts the identical set.
+    let mut keys: Vec<(bool, String)> = follows
+        .iter()
+        .map(|(k, v)| (v.following, k.clone()))
+        .collect();
+    // Sort so the entries we KEEP come first: active before tombstone, then key
+    // ascending. (active=true should sort before false → reverse the bool.)
+    keys.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, key) in keys.into_iter().skip(MAX_FOLLOWS) {
+        follows.remove(&key);
+    }
+}
+
+/// Restore canonical order + enforce both bounded surfaces after any merge.
+/// Like the post window, follow eviction over the cap is best-effort lossy
+/// (same trade-off as recent-N posts): deterministic given an identical merged
+/// map, but an over-cap shard does not retain everything across partial syncs.
 fn normalize(shard: &mut UserShard) {
     shard.posts.sort_by_cached_key(post_hash);
     shard.posts.dedup_by_key(|p| post_hash(p));
     truncate_window(&mut shard.posts);
+    truncate_follows(&mut shard.follows);
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +829,76 @@ mod test {
             .unwrap(),
             ValidateResult::Invalid
         ));
+    }
+
+    #[test]
+    fn follows_cap_eviction_is_order_independent() {
+        // Regression for review MAJOR-1: building an over-cap follow set in two
+        // different op orders must yield the SAME retained key set (eviction is
+        // a function of the key set, not arrival order). truncate_follows keeps
+        // the lexicographically-smallest active keys.
+        let keys: Vec<String> = (0..MAX_FOLLOWS + 200)
+            .map(|i| format!("{i:0>10}"))
+            .collect();
+        assert!(keys.len() > MAX_FOLLOWS);
+
+        let mut f1 = BTreeMap::new();
+        for k in &keys {
+            f1.insert(
+                k.clone(),
+                FollowState {
+                    seq: 1,
+                    following: true,
+                },
+            );
+        }
+        let mut f2 = BTreeMap::new();
+        for k in keys.iter().rev() {
+            f2.insert(
+                k.clone(),
+                FollowState {
+                    seq: 1,
+                    following: true,
+                },
+            );
+        }
+        truncate_follows(&mut f1);
+        truncate_follows(&mut f2);
+        assert_eq!(f1.len(), MAX_FOLLOWS);
+        assert_eq!(f1.keys().collect::<Vec<_>>(), f2.keys().collect::<Vec<_>>());
+        // Smallest keys retained: "0000000000" present, the largest absent.
+        assert!(f1.contains_key(&keys[0]));
+        assert!(!f1.contains_key(keys.last().unwrap()));
+    }
+
+    #[test]
+    fn follows_cap_evicts_tombstones_first() {
+        // Review NIT: tombstones (unfollowed) are dropped before active follows
+        // when over the cap, so churn can't wedge the map full of tombstones.
+        let mut f = BTreeMap::new();
+        // MAX_FOLLOWS active + 10 tombstones = over cap by 10.
+        for i in 0..MAX_FOLLOWS {
+            f.insert(
+                format!("a{i:0>10}"),
+                FollowState {
+                    seq: 1,
+                    following: true,
+                },
+            );
+        }
+        for i in 0..10 {
+            f.insert(
+                format!("z{i:0>10}"),
+                FollowState {
+                    seq: 2,
+                    following: false,
+                },
+            );
+        }
+        truncate_follows(&mut f);
+        assert_eq!(f.len(), MAX_FOLLOWS);
+        // All tombstones evicted; all actives retained.
+        assert!(f.values().all(|v| v.following));
     }
 
     #[test]

@@ -162,10 +162,14 @@ The envelope is **bound to a shard context** (`USER_SHARD_CONTEXT =
 "raven:user-shard:v1"`) mixed into `signing_payload`, so a future thread/inbox
 shard reusing `SignedOp` cannot have a user-shard op replayed into it (review
 M-2). Follows are also bounded — `MAX_FOLLOWS` map entries, `MAX_FOLLOW_TARGETS_
-PER_OP` per op, and a target-key length cap — enforced in `validate_state` and
-respected by `apply_op`/`merge_state` (new keys are not inserted past the cap),
-so an owner cannot self-bloat the shard (review M-1). Hitting the cap requires
-the owner to unfollow before following more.
+PER_OP` per op, and a target-key length cap — so an owner cannot self-bloat the
+shard (review M-1). The cap is applied **post-merge by `truncate_follows` as a
+function of the key set** (tombstones evicted first, then largest key), never by
+arrival order: an earlier draft skipped new keys at insert time, which made the
+retained set order-dependent and split replicas permanently at the cap (review
+MAJOR-1, fourth round — the same convergence class as C-1). Over-cap eviction is
+best-effort lossy, the same trade-off as the recent-N post window. Evicting
+tombstones first also bounds tombstone accumulation (review NIT).
 
 **Delta format is now a tagged `ShardDelta` enum** (`Posts(Vec<Post>)` |
 `Op(SignedOp)`), forced by review finding MAJOR-2: the Phase-1 bare-`Vec<Post>`
