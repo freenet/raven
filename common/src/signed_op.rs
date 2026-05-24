@@ -85,15 +85,23 @@ pub struct SignedOp {
 
 impl SignedOp {
     /// The exact bytes signed and verified: a length-prefixed concatenation of
-    /// the domain tag, op-type tag, payload, seq, and signer key. Deterministic
-    /// across builds; `signature` is excluded (it is derived from this).
-    pub fn signing_payload(&self) -> Vec<u8> {
+    /// the domain tag, the shard `context`, op-type tag, payload, seq, and signer
+    /// key. Deterministic across builds; `signature` is excluded (it is derived
+    /// from this).
+    ///
+    /// `context` binds the op to a specific shard *type* (e.g. the user shard),
+    /// so an op signed for one shard cannot be replayed into a different shard
+    /// that also uses `SignedOp`. Each shard contract passes its own constant
+    /// (e.g. [`USER_SHARD_CONTEXT`]); the same `context` must be passed to
+    /// [`SignedOp::verify`].
+    pub fn signing_payload(&self, context: &[u8]) -> Vec<u8> {
         fn put(buf: &mut Vec<u8>, field: &[u8]) {
             buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
             buf.extend_from_slice(field);
         }
         let mut buf = Vec::new();
         put(&mut buf, SIGNED_OP_DOMAIN_TAG);
+        put(&mut buf, context);
         put(&mut buf, self.op_type.tag());
         put(&mut buf, &self.payload);
         put(&mut buf, &self.seq.to_le_bytes());
@@ -101,10 +109,10 @@ impl SignedOp {
         buf
     }
 
-    /// Verify the op is well-formed and signed by `expected_owner_vk_hex`. This
-    /// is what a user-shard `update_state` calls before applying a profile or
-    /// follow mutation.
-    pub fn verify(&self, expected_owner_vk_hex: &str) -> Result<(), VerifyError> {
+    /// Verify the op is well-formed, bound to `context`, and signed by
+    /// `expected_owner_vk_hex`. This is what a shard `update_state` calls before
+    /// applying a profile or follow mutation, passing its own shard context.
+    pub fn verify(&self, context: &[u8], expected_owner_vk_hex: &str) -> Result<(), VerifyError> {
         // Owner-writes: the signer must be exactly this shard's owner.
         if self.signer_pubkey != expected_owner_vk_hex {
             return Err(VerifyError::NotOwner);
@@ -125,10 +133,16 @@ impl SignedOp {
             .map_err(|_| VerifyError::BadSignature)?;
         let sig = Signature::<MlDsa65>::decode(&sig_encoded).ok_or(VerifyError::BadSignature)?;
 
-        vk.verify(&self.signing_payload(), &sig)
+        vk.verify(&self.signing_payload(context), &sig)
             .map_err(|_| VerifyError::SignatureInvalid)
     }
 }
+
+/// Shard-context tag for the **user shard**, mixed into every user-shard
+/// `SignedOp` signature. A future thread/inbox shard reusing `SignedOp` must
+/// pass its own distinct context, so an op signed for one shard type can never
+/// verify against another.
+pub const USER_SHARD_CONTEXT: &[u8] = b"raven:user-shard:v1";
 
 /// The profile register carried in a [`OpType::Profile`] op's payload. Bounded
 /// so a malicious owner cannot bloat their own shard without limit (the only
@@ -168,12 +182,14 @@ mod test {
     use ml_dsa::KeyGen;
     use ml_dsa::signature::{Keypair, Signer};
 
+    const CTX: &[u8] = USER_SHARD_CONTEXT;
+
     fn owner_vk_hex(seed: [u8; 32]) -> String {
         let sk = MlDsa65::from_seed(&seed.into());
         hex::encode(sk.verifying_key().encode())
     }
 
-    /// Build a fully-signed op the way the delegate would.
+    /// Build a fully-signed op (for context `CTX`) the way the delegate would.
     fn signed(seed: [u8; 32], op_type: OpType, payload: Vec<u8>, seq: u64) -> SignedOp {
         let sk = MlDsa65::from_seed(&seed.into());
         let mut op = SignedOp {
@@ -183,7 +199,7 @@ mod test {
             signer_pubkey: hex::encode(sk.verifying_key().encode()),
             signature: None,
         };
-        let sig: Signature<MlDsa65> = sk.sign(&op.signing_payload());
+        let sig: Signature<MlDsa65> = sk.sign(&op.signing_payload(CTX));
         op.signature = Some(hex::encode(sig.encode()));
         op
     }
@@ -192,7 +208,7 @@ mod test {
     fn verify_accepts_owner_signed_op() {
         let owner = owner_vk_hex([1u8; 32]);
         let op = signed([1u8; 32], OpType::Profile, b"hello".to_vec(), 1);
-        assert_eq!(op.verify(&owner), Ok(()));
+        assert_eq!(op.verify(CTX, &owner), Ok(()));
     }
 
     #[test]
@@ -201,7 +217,20 @@ mod test {
         // is NotOwner (checked before the crypto).
         let owner = owner_vk_hex([1u8; 32]);
         let op = signed([2u8; 32], OpType::Profile, b"hello".to_vec(), 1);
-        assert_eq!(op.verify(&owner), Err(VerifyError::NotOwner));
+        assert_eq!(op.verify(CTX, &owner), Err(VerifyError::NotOwner));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_context() {
+        // An op signed for the user shard must not verify under another shard's
+        // context — cross-shard replay defense.
+        let owner = owner_vk_hex([1u8; 32]);
+        let op = signed([1u8; 32], OpType::Profile, b"hello".to_vec(), 1);
+        assert_eq!(op.verify(CTX, &owner), Ok(()));
+        assert_eq!(
+            op.verify(b"raven:thread-shard:v1", &owner),
+            Err(VerifyError::SignatureInvalid)
+        );
     }
 
     #[test]
@@ -209,7 +238,7 @@ mod test {
         let owner = owner_vk_hex([1u8; 32]);
         let mut op = signed([1u8; 32], OpType::Profile, b"hello".to_vec(), 1);
         op.payload = b"tampered".to_vec();
-        assert_eq!(op.verify(&owner), Err(VerifyError::SignatureInvalid));
+        assert_eq!(op.verify(CTX, &owner), Err(VerifyError::SignatureInvalid));
     }
 
     #[test]
@@ -218,7 +247,7 @@ mod test {
         let owner = owner_vk_hex([1u8; 32]);
         let mut op = signed([1u8; 32], OpType::Profile, b"hello".to_vec(), 1);
         op.seq = 9999;
-        assert_eq!(op.verify(&owner), Err(VerifyError::SignatureInvalid));
+        assert_eq!(op.verify(CTX, &owner), Err(VerifyError::SignatureInvalid));
     }
 
     #[test]
@@ -228,7 +257,7 @@ mod test {
         let owner = owner_vk_hex([1u8; 32]);
         let mut op = signed([1u8; 32], OpType::Follow, b"key".to_vec(), 1);
         op.op_type = OpType::Unfollow;
-        assert_eq!(op.verify(&owner), Err(VerifyError::SignatureInvalid));
+        assert_eq!(op.verify(CTX, &owner), Err(VerifyError::SignatureInvalid));
     }
 
     #[test]
@@ -236,7 +265,7 @@ mod test {
         let owner = owner_vk_hex([1u8; 32]);
         let mut op = signed([1u8; 32], OpType::Profile, b"x".to_vec(), 1);
         op.signature = None;
-        assert_eq!(op.verify(&owner), Err(VerifyError::BadSignature));
+        assert_eq!(op.verify(CTX, &owner), Err(VerifyError::BadSignature));
     }
 
     #[test]
@@ -244,7 +273,7 @@ mod test {
         let a = signed([1u8; 32], OpType::Follow, b"ab".to_vec(), 1);
         let mut b = a.clone();
         b.payload = b"a".to_vec();
-        assert_ne!(a.signing_payload(), b.signing_payload());
+        assert_ne!(a.signing_payload(CTX), b.signing_payload(CTX));
     }
 
     #[test]

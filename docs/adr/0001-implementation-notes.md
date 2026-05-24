@@ -151,10 +151,21 @@ arrive in any order across replicas):
 - *profile* — last-write-wins by monotonic `seq`, tie-broken by serialized bytes
   (no clock in a contract; the delegate supplies a monotonic counter).
 - *follows* — each target key stores the `seq` of the op that last touched it and
-  whether it was a Follow; merge keeps the higher `seq` per key. This is
-  convergent under reordering, unlike the bare add/remove set in the legacy
-  global `follows` contract (whose own NOTE admits Follow/Unfollow is not
-  commutative).
+  whether it was a Follow; merge keeps the higher `seq` per key, and on **equal
+  seq an Unfollow wins** (a deterministic tie-break). This is convergent under
+  reordering, unlike the bare add/remove set in the legacy global `follows`
+  contract (whose own NOTE admits Follow/Unfollow is not commutative). The
+  equal-seq tie-break is load-bearing: without it, concurrent Follow/Unfollow at
+  the same seq splits replicas permanently (review C-1).
+
+The envelope is **bound to a shard context** (`USER_SHARD_CONTEXT =
+"raven:user-shard:v1"`) mixed into `signing_payload`, so a future thread/inbox
+shard reusing `SignedOp` cannot have a user-shard op replayed into it (review
+M-2). Follows are also bounded — `MAX_FOLLOWS` map entries, `MAX_FOLLOW_TARGETS_
+PER_OP` per op, and a target-key length cap — enforced in `validate_state` and
+respected by `apply_op`/`merge_state` (new keys are not inserted past the cap),
+so an owner cannot self-bloat the shard (review M-1). Hitting the cap requires
+the owner to unfollow before following more.
 
 **Delta format is now a tagged `ShardDelta` enum** (`Posts(Vec<Post>)` |
 `Op(SignedOp)`), forced by review finding MAJOR-2: the Phase-1 bare-`Vec<Post>`

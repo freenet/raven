@@ -38,7 +38,7 @@
 //!   key. Convergent under reordering, unlike a bare add/remove set.
 
 use freenet_microblogging_common::post::{MAX_CONTENT_LEN, Post};
-use freenet_microblogging_common::signed_op::{OpType, Profile, SignedOp};
+use freenet_microblogging_common::signed_op::{OpType, Profile, SignedOp, USER_SHARD_CONTEXT};
 use freenet_stdlib::prelude::{
     blake3::{Hasher as Blake3, traits::digest::Digest},
     *,
@@ -48,6 +48,20 @@ use std::collections::BTreeMap;
 
 /// Recent-post retention window. ADR-0001 starting policy: ~200.
 const MAX_POSTS: usize = 200;
+
+/// Cap on the number of distinct followed keys retained. Like the profile field
+/// bounds, this caps an owner's self-bloat (the only blast radius for an
+/// owner-writes surface). Enforced post-merge in `validate_state` (transient
+/// over-bound during merge is tolerated, mirroring the post window).
+const MAX_FOLLOWS: usize = 5_000;
+
+/// Cap on targets a single follow/unfollow op may carry, so one op cannot
+/// blow the follow set in a single write.
+const MAX_FOLLOW_TARGETS_PER_OP: usize = 1_000;
+
+/// Maximum length of a followed-key hex string (an ML-DSA-65 VK is 1952 bytes →
+/// 3904 hex chars). Rejects malformed/oversized target strings.
+const MAX_TARGET_KEY_LEN: usize = 3904;
 
 /// Per-key follow record: the `seq` of the op that last touched this key and
 /// whether that op was a Follow (`true`) or an Unfollow (`false`). Merge keeps
@@ -158,11 +172,26 @@ fn posts_are_valid_state(posts: &[Post], owner: &str) -> bool {
     true
 }
 
+/// Whether an incoming follow entry `(seq, following)` should replace the
+/// current one for a key. Higher seq always wins. On EQUAL seq the states must
+/// still converge regardless of arrival order, so a deterministic tie-break is
+/// required: an Unfollow (`following == false`) beats a Follow. Without this,
+/// concurrent Follow/Unfollow at the same seq diverges permanently (one replica
+/// keeps `true`, the other `false`, and neither heals on gossip).
+fn follow_replaces(new_seq: u64, new_following: bool, cur: &FollowState) -> bool {
+    if new_seq != cur.seq {
+        return new_seq > cur.seq;
+    }
+    // Equal seq: Unfollow (false) wins. Only a state actually changing matters,
+    // so replace iff the incoming differs and is the tie-break winner.
+    !new_following && cur.following
+}
+
 /// Apply an owner-signed op to the shard. Returns whether anything changed.
 /// Rejected (non-owner / bad signature / out-of-bounds) ops are silently
 /// skipped — a bad op in a batch is dropped, not fatal.
 fn apply_op(shard: &mut UserShard, op: &SignedOp, owner: &str) -> bool {
-    if op.verify(owner).is_err() {
+    if op.verify(USER_SHARD_CONTEXT, owner).is_err() {
         return false;
     }
     match op.op_type {
@@ -198,14 +227,26 @@ fn apply_op(shard: &mut UserShard, op: &SignedOp, owner: &str) -> bool {
             let Ok(targets) = serde_json::from_slice::<Vec<String>>(&op.payload) else {
                 return false;
             };
+            // Reject an over-large batch outright (fail closed, don't truncate).
+            if targets.len() > MAX_FOLLOW_TARGETS_PER_OP {
+                return false;
+            }
             let following = matches!(op.op_type, OpType::Follow);
             let mut changed = false;
             for target in targets {
-                let entry = shard.follows.get(&target);
-                // Higher seq wins per key; equal seq keeps existing (idempotent).
-                let apply = match entry {
+                if target.len() > MAX_TARGET_KEY_LEN {
+                    continue; // skip malformed/oversized key, don't fail the batch
+                }
+                let existing = shard.follows.get(&target);
+                // Don't grow the map past the cap with brand-new keys (keeps the
+                // state within what validate_state accepts). Updates to existing
+                // keys are always allowed — they don't increase the size.
+                if existing.is_none() && shard.follows.len() >= MAX_FOLLOWS {
+                    continue;
+                }
+                let apply = match existing {
                     None => true,
-                    Some(cur) => op.seq > cur.seq,
+                    Some(cur) => follow_replaces(op.seq, following, cur),
                 };
                 if apply {
                     shard.follows.insert(
@@ -246,11 +287,19 @@ fn merge_state(shard: &mut UserShard, other: UserShard, owner: &str) {
             shard.profile = Some(other_p);
         }
     }
-    // Follows: higher seq wins per key.
+    // Follows: higher seq wins per key, with the same equal-seq tie-break as
+    // apply_op so a delta-applied state and a full-state merge converge.
     for (target, other_fs) in other.follows {
-        let keep = match shard.follows.get(&target) {
+        if target.len() > MAX_TARGET_KEY_LEN {
+            continue;
+        }
+        let existing = shard.follows.get(&target);
+        if existing.is_none() && shard.follows.len() >= MAX_FOLLOWS {
+            continue;
+        }
+        let keep = match existing {
             None => true,
-            Some(cur) => other_fs.seq > cur.seq,
+            Some(cur) => follow_replaces(other_fs.seq, other_fs.following, cur),
         };
         if keep {
             shard.follows.insert(target, other_fs);
@@ -332,6 +381,16 @@ impl ContractInterface for UserShard {
             if !reg.profile.within_bounds() {
                 return Ok(ValidateResult::Invalid);
             }
+        }
+        // Follows: cap the map size (owner self-bloat ceiling) and reject any
+        // malformed/oversized target key. The count of *actively followed* keys
+        // is what the cap bounds; tombstoned (unfollowed) entries are retained
+        // for convergence but also counted, so the cap is on total entries.
+        if shard.follows.len() > MAX_FOLLOWS {
+            return Ok(ValidateResult::Invalid);
+        }
+        if shard.follows.keys().any(|k| k.len() > MAX_TARGET_KEY_LEN) {
+            return Ok(ValidateResult::Invalid);
         }
         Ok(ValidateResult::Valid)
     }
@@ -512,7 +571,7 @@ mod test {
             signer_pubkey: hex::encode(sk.verifying_key().encode()),
             signature: None,
         };
-        let sig: ml_dsa::Signature<MlDsa65> = sk.sign(&op.signing_payload());
+        let sig: ml_dsa::Signature<MlDsa65> = sk.sign(&op.signing_payload(USER_SHARD_CONTEXT));
         op.signature = Some(hex::encode(sig.encode()));
         op
     }
@@ -656,6 +715,92 @@ mod test {
         let shard2: UserShard = serde_json::from_slice(&bytes2).unwrap();
         assert!(!shard2.follows.get(&a).unwrap().following);
         assert!(shard2.follows.get(&b).unwrap().following);
+    }
+
+    #[test]
+    fn follows_equal_seq_converges() {
+        // Regression for review C-1: Follow(k) and Unfollow(k) at the SAME seq
+        // must converge regardless of order (was a permanent split-brain — one
+        // replica kept following=true, the other false, neither healed). The
+        // deterministic tie-break is "Unfollow wins on equal seq".
+        let owner = [1u8; 32];
+        let k = vk_hex([10u8; 32]);
+
+        // Follow(seq=5) then Unfollow(seq=5).
+        let s1: UserShard = serde_json::from_slice(&apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Op(follow_op(owner, &[&k], true, 5)),
+                ShardDelta::Op(follow_op(owner, &[&k], false, 5)),
+            ],
+        ))
+        .unwrap();
+
+        // Unfollow(seq=5) then Follow(seq=5) — reverse order.
+        let s2: UserShard = serde_json::from_slice(&apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Op(follow_op(owner, &[&k], false, 5)),
+                ShardDelta::Op(follow_op(owner, &[&k], true, 5)),
+            ],
+        ))
+        .unwrap();
+
+        // Both converge to the same result (Unfollow wins on tie).
+        assert_eq!(s1.follows.get(&k), s2.follows.get(&k));
+        assert!(!s1.follows.get(&k).unwrap().following);
+
+        // And a full-state merge of one into the other also converges.
+        let s1_bytes = serde_json::to_vec(&s1).unwrap();
+        let merged = UserShard::update_state(
+            params_of(owner),
+            State::from(serde_json::to_vec(&s2).unwrap()),
+            vec![UpdateData::State(State::from(s1_bytes))],
+        )
+        .unwrap()
+        .unwrap_valid();
+        let sm: UserShard = serde_json::from_slice(merged.as_ref()).unwrap();
+        assert!(!sm.follows.get(&k).unwrap().following);
+    }
+
+    #[test]
+    fn follows_rejects_oversized_op_and_caps_map() {
+        let owner = [1u8; 32];
+        // An op carrying more than MAX_FOLLOW_TARGETS_PER_OP targets is dropped.
+        let many: Vec<String> = (0..MAX_FOLLOW_TARGETS_PER_OP + 1)
+            .map(|i| format!("{i:0>8}"))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        let bytes = apply(
+            owner,
+            empty_state(),
+            vec![ShardDelta::Op(follow_op(owner, &refs, true, 1))],
+        );
+        let shard: UserShard = serde_json::from_slice(&bytes).unwrap();
+        assert!(shard.follows.is_empty());
+
+        // validate_state rejects a state whose follows map exceeds MAX_FOLLOWS.
+        let mut over = UserShard::default();
+        for i in 0..=MAX_FOLLOWS {
+            over.follows.insert(
+                format!("{i:0>8}"),
+                FollowState {
+                    seq: 1,
+                    following: true,
+                },
+            );
+        }
+        assert!(matches!(
+            UserShard::validate_state(
+                params_of(owner),
+                State::from(serde_json::to_vec(&over).unwrap()),
+                RelatedContracts::new(),
+            )
+            .unwrap(),
+            ValidateResult::Invalid
+        ));
     }
 
     #[test]
