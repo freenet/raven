@@ -1,0 +1,263 @@
+//! Canonical signed post record shared by the identity delegate, the shard
+//! contracts (ADR-0001), and any external indexer (Atlas).
+//!
+//! A post is a **self-contained signed record with a stable, content-addressed
+//! ID** (ADR-0001 → "Durable history is not Raven's job"). The ID is
+//! `blake3(canonical_signing_payload)`, so it is collision-resistant and
+//! tamper-evident: changing any signed field changes the ID, and the ID can be
+//! referenced externally without rehydrating internal state.
+//!
+//! Signatures are ML-DSA-65 (FIPS 204). The signing payload is a deterministic,
+//! length-prefixed concatenation of the signed fields — NOT `serde_json`, whose
+//! field order and whitespace are not guaranteed stable across versions. The
+//! same payload is hashed for the ID and verified for the signature.
+
+use ml_dsa::signature::Verifier;
+use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa65, Signature, VerifyingKey};
+use serde::{Deserialize, Serialize};
+
+/// Why a post failed verification. Carried back so callers can log/reject
+/// precisely rather than treating every failure as "invalid signature".
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerifyError {
+    /// `signature` field was absent.
+    MissingSignature,
+    /// `author_pubkey` was not valid hex or not a valid ML-DSA-65 VK.
+    BadPublicKey,
+    /// `signature` was not valid hex or not a valid ML-DSA-65 signature.
+    BadSignature,
+    /// `id` did not match `blake3(signing_payload)`.
+    IdMismatch,
+    /// Signature did not verify against the author's key.
+    SignatureInvalid,
+}
+
+/// Domain-separation tag mixed into every post signing payload, so a post
+/// signature can never be replayed as a signature over some other Raven
+/// structure (profile delta, follow op, …) that happens to share bytes.
+pub const POST_DOMAIN_TAG: &[u8] = b"raven:post:v1";
+
+/// A signed post record.
+///
+/// Schema-tolerance: additive fields must carry `#[serde(default, …)]` so older
+/// wire shapes still decode under newer code (AGENTS.md → "Contract migration").
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Post {
+    /// Content-addressed ID: hex of `blake3(signing_payload)`. Derived, not
+    /// author-chosen — recompute with [`Post::compute_id`] and reject a
+    /// mismatch.
+    pub id: String,
+    /// Hex-encoded ML-DSA-65 verifying key of the author (1952 bytes → 3904 hex).
+    pub author_pubkey: String,
+    /// Display name.
+    pub author_name: String,
+    /// `@handle`.
+    pub author_handle: String,
+    /// Post text (max [`MAX_CONTENT_LEN`] chars).
+    pub content: String,
+    /// Unix timestamp, milliseconds. Part of the signed payload, so it cannot
+    /// be altered without invalidating the signature; it is not read as a clock
+    /// by any contract.
+    pub timestamp: u64,
+    /// Hex-encoded ML-DSA-65 signature over the signing payload (3309 bytes).
+    /// Optional only for forward/backward wire tolerance; an unsigned post is
+    /// rejected by [`Post::verify`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// Maximum post length, in characters. Enforced in `validate_state` and the UI.
+pub const MAX_CONTENT_LEN: usize = 280;
+
+impl Post {
+    /// The exact bytes that are hashed for the ID and signed/verified.
+    ///
+    /// Length-prefixed concatenation (`u32` LE length + bytes per field) so no
+    /// field-boundary ambiguity exists and the encoding is deterministic across
+    /// builds. `id` and `signature` are intentionally excluded — they are
+    /// *derived from* this payload.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        fn put(buf: &mut Vec<u8>, field: &[u8]) {
+            buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+            buf.extend_from_slice(field);
+        }
+        let mut buf = Vec::new();
+        put(&mut buf, POST_DOMAIN_TAG);
+        put(&mut buf, self.author_pubkey.as_bytes());
+        put(&mut buf, self.author_name.as_bytes());
+        put(&mut buf, self.author_handle.as_bytes());
+        put(&mut buf, self.content.as_bytes());
+        put(&mut buf, &self.timestamp.to_le_bytes());
+        buf
+    }
+
+    /// Content-addressed ID for this post: hex of `blake3(signing_payload)`.
+    pub fn compute_id(&self) -> String {
+        let payload = self.signing_payload();
+        let hash = blake3::hash(&payload);
+        hex::encode(hash.as_bytes())
+    }
+
+    /// Whether `self.id` matches the recomputed content address.
+    pub fn id_is_valid(&self) -> bool {
+        self.id == self.compute_id()
+    }
+
+    /// Full verification of a self-contained post: the ID is the correct
+    /// content address, and the signature verifies against `author_pubkey`
+    /// over the signing payload. This is what a contract's `update_state`
+    /// calls before accepting a post.
+    pub fn verify(&self) -> Result<(), VerifyError> {
+        let sig_hex = self
+            .signature
+            .as_deref()
+            .ok_or(VerifyError::MissingSignature)?;
+
+        // ID must be the content address of the signed fields.
+        if !self.id_is_valid() {
+            return Err(VerifyError::IdMismatch);
+        }
+
+        // Decode the author's verifying key.
+        let vk_bytes = hex::decode(&self.author_pubkey).map_err(|_| VerifyError::BadPublicKey)?;
+        let vk_encoded: EncodedVerifyingKey<MlDsa65> = vk_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyError::BadPublicKey)?;
+        let vk = VerifyingKey::<MlDsa65>::decode(&vk_encoded);
+
+        // Decode the signature.
+        let sig_bytes = hex::decode(sig_hex).map_err(|_| VerifyError::BadSignature)?;
+        let sig_encoded: EncodedSignature<MlDsa65> = sig_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyError::BadSignature)?;
+        let sig = Signature::<MlDsa65>::decode(&sig_encoded).ok_or(VerifyError::BadSignature)?;
+
+        vk.verify(&self.signing_payload(), &sig)
+            .map_err(|_| VerifyError::SignatureInvalid)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use ml_dsa::KeyGen;
+    use ml_dsa::signature::{Keypair, Signer};
+
+    fn sample() -> Post {
+        Post {
+            id: String::new(),
+            author_pubkey: "ab".repeat(1952),
+            author_name: "Alice".into(),
+            author_handle: "@alice".into(),
+            content: "Hello world".into(),
+            timestamp: 1_700_000_000_000,
+            signature: None,
+        }
+    }
+
+    /// Build a fully-signed post the way the delegate + UI would.
+    fn signed(seed: [u8; 32], content: &str) -> Post {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let vk_hex = hex::encode(sk.verifying_key().encode());
+        let mut p = Post {
+            id: String::new(),
+            author_pubkey: vk_hex,
+            author_name: "Alice".into(),
+            author_handle: "@alice".into(),
+            content: content.into(),
+            timestamp: 1_700_000_000_000,
+            signature: None,
+        };
+        p.id = p.compute_id();
+        let sig: Signature<MlDsa65> = sk.sign(&p.signing_payload());
+        p.signature = Some(hex::encode(sig.encode()));
+        p
+    }
+
+    #[test]
+    fn verify_accepts_well_formed_post() {
+        let p = signed([3u8; 32], "hello raven");
+        assert_eq!(p.verify(), Ok(()));
+    }
+
+    #[test]
+    fn verify_rejects_tampering() {
+        // Tamper with content after signing → id mismatch (id is recomputed first).
+        let mut p = signed([3u8; 32], "hello raven");
+        p.content = "tampered".into();
+        assert_eq!(p.verify(), Err(VerifyError::IdMismatch));
+
+        // Keep id consistent with tampered content but signature now stale.
+        p.id = p.compute_id();
+        assert_eq!(p.verify(), Err(VerifyError::SignatureInvalid));
+
+        // Wrong author key.
+        let mut q = signed([3u8; 32], "hello raven");
+        let other = MlDsa65::from_seed(&[9u8; 32].into());
+        q.author_pubkey = hex::encode(other.verifying_key().encode());
+        // id is over author_pubkey too, so this is an id mismatch.
+        assert_eq!(q.verify(), Err(VerifyError::IdMismatch));
+    }
+
+    #[test]
+    fn verify_rejects_missing_signature() {
+        let mut p = signed([3u8; 32], "x");
+        p.signature = None;
+        assert_eq!(p.verify(), Err(VerifyError::MissingSignature));
+    }
+
+    #[test]
+    fn id_is_deterministic_and_content_addressed() {
+        let mut p = sample();
+        let id = p.compute_id();
+        // Stable across calls.
+        assert_eq!(id, p.compute_id());
+        // 32-byte blake3 → 64 hex chars.
+        assert_eq!(id.len(), 64);
+        // Changing a signed field changes the id.
+        p.content.push('!');
+        assert_ne!(id, p.compute_id());
+    }
+
+    #[test]
+    fn id_validation_roundtrip() {
+        let mut p = sample();
+        assert!(!p.id_is_valid()); // empty id
+        p.id = p.compute_id();
+        assert!(p.id_is_valid());
+        // id excludes the signature/id fields themselves.
+        p.signature = Some("ff".into());
+        assert!(p.id_is_valid());
+    }
+
+    #[test]
+    fn payload_is_length_prefixed_unambiguous() {
+        // "ab"+"c" vs "a"+"bc" must not collide.
+        let mut p1 = sample();
+        p1.author_name = "ab".into();
+        p1.author_handle = "c".into();
+        let mut p2 = sample();
+        p2.author_name = "a".into();
+        p2.author_handle = "bc".into();
+        assert_ne!(p1.signing_payload(), p2.signing_payload());
+    }
+
+    #[test]
+    fn decodes_old_shape_without_signature() {
+        // A post missing `signature` (older shape) and carrying an unknown
+        // forward-compat field must decode.
+        let json = r#"{
+            "id": "deadbeef",
+            "author_pubkey": "ab",
+            "author_name": "Alice",
+            "author_handle": "@alice",
+            "content": "hi",
+            "timestamp": 1700000000000,
+            "reply_to": "future-field"
+        }"#;
+        let p: Post = serde_json::from_str(json).unwrap();
+        assert!(p.signature.is_none());
+    }
+}

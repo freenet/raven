@@ -69,10 +69,37 @@ export function createIdentity(displayName: string, secretKey?: string): Identit
       .catch((e) => console.warn("[identity] Failed to send to delegate:", e));
   }
 
-  const publicKey = secretKey ? secretKey.slice(0, 64) : generateFakePubkey();
-  const handle = publicKey.slice(0, 8);
+  // The ML-DSA-65 verifying key is 1952 bytes and is NOT derivable from the
+  // 32-byte secret seed by string-slicing — the delegate is the sole source of
+  // the public key and returns it in its `Identity`/`Signed` responses
+  // (see applyDelegateIdentity). When connected we use a provisional placeholder
+  // here and let the delegate response replace it. Offline we only have a fake.
+  const publicKey = isDelegateConnected() ? "" : generateFakePubkey();
+  const handle = publicKey ? publicKey.slice(0, 8) : "";
   currentIdentity = { publicKey, displayName, handle };
   return currentIdentity;
+}
+
+/**
+ * Ask the delegate to sign a post. The delegate builds the canonical signing
+ * payload, derives the content-addressed id, and replies with a `Signed`
+ * response routed through onDelegateResponse → freenet-api completePublish.
+ */
+export function signPost(
+  content: string,
+  authorName: string,
+  authorHandle: string,
+  timestamp: number
+): boolean {
+  if (!isDelegateConnected()) return false;
+  sendIdentityMessage(delegateApi!, delegateKeyBytes!, delegateCodeHashBytes!, {
+    type: "SignPost",
+    content,
+    author_name: authorName,
+    author_handle: authorHandle,
+    timestamp,
+  }).catch((e) => console.warn("[identity] SignPost failed:", e));
+  return true;
 }
 
 export function exportIdentity(): void {

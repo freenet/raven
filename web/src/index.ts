@@ -177,6 +177,29 @@ const connection = new FreenetConnection({
         return;
       }
 
+      // A signed post came back from the delegate — finish publishing it.
+      const signed = payload as {
+        type?: string;
+        post_id?: string;
+        signature?: string;
+        public_key?: string;
+      };
+      if (
+        signed.type === "Signed" &&
+        signed.post_id &&
+        signed.signature &&
+        signed.public_key
+      ) {
+        connection
+          .completePublish({
+            post_id: signed.post_id,
+            signature: signed.signature,
+            public_key: signed.public_key,
+          })
+          .catch((e) => console.error("[delegate] completePublish failed:", e));
+        return;
+      }
+
       // Check for "no identity" error from delegate
       const p = payload as { type?: string; message?: string };
       if (p.type === "Error" && p.message?.includes("no identity")) {

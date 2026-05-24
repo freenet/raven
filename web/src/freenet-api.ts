@@ -16,6 +16,7 @@ import {
   ResponseHandler,
 } from "@freenetorg/freenet-stdlib";
 import { Post } from "./types";
+import { signPost } from "./identity";
 import { runMigrations, type MigrationRunnerDeps } from "./migrations/run";
 import {
   LocalStorageMigrationStateStore,
@@ -28,7 +29,9 @@ import {
   type MigratableContract,
 } from "./migrations/legacy-hashes";
 
-// Contract post format (matches Rust contract)
+// Contract post format (matches Rust `common::post::Post`). Signature and
+// author_pubkey are hex strings (ML-DSA-65 sig 3309 B, VK 1952 B); the id is
+// the content address (hex of blake3 over the canonical signing payload).
 interface ContractPost {
   id: string;
   author_pubkey: string;
@@ -36,7 +39,14 @@ interface ContractPost {
   author_handle: string;
   content: string;
   timestamp: number;
-  signature: number[] | null;
+  signature: string | null;
+}
+
+interface PendingPostDraft {
+  author_name: string;
+  author_handle: string;
+  content: string;
+  timestamp: number;
 }
 
 interface PostsFeedState {
@@ -102,6 +112,8 @@ export class FreenetConnection {
     new LocalStorageMigrationStateStore();
   /** True while the startup migration loop probes old contract keys. */
   private migrating = false;
+  /** Drafts awaiting a delegate `Signed` response, FIFO. See publishPost. */
+  private pendingPosts: PendingPostDraft[] = [];
 
   constructor(callbacks: FreenetCallbacks) {
     this.callbacks = callbacks;
@@ -333,19 +345,69 @@ export class FreenetConnection {
     this.currentUser = { pubkey, name, handle };
   }
 
+  /**
+   * Begin publishing a post. The delegate must sign it first (ML-DSA-65 over
+   * the canonical payload) and assign the content-addressed id, so this stashes
+   * the draft and fires a SignPost request. The matching `Signed` response is
+   * routed to {@link completePublish}, which sends the signed post on-chain.
+   * (Mirrors mail's pending-send pattern; delegate responses are not correlated
+   * per-request, so we hold the draft until the signature returns.)
+   */
   async publishPost(content: string): Promise<boolean> {
     if (!this.api || !this.contractKey || !this.currentUser) {
       return false;
     }
-
-    const post: ContractPost = {
-      id: `${this.currentUser.pubkey.slice(0, 16)}-${Date.now()}`,
-      author_pubkey: this.currentUser.pubkey,
+    const timestamp = Date.now();
+    const draft: PendingPostDraft = {
       author_name: this.currentUser.name,
       author_handle: this.currentUser.handle,
       content,
-      timestamp: Date.now(),
-      signature: null,
+      timestamp,
+    };
+    // Keyed by content+timestamp so the returned Signed (which echoes neither
+    // name nor handle) matches the right draft even with rapid posting.
+    this.pendingPosts.push(draft);
+
+    const requested = signPost(
+      content,
+      this.currentUser.name,
+      this.currentUser.handle,
+      timestamp
+    );
+    if (!requested) {
+      // No delegate (offline) — cannot sign, so cannot publish.
+      this.pendingPosts.pop();
+      console.warn("[freenet] Cannot publish: delegate not connected to sign post");
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Complete a publish once the delegate returns a `Signed` response: matches
+   * the pending draft, assembles the signed ContractPost, and sends it.
+   */
+  async completePublish(signed: {
+    post_id: string;
+    signature: string;
+    public_key: string;
+  }): Promise<boolean> {
+    if (!this.api || !this.contractKey) return false;
+
+    const draft = this.pendingPosts.shift();
+    if (!draft) {
+      console.warn("[freenet] Signed response with no pending post draft");
+      return false;
+    }
+
+    const post: ContractPost = {
+      id: signed.post_id,
+      author_pubkey: signed.public_key,
+      author_name: draft.author_name,
+      author_handle: draft.author_handle,
+      content: draft.content,
+      timestamp: draft.timestamp,
+      signature: signed.signature,
     };
 
     try {
