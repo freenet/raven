@@ -91,6 +91,26 @@ echo "wrote build/likes_code_hash: $hash"
 echo "wrote web/likes_contract_id.txt: $instance_id"
 '''
 
+[tasks.build-user-shard]
+description = "Build user-shard contract WASM + code_hash"
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+cd "$ROOT/contracts/user-shard"
+CARGO_TARGET_DIR="$ROOT/target" fdev build
+hash=$(CARGO_TARGET_DIR="$ROOT/target" fdev inspect \
+    "$ROOT/contracts/user-shard/build/freenet/freenet_microblogging_user_shard" code | \
+    grep 'code hash:' | cut -d' ' -f3)
+mkdir -p "$ROOT/build"
+# User shards are PARAMETERIZED (parameters = owner ML-DSA-65 VK), so there is
+# no single contract instance id: each owner derives a distinct key from this
+# code_hash + their VK. Only the code_hash is build-stable; instance ids are
+# computed per owner at runtime (ADR-0001 → "Shard key derivation").
+printf '%s' "$hash" > "$ROOT/build/user_shard_code_hash"
+echo "wrote build/user_shard_code_hash: $hash"
+'''
+
 [tasks.build-identity]
 description = "Build identity delegate WASM + code_hash + delegate_key bytes"
 script_runner = "bash"
@@ -118,7 +138,7 @@ echo "identity hash=$hash key=$key_hex"
 
 [tasks.build-contracts]
 description = "Build all contracts + delegates (WASM + code_hash files)"
-dependencies = ["build-posts", "build-follows", "build-likes", "build-identity"]
+dependencies = ["build-posts", "build-follows", "build-likes", "build-user-shard", "build-identity"]
 
 [tasks.build-web-container]
 description = "Build web/container Rust crate (WASM)"
