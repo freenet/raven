@@ -194,6 +194,93 @@ This rotates the user-shard WASM hash again; still no migration entry (no
 migratable prior state — Phase 1 shipped no real user-shard data). UI wiring is
 still Phase 4.
 
+## Phase 2 decisions (thread shard)
+
+The thread shard (`contracts/thread-shard`) is the first **public-write** shard:
+one contract per root post, created lazily on the first reply, collecting the
+**replies, likes, and quote references** that target that root. It is
+parameterized by the root post's content-addressed id (`parameters =
+root_post_id`), so `contract_key = blake3(thread_shard_wasm || root_post_id)` —
+distinct per thread and, because the WASM hash differs, distinct from a user
+shard parameterized by the same bytes.
+
+### Write authority — anyone-writes, self-verifying, credential seam
+
+Unlike the owner-writes user shard, a thread shard accepts writes from **any**
+party. Each entry still self-verifies:
+
+- a **reply** is a full `common::post::Post` whose `reply_to` equals this
+  thread's root id. `reply_to` is **conditionally mixed into the post signing
+  payload** (only when non-empty — see below), so a reply's thread membership is
+  signed and cannot be replayed into another thread; a top-level post (empty
+  `reply_to`) hashes/signs exactly as before, leaving existing post ids/sigs
+  byte-stable.
+- a **like** is a `common::thread::LikeRecord` and a **quote ref** a
+  `common::thread::QuoteRef`, each an ML-DSA-65 signature over a domain-tagged
+  (`raven:thread-like:v1` / `raven:thread-quote:v1`), length-prefixed payload
+  **including the root post id**, so neither can be replayed into another thread.
+
+Verification proves *who* signed, not that the signer is *allowed* — the ADR's
+abuse model leaves "who may be a writer" to a credential mechanism (GhostKey is
+the candidate, not fixed). Per the Phase 2 decision, the wire slot is reserved
+now: every record carries an optional `WriterCert`, and the contract gates writes
+through a `verify_writer_cert` seam that **accepts everything today**. When a real
+credential lands, only that seam changes — an additive schema step, not a format
+break. (The user shard does not reuse `signed_op::SignedOp` here: `SignedOp` is
+owner-bound — its `verify` rejects any signer ≠ owner — which is exactly wrong
+for an anyone-writes surface, so thread records carry their own self-sig.)
+
+### Convergence per surface (order-independent — AGENTS.md → "Contract correctness invariants")
+
+- *replies* — grow-set deduped by content-address id, truncated post-merge to the
+  newest `MAX_REPLIES` (500) by `(timestamp, id)` desc (a total order; no clock).
+- *likes* — per-liker join semilattice keyed by liker VK: keep the higher `seq`,
+  and on equal `seq` an **unlike wins** (the same deterministic tie-break as the
+  user-shard follows, for the same reason — equal-seq concurrent like/unlike must
+  not split replicas). Capped post-merge by `truncate_likes` as a function of the
+  key set (tombstones evicted first, then largest key).
+- *quotes* — grow-set deduped by `quote_post_id`, capped post-merge by a total
+  order over the key.
+
+All caps are enforced **only post-merge** (`normalize`), never at insert time;
+`validate_state` deliberately does not enforce them (a transiently over-bound
+merged state is normal). `validate_state` *does* reject any reply/quote that
+fails self-verification, is not thread-bound, or is mis-keyed (id ≠ map key), and
+any liker key that is not a valid-length ML-DSA-65 VK — the invariants
+`update_state` guarantees, so the two halves agree.
+
+### Delta format and sync
+
+Deltas are a tagged `ThreadDelta` enum (`Replies` | `Likes` | `Quotes`).
+`update_state` iterates **every** `UpdateData` item and the `State` /
+`StateAndDelta` arms do a full-`ThreadShard` merge, so a peer syncing state
+reconciles all three surfaces. `summarize_state` returns the per-surface key sets
+(plus each like's `(seq, liked)` for diffing), and `get_state_delta` ships a
+`ThreadStateDelta` carrying exactly what the requester lacks: full self-verifying
+records for **all three** surfaces, including likes. `apply_delta_bytes` decodes
+`ThreadStateDelta` too, so the sync delta round-trips (regression:
+`get_state_delta_output_is_applyable`).
+
+**Likes store the full signed `LikeRecord`, re-verified on every path.** A
+public-write contract must assume adversarial `UpdateData`, so a like is re-checked
+by `merge_like` (→ `LikeRecord::verify`) on *every* write path — `ThreadDelta::Likes`,
+full-state `merge_state`, and the sync `apply_state_delta` — and `validate_state`
+re-proves every stored like's signature. There is no "the sender already verified
+it" shortcut: an earlier draft stored likes as unsigned `(seq, liked)` and trusted
+the full-state / sync paths, which let *any* peer forge, suppress, or overwrite any
+user's like with no private key (review **CRITICAL**, fifth round — a signature
+bypass, the same "every write path must verify, not just the primary one" lesson as
+the convergence rounds). Retaining the signature (~3.3 KB/like) is the price of an
+unforgeable per-liker counter on a public surface. Replies and quotes always worked
+this way; likes were the lone exception and now match. `merge_state` likewise
+re-verifies replies/quotes (it had trusted them) so a full-state sync cannot inject
+anything a delta could not (review M-1).
+
+This adds the `thread_shard_code_hash` build artifact (parameterized, so no single
+instance id — like the user shard). No migration entry (no prior thread-shard
+state). UI wiring + cross-contract quote/notification delivery are Phase 4 / the
+inbox shard (Phase 3).
+
 ## Caveat: ADR vs. mail on windowing
 
 The ADR states the bounded-state window mirrors "how `freenet/mail` windows its

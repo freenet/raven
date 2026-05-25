@@ -60,6 +60,14 @@ pub struct Post {
     /// be altered without invalidating the signature; it is not read as a clock
     /// by any contract.
     pub timestamp: u64,
+    /// Content-addressed id of the post this is a reply to, if any (ADR-0001
+    /// thread shard). Empty/absent for a top-level post. When non-empty it is
+    /// **mixed into the signing payload** (so a reply's thread membership is
+    /// signed and cannot be replayed into another thread); when empty the
+    /// payload is byte-identical to a pre-`reply_to` top-level post, so existing
+    /// post ids/signatures are unaffected.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reply_to: String,
     /// Hex-encoded ML-DSA-65 signature over the signing payload (3309 bytes).
     /// Optional only for forward/backward wire tolerance; an unsigned post is
     /// rejected by [`Post::verify`].
@@ -78,6 +86,11 @@ impl Post {
     /// field-boundary ambiguity exists and the encoding is deterministic across
     /// builds. `id` and `signature` are intentionally excluded — they are
     /// *derived from* this payload.
+    ///
+    /// `reply_to` is appended **only when non-empty**: a top-level post (empty
+    /// `reply_to`) produces the exact pre-`reply_to` byte sequence, so its id and
+    /// signature are unchanged; a reply binds its target thread into the signed
+    /// bytes, so a reply cannot be replayed into a different thread.
     pub fn signing_payload(&self) -> Vec<u8> {
         fn put(buf: &mut Vec<u8>, field: &[u8]) {
             buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
@@ -90,6 +103,9 @@ impl Post {
         put(&mut buf, self.author_handle.as_bytes());
         put(&mut buf, self.content.as_bytes());
         put(&mut buf, &self.timestamp.to_le_bytes());
+        if !self.reply_to.is_empty() {
+            put(&mut buf, self.reply_to.as_bytes());
+        }
         buf
     }
 
@@ -155,6 +171,7 @@ mod test {
             author_handle: "@alice".into(),
             content: "Hello world".into(),
             timestamp: 1_700_000_000_000,
+            reply_to: String::new(),
             signature: None,
         }
     }
@@ -170,6 +187,7 @@ mod test {
             author_handle: "@alice".into(),
             content: content.into(),
             timestamp: 1_700_000_000_000,
+            reply_to: String::new(),
             signature: None,
         };
         p.id = p.compute_id();
@@ -244,6 +262,58 @@ mod test {
         p2.author_name = "a".into();
         p2.author_handle = "bc".into();
         assert_ne!(p1.signing_payload(), p2.signing_payload());
+    }
+
+    #[test]
+    fn empty_reply_to_is_payload_compatible() {
+        // A top-level post (empty reply_to) must hash/sign exactly as it did
+        // before the field existed: reply_to is appended only when non-empty,
+        // so the byte sequence is unchanged and ids/signatures are stable.
+        let p = sample();
+        assert!(p.reply_to.is_empty());
+
+        // Reconstruct the pre-reply_to payload by hand and compare.
+        let mut expected = Vec::new();
+        for field in [
+            POST_DOMAIN_TAG,
+            p.author_pubkey.as_bytes(),
+            p.author_name.as_bytes(),
+            p.author_handle.as_bytes(),
+            p.content.as_bytes(),
+            &p.timestamp.to_le_bytes(),
+        ] {
+            expected.extend_from_slice(&(field.len() as u32).to_le_bytes());
+            expected.extend_from_slice(field);
+        }
+        assert_eq!(p.signing_payload(), expected);
+    }
+
+    #[test]
+    fn reply_to_is_signed_and_thread_bound() {
+        // A reply binds its target thread into the signature: it verifies in its
+        // own thread, but moving it to another thread (changing reply_to) breaks
+        // the id (id is over the payload) — a reply cannot be replayed elsewhere.
+        let sk = MlDsa65::from_seed(&[7u8; 32].into());
+        let mut reply = Post {
+            id: String::new(),
+            author_pubkey: hex::encode(sk.verifying_key().encode()),
+            author_name: "Bob".into(),
+            author_handle: "@bob".into(),
+            content: "nice post".into(),
+            timestamp: 1_700_000_000_001,
+            reply_to: "root_post_id_aaaa".into(),
+            signature: None,
+        };
+        reply.id = reply.compute_id();
+        let sig: Signature<MlDsa65> = sk.sign(&reply.signing_payload());
+        reply.signature = Some(hex::encode(sig.encode()));
+        assert_eq!(reply.verify(), Ok(()));
+
+        // Same author/content, different thread → different signed bytes → the
+        // id no longer matches, so a thread can detect a misfiled reply.
+        let mut moved = reply.clone();
+        moved.reply_to = "root_post_id_bbbb".into();
+        assert_eq!(moved.verify(), Err(VerifyError::IdMismatch));
     }
 
     #[test]

@@ -256,6 +256,10 @@ fn sign_post(
         author_handle: author_handle.to_string(),
         content: content.to_string(),
         timestamp,
+        // Top-level post: empty reply_to keeps the signing payload byte-identical
+        // to the pre-reply_to shape. Reply signing (non-empty reply_to) arrives
+        // with thread-shard UI wiring (ADR-0001 Phase 4).
+        reply_to: String::new(),
         signature: None,
     };
     post.id = post.compute_id();

@@ -187,6 +187,7 @@ mod test {
             author_handle: "@testuser".to_string(),
             content: content.to_string(),
             timestamp: 1_700_000_000_000,
+            reply_to: String::new(),
             signature: None,
         };
         p.id = p.compute_id();
