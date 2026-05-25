@@ -42,16 +42,19 @@
 //!   payload, a peer cannot forge `pruned_before = u64::MAX` without the owner
 //!   key. Merged by keeping the higher-`seq` *verified* op.
 //! * **`prune_ids_ops`** — owner-signed `PruneIds` ops (keyed by op `seq`), each
-//!   carrying `(id, notif_seq)` pairs. A tombstone for `id` exists only while
-//!   backed by such a verified op. Merged as a verified-op union.
+//!   naming the ids it prunes. A tombstone for `id` exists only while backed by
+//!   such a verified op. Merged as a verified-op union.
 //! * **`notifs`** — a grow-set keyed by content-addressed id, admitted only if it
 //!   self-verifies, is **not** tombstoned, and is **not** below the high-water.
 //!
-//! Tombstones stay bounded *and* genuinely collectible: a `(id, notif_seq)` pair
-//! is **redundant** once `notif_seq < pruned_before` (the high-water already
-//! suppresses it), and a `PruneIds` op whose every pair is redundant is dropped
-//! post-merge. So selective tombstones only persist while newer than the bulk
-//! high-water.
+//! Selective tombstones are a **pure grow-set**, bounded only by the
+//! `MAX_PRUNE_IDS_OPS` backstop. An earlier draft tried to GC a tombstone once an
+//! owner-attested per-id `notif_seq` fell below the high-water, but that seq was
+//! never tied to the notif's real seq — an understated value let GC drop a live
+//! tombstone and resurrect the notif (review MAJOR, seventh round). There is no
+//! sound high-water GC for a bare id, so the bulk-cleanup tool is `PruneBefore`
+//! (a single max-wins op needing no GC); selective `PruneIds` accumulate until
+//! the rare backstop eviction (best-effort lossy, like the notif window).
 //!
 //! **Every prune op is re-verified against the owner on *every* path** (delta,
 //! full-state merge, sync delta) before it can raise the high-water or add a
@@ -74,14 +77,14 @@ use std::collections::BTreeMap;
 /// the owner's own pruning.
 const MAX_NOTIFS: usize = 10_000;
 
-/// Cap on retained `PruneIds` ops. Ops whose every pair is redundant (below the
-/// high-water) are GC'd, so this only bites if an owner selectively prunes a huge
-/// number of ids all newer than their bulk high-water; the cap keeps even that
-/// bounded.
+/// Cap on retained `PruneIds` ops (selective tombstones are a pure grow-set).
+/// When exceeded, the oldest op `seq`s are evicted — best-effort lossy, the only
+/// bound on tombstone growth. An owner who bulk-prunes with `PruneBefore` keeps
+/// selective ops few, so this rarely bites.
 const MAX_PRUNE_IDS_OPS: usize = 1_000;
 
-/// Max explicit `(id, notif_seq)` pairs one `PruneIds` op may carry, so a single
-/// signed op cannot be made arbitrarily large.
+/// Max ids one `PruneIds` op may carry, so a single signed op cannot be made
+/// arbitrarily large.
 const MAX_PRUNE_IDS_PER_OP: usize = 1_000;
 
 /// Max length of a notification id (hex of a 32-byte blake3 hash = 64 chars);
@@ -111,9 +114,10 @@ struct InboxShard {
     /// unforgeable (a peer cannot claim `u64::MAX` without the owner key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prune_before_op: Option<SignedOp>,
-    /// Owner-signed `PruneIds` ops keyed by their op `seq`. Each carries
-    /// `(id, notif_seq)` pairs; the union of their ids is the tombstone set. An
-    /// op is GC'd once all its pairs are below the high-water (redundant).
+    /// Owner-signed `PruneIds` ops keyed by their op `seq`. Each names the ids it
+    /// prunes; the union of those ids is the tombstone set. A pure grow-set
+    /// (no sound high-water GC for a bare id), bounded only by the
+    /// [`MAX_PRUNE_IDS_OPS`] backstop.
     #[serde(default)]
     prune_ids_ops: BTreeMap<u64, SignedOp>,
 }
@@ -160,19 +164,14 @@ fn pruned_before(shard: &InboxShard) -> u64 {
     shard.prune_before_op.as_ref().map(|op| op.seq).unwrap_or(0)
 }
 
-/// The live tombstone id set: the ids named by every retained `PruneIds` op whose
-/// pair is not yet redundant under the high-water. Recomputed from the verified
-/// ops (never stored as a bare projection), so a tombstone exists only while
-/// backed by an owner signature.
+/// The live tombstone id set: every id named by a retained `PruneIds` op.
+/// Recomputed from the verified ops (never stored as a bare projection), so a
+/// tombstone exists only while backed by an owner signature.
 fn tombstone_ids(shard: &InboxShard) -> std::collections::HashSet<String> {
-    let hw = pruned_before(shard);
     let mut ids = std::collections::HashSet::new();
     for op in shard.prune_ids_ops.values() {
-        for (id, notif_seq) in decode_prune_ids(&op.payload) {
-            // A pair below the high-water is already suppressed by it.
-            if notif_seq >= hw {
-                ids.insert(id);
-            }
+        for id in decode_prune_ids(&op.payload) {
+            ids.insert(id);
         }
     }
     ids
@@ -246,70 +245,60 @@ fn merge_prune_op(shard: &mut InboxShard, op: SignedOp) {
     }
 }
 
-/// Decode a `PruneIds` payload: a length-prefixed (u32 LE) sequence of records,
-/// each `[id_len:u32][id bytes][notif_seq:u64 LE]`, capped at
-/// [`MAX_PRUNE_IDS_PER_OP`]. Malformed input yields the pairs parsed so far
-/// (tolerant, never panics — AGENTS.md → "No unwrap/panic").
-fn decode_prune_ids(payload: &[u8]) -> Vec<(String, u64)> {
-    let mut pairs = Vec::new();
+/// Decode a `PruneIds` payload: a length-prefixed (u32 LE) sequence of hex id
+/// strings, capped at [`MAX_PRUNE_IDS_PER_OP`]. Malformed input yields the ids
+/// parsed so far (tolerant, never panics — AGENTS.md → "No unwrap/panic").
+///
+/// Note: ids only — no per-id `notif_seq`. An earlier draft carried an
+/// owner-attested `notif_seq` per id to let the high-water GC tombstones, but
+/// that seq was untied to the notif's real seq: an understated value let GC drop
+/// a tombstone while the real notif was still above the high-water, resurrecting
+/// it (review MAJOR, seventh round — owner-self-harm, no validate backstop).
+/// There is no sound high-water GC for a bare id, so tombstones are a pure
+/// grow-set bounded only by [`MAX_PRUNE_IDS_OPS`].
+fn decode_prune_ids(payload: &[u8]) -> Vec<String> {
+    let mut ids = Vec::new();
     let mut i = 0;
-    while i + 4 <= payload.len() && pairs.len() < MAX_PRUNE_IDS_PER_OP {
+    while i + 4 <= payload.len() && ids.len() < MAX_PRUNE_IDS_PER_OP {
         let len = u32::from_le_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]])
             as usize;
         i += 4;
-        // Need the id bytes plus an 8-byte notif_seq trailer.
-        if len > MAX_ID_LEN || i + len + 8 > payload.len() {
+        if len > MAX_ID_LEN || i + len > payload.len() {
             break;
         }
-        let Ok(s) = std::str::from_utf8(&payload[i..i + len]) else {
-            break;
-        };
+        if let Ok(s) = std::str::from_utf8(&payload[i..i + len]) {
+            ids.push(s.to_owned());
+        }
         i += len;
-        let notif_seq = u64::from_le_bytes([
-            payload[i],
-            payload[i + 1],
-            payload[i + 2],
-            payload[i + 3],
-            payload[i + 4],
-            payload[i + 5],
-            payload[i + 6],
-            payload[i + 7],
-        ]);
-        i += 8;
-        pairs.push((s.to_owned(), notif_seq));
     }
-    pairs
+    ids
 }
 
-/// Encode a `PruneIds` payload from `(id, notif_seq)` pairs (mirror of
-/// [`decode_prune_ids`]). Lives in the contract so tests and any future delegate
-/// share one encoder; the bytes go into the op's signed payload, so the owner
-/// attests both *which* ids and *at what seq* they pruned.
-pub fn encode_prune_ids(pairs: &[(String, u64)]) -> Vec<u8> {
+/// Encode a `PruneIds` payload from a list of ids (mirror of [`decode_prune_ids`]).
+/// Lives in the contract so tests and any future delegate share one encoder; the
+/// bytes go into the op's signed payload, so the owner attests which ids they
+/// pruned.
+pub fn encode_prune_ids(ids: &[String]) -> Vec<u8> {
     let mut buf = Vec::new();
-    for (id, notif_seq) in pairs {
+    for id in ids {
         buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
         buf.extend_from_slice(id.as_bytes());
-        buf.extend_from_slice(&notif_seq.to_le_bytes());
     }
     buf
 }
 
-/// GC `PruneIds` ops whose every `(id, notif_seq)` pair is redundant — i.e. all
-/// below the high-water, which already suppresses those ids. This is what keeps
-/// the tombstone set genuinely bounded by the high-water (not arbitrary lossy
-/// eviction). Then bound the retained-op count as a backstop, by a deterministic
-/// total order over op seq.
+/// Bound the retained `PruneIds` op set. Tombstones are a pure grow-set — there
+/// is no sound high-water GC for a bare id (see [`decode_prune_ids`]) — so the
+/// only bound is this cap. When exceeded, evict the lowest op `seq`s
+/// (oldest prunes) deterministically; the `BTreeMap` is already seq-ordered, so
+/// every replica evicts the identical set regardless of arrival order. Eviction
+/// is best-effort lossy (it can re-open resurrection for the evicted ids, the
+/// same trade as the notif window), but only an owner who issues
+/// `MAX_PRUNE_IDS_OPS` selective prunes without ever bulk-pruning hits it — a
+/// `PruneBefore` is the unbounded-cleanup tool and needs no GC (single max-wins
+/// op).
 fn gc_prune_ids_ops(shard: &mut InboxShard) {
-    let hw = pruned_before(shard);
-    shard.prune_ids_ops.retain(|_seq, op| {
-        decode_prune_ids(&op.payload)
-            .iter()
-            .any(|(_, notif_seq)| *notif_seq >= hw)
-    });
     if shard.prune_ids_ops.len() > MAX_PRUNE_IDS_OPS {
-        // Keep the highest op seqs (most recent prunes). Deterministic; the
-        // BTreeMap is already ordered by seq.
         let drop: Vec<u64> = shard
             .prune_ids_ops
             .keys()
@@ -744,7 +733,7 @@ mod test {
         assert_eq!(base.notifs.len(), 1);
 
         // PruneIds carries (id, notif_seq) pairs; the owner attests both.
-        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[(id.clone(), 5)]), 1);
+        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[id.clone()]), 1);
         let out = run_update(base, vec![delta_item(&InboxDelta::Prune(op))]);
         assert!(out.notifs.is_empty(), "pruned notif removed");
         assert!(tombstone_ids(&out).contains(&id), "tombstone recorded");
@@ -756,7 +745,7 @@ mod test {
         // notif. The tombstone must keep it out (no resurrection).
         let n = signed_notif([2u8; 32], NotifKind::Reply, "p", 5);
         let id = n.id(&owner_vk());
-        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[(id.clone(), 5)]), 1);
+        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[id.clone()]), 1);
 
         // Prune first, then the (late) re-delivery arrives.
         let pruned = run_update(
@@ -820,7 +809,7 @@ mod test {
         let attacker = MlDsa65::from_seed(&[2u8; 32].into());
         let mut op = SignedOp {
             op_type: OpType::PruneIds,
-            payload: encode_prune_ids(&[(id.clone(), 5)]),
+            payload: encode_prune_ids(&[id.clone()]),
             seq: 1,
             signer_pubkey: hex::encode(attacker.verifying_key().encode()),
             signature: None,
@@ -848,7 +837,7 @@ mod test {
         let sk = MlDsa65::from_seed(&owner_seed().into());
         let mut op = SignedOp {
             op_type: OpType::PruneIds,
-            payload: encode_prune_ids(&[(id, 5)]),
+            payload: encode_prune_ids(&[id]),
             seq: 1,
             signer_pubkey: owner_vk(),
             signature: None,
@@ -914,7 +903,7 @@ mod test {
             7,
             SignedOp {
                 op_type: OpType::PruneIds,
-                payload: encode_prune_ids(&[(id, 5)]),
+                payload: encode_prune_ids(&[id]),
                 seq: 7,
                 signer_pubkey: owner_vk(),
                 signature: None, // forged
@@ -995,7 +984,7 @@ mod test {
         shard.notifs.insert(id.clone(), n);
         // Genuine owner-signed PruneIds op tombstoning that id (notif_seq 5, at or
         // above the high-water of 0, so the tombstone is live).
-        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[(id, 5)]), 1);
+        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[id]), 1);
         shard.prune_ids_ops.insert(1, op);
         let res = InboxShard::validate_state(params(), state_of(&shard), RelatedContracts::new());
         assert!(!matches!(res, Ok(ValidateResult::Valid)));
@@ -1076,11 +1065,7 @@ mod test {
         let pruned_id = signed_notif([6u8; 32], NotifKind::Reply, "gone", 9).id(&owner_vk());
         src.prune_ids_ops.insert(
             3,
-            prune_op(
-                OpType::PruneIds,
-                encode_prune_ids(&[(pruned_id.clone(), 9)]),
-                3,
-            ),
+            prune_op(OpType::PruneIds, encode_prune_ids(&[pruned_id.clone()]), 3),
         );
 
         let empty_summary =
@@ -1141,14 +1126,56 @@ mod test {
     }
 
     #[test]
+    fn high_water_does_not_drop_selective_tombstone() {
+        // MAJOR regression (seventh round): a selective PruneIds tombstone must NOT
+        // be GC'd by the high-water — there is no sound per-id seq to compare, so
+        // tombstones are a pure grow-set. Prune a high-seq notif selectively, then
+        // advance the high-water far past low values; the tombstone (and the notif
+        // suppression) must persist, with no resurrection.
+        let n = signed_notif([2u8; 32], NotifKind::Reply, "p", 999);
+        let id = n.id(&owner_vk());
+        let base = run_update(
+            InboxShard::default(),
+            vec![
+                delta_item(&InboxDelta::Notifs(vec![n.clone()])),
+                delta_item(&InboxDelta::Prune(prune_op(
+                    OpType::PruneIds,
+                    encode_prune_ids(&[id.clone()]),
+                    1,
+                ))),
+            ],
+        );
+        assert!(base.notifs.is_empty());
+        assert!(tombstone_ids(&base).contains(&id));
+
+        // Advance the high-water to 50 — far below the pruned notif's seq (999),
+        // so it must NOT make the tombstone redundant or drop it.
+        let out = run_update(
+            base,
+            vec![delta_item(&InboxDelta::Prune(prune_op(
+                OpType::PruneBefore,
+                Vec::new(),
+                50,
+            )))],
+        );
+        assert!(
+            tombstone_ids(&out).contains(&id),
+            "selective tombstone must survive an unrelated high-water advance"
+        );
+        // And a re-delivery of the seq-999 notif (above the high-water) is still
+        // blocked by the surviving tombstone — no resurrection.
+        let after = run_update(out, vec![delta_item(&InboxDelta::Notifs(vec![n]))]);
+        assert!(
+            after.notifs.is_empty(),
+            "tombstoned notif must not resurrect"
+        );
+    }
+
+    #[test]
     fn prune_ids_payload_round_trips() {
-        let pairs = vec![
-            ("aaa".to_string(), 1u64),
-            ("bbb".to_string(), 7u64),
-            ("ccc".to_string(), 42u64),
-        ];
-        let encoded = encode_prune_ids(&pairs);
-        assert_eq!(decode_prune_ids(&encoded), pairs);
+        let ids = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
+        let encoded = encode_prune_ids(&ids);
+        assert_eq!(decode_prune_ids(&encoded), ids);
         // Truncated/garbage trailing bytes are tolerated (no panic).
         let mut trunc = encoded.clone();
         trunc.truncate(encoded.len() - 1);
@@ -1307,7 +1334,7 @@ mod integration {
             &a_delivered,
             vec![delta(&InboxDelta::Prune(prune_op(
                 OpType::PruneIds,
-                encode_prune_ids(&[(id.clone(), 5)]),
+                encode_prune_ids(&[id.clone()]),
                 1,
             )))],
         );
@@ -1378,6 +1405,32 @@ mod integration {
             synced.notifs.is_empty(),
             "honest replica must reject forged notif over sync"
         );
+    }
+
+    #[test]
+    fn prune_before_ops_converge_over_sync() {
+        // A on high-water seq 5, B on seq 3 — over the sync protocol each adopts
+        // the other's op; both land on the single seq-5 op (highest-wins, byte
+        // identical), no split.
+        let a = apply(
+            &InboxShard::default(),
+            vec![delta(&InboxDelta::Prune(prune_op(
+                OpType::PruneBefore,
+                Vec::new(),
+                5,
+            )))],
+        );
+        let b = apply(
+            &InboxShard::default(),
+            vec![delta(&InboxDelta::Prune(prune_op(
+                OpType::PruneBefore,
+                Vec::new(),
+                3,
+            )))],
+        );
+        let (a2, b2) = reconcile(&a, &b);
+        assert_eq!(canonical(&a2), canonical(&b2));
+        assert_eq!(pruned_before(&a2), 5);
     }
 
     #[test]

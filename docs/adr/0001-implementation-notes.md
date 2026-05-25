@@ -327,22 +327,30 @@ must itself carry the owner's signature on every path. State retains the
   high-water *is* that op's `seq`; because `seq` is inside the signed payload, a
   peer cannot claim `pruned_before = u64::MAX` without the owner key. Merged by
   keeping the higher-`seq` **verified** op.
-- *prune_ids_ops* — owner-signed `PruneIds` ops (keyed by op `seq`), each carrying
-  signed `(id, notif_seq)` pairs. The live tombstone set is *derived* from these
-  verified ops; a tombstone exists only while backed by an owner signature.
+- *prune_ids_ops* — owner-signed `PruneIds` ops (keyed by op `seq`), each naming
+  the ids it prunes. The live tombstone set is *derived* from these verified ops;
+  a tombstone exists only while backed by an owner signature.
 - *notifs* — a grow-set keyed by content address, admitted only if it
   self-verifies for this owner **and** is neither tombstoned nor below the
   high-water (`notif_admissible`, the single predicate every write path and
   `validate_state` agree on).
 
-The hybrid (selective ids + bulk high-water) keeps tombstones bounded *and*
-genuinely collectible: a `(id, notif_seq)` pair is **redundant** once `notif_seq <
-pruned_before` (the high-water already suppresses it), and a `PruneIds` op whose
-every pair is redundant is dropped in `normalize` (`gc_prune_ids_ops`). `normalize`
-also re-applies prune suppression **post-merge** (the same discipline as the
-caps), so a notif that arrived before the prune that suppresses it — i.e. the
-prune op merged in second — is still removed. Notifs are capped post-merge to the
-newest `MAX_NOTIFS` by `(seq, id)` desc (a total order; no clock).
+`PruneBefore` is the bulk-cleanup tool: a single max-wins op, no GC needed.
+Selective `PruneIds` tombstones are a **pure grow-set**, bounded only by the
+`MAX_PRUNE_IDS_OPS` backstop (oldest op `seq`s evicted, best-effort lossy — the
+same trade as the notif window). A second draft tried to GC a `PruneIds` op once
+an owner-attested per-id `notif_seq` fell below the high-water, but that seq was
+never tied to the notif's *real* seq: an understated value (a delegate bug or a
+careless owner) let GC drop a live tombstone and resurrect the notif, with no
+`validate_state` backstop — owner-self-harm, not attacker-reachable, but it
+silently re-opened the exact resurrection class the prune machinery exists to
+prevent (review **MAJOR**, seventh round). There is no sound high-water GC for a
+bare id, so `notif_seq` was dropped entirely and `gc_prune_ids_ops` keeps only the
+count backstop. `normalize` re-applies prune suppression **post-merge** (the same
+discipline as the caps), so a notif that arrived before the prune op that
+suppresses it — i.e. the prune merged in second — is still removed. Notifs are
+capped post-merge to the newest `MAX_NOTIFS` by `(seq, id)` desc (a total order;
+no clock).
 
 ### Sync delta carries the **signed prune ops** — there is no removal-only shortcut (review CRITICAL, sixth round)
 
@@ -373,7 +381,7 @@ and its notifications survive (regression
 `forged_unsigned_prune_evidence_cannot_suppress`). Notifications continue to be
 re-verified by `merge_notif` on every path, exactly as before. The cost is real —
 prune ops accumulate — but a `PruneBefore` collapses to one op (highest seq) and
-`PruneIds` ops are GC'd once redundant, so it stays bounded.
+`PruneIds` ops are capped by the `MAX_PRUNE_IDS_OPS` backstop, so it stays bounded.
 
 `validate_state` re-proves **every retained prune op** (genuine owner signature,
 correct op type, keyed under its own seq) *and* every stored notification's
