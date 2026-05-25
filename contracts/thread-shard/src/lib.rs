@@ -1,0 +1,845 @@
+//! Thread shard contract (ADR-0001, Phase 2).
+//!
+//! One contract **per root post**, created lazily on the first reply, and
+//! **anyone-writes**: it collects the replies, likes, and quote references that
+//! target one root post. The contract is parameterized by the root post's
+//! content-addressed id (`parameters = root_post_id` bytes), so the contract key
+//! is `blake3(thread_shard_wasm || root_post_id)` — distinct per thread, and
+//! distinct from a user shard with the same parameters because the WASM hash
+//! differs (ADR-0001 → "Shard key derivation").
+//!
+//! ## Write authority (anyone-writes)
+//!
+//! Unlike the owner-writes user shard, a thread shard accepts writes from any
+//! party. Each entry still **self-verifies** — a reply is a self-signed
+//! [`Post`](freenet_microblogging_common::post::Post) whose `reply_to` equals
+//! this thread's root; a like / quote is a signed
+//! [`LikeRecord`] / [`QuoteRef`] bound to the root id. Verification proves *who*
+//! signed, not that the signer is *allowed*. Constraining who may write is the
+//! abuse question ADR-0001 leaves to a credential mechanism (GhostKey is the
+//! candidate); the [`WriterCert`] wire slot is reserved and checked by the
+//! [`verify_writer_cert`] seam, which accepts everything today.
+//!
+//! ## Convergence (every rule order-independent — AGENTS.md → "Contract
+//! correctness invariants")
+//!
+//! * **replies** — grow-set deduped by content-address id, truncated post-merge
+//!   to the newest `MAX_REPLIES` by `(timestamp, id)` desc (a total order; no
+//!   clock in a contract).
+//! * **likes** — per-liker join semilattice: keep the higher `seq` per liker,
+//!   and on equal `seq` an **unlike wins** (deterministic tie-break, mirroring
+//!   the user-shard follow rule). Capped post-merge by `truncate_likes`
+//!   (tombstones first, then a total order over keys).
+//! * **quotes** — grow-set deduped by `quote_post_id`, capped post-merge.
+//!
+//! `validate_state` checks authority + self-verification + thread-binding + no
+//! duplicates, but deliberately does **not** enforce the caps: a transiently
+//! over-bound merged state is normal, and rejecting it would break convergence.
+
+use freenet_microblogging_common::post::{MAX_CONTENT_LEN, Post};
+use freenet_microblogging_common::thread::{LikeRecord, QuoteRef, WriterCert};
+use freenet_stdlib::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Retention window for replies (ADR-0001 starting policy, matching the user
+/// shard's post window).
+const MAX_REPLIES: usize = 500;
+
+/// Cap on distinct likers retained. Public-write, so this bounds flood blast
+/// radius alongside the (future) writer-credential gate.
+const MAX_LIKES: usize = 50_000;
+
+/// Cap on distinct quote references retained.
+const MAX_QUOTES: usize = 5_000;
+
+/// Encoded ML-DSA-65 verifying key length in bytes (FIPS 204). A liker key in
+/// state must decode to exactly this.
+const ML_DSA_65_VK_LEN: usize = 1952;
+
+/// Per-liker like record: the `seq` of the op that last touched this liker and
+/// whether that op was a like. Merge keeps the higher `seq`; an unlike wins an
+/// equal-`seq` tie, so concurrent like/unlike converges regardless of arrival
+/// order (the same join-semilattice rule as the user shard's follows).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct LikeState {
+    seq: u64,
+    liked: bool,
+}
+
+/// Thread shard state: replies, likes, and quote references for one root post.
+#[derive(Serialize, Deserialize, Default)]
+struct ThreadShard {
+    // Schema-tolerance: defaults so older/newer wire shapes still decode
+    // (AGENTS.md → "Contract migration").
+    /// Replies keyed by content-addressed post id (`BTreeMap` for deterministic
+    /// serialization).
+    #[serde(default)]
+    replies: BTreeMap<String, Post>,
+    /// Likes keyed by liker VK hex.
+    #[serde(default)]
+    likes: BTreeMap<String, LikeState>,
+    /// Quote references keyed by the quoting post's content-addressed id.
+    #[serde(default)]
+    quotes: BTreeMap<String, QuoteRef>,
+}
+
+impl<'a> TryFrom<State<'a>> for ThreadShard {
+    type Error = ContractError;
+
+    fn try_from(value: State<'a>) -> Result<Self, Self::Error> {
+        serde_json::from_slice(value.as_ref()).map_err(|_| ContractError::InvalidState)
+    }
+}
+
+/// A single thread-shard delta operation. Externally tagged so the wire form is
+/// unambiguous and new surfaces can be added without colliding.
+#[derive(Serialize, Deserialize)]
+enum ThreadDelta {
+    /// One or more replies (each a self-signed `Post` with `reply_to == root`).
+    Replies(Vec<Post>),
+    /// One or more like/unlike records.
+    Likes(Vec<LikeRecord>),
+    /// One or more quote references.
+    Quotes(Vec<QuoteRef>),
+}
+
+/// This thread's root post id, as the UTF-8 string carried in the contract
+/// parameters. Empty parameters yield an empty root id that no real reply (whose
+/// signed `reply_to` is a 64-hex content address) can match, so an
+/// un-parameterized thread accepts no replies.
+fn root_post_id(parameters: &Parameters<'_>) -> String {
+    String::from_utf8_lossy(parameters.as_ref()).into_owned()
+}
+
+/// The writer-credential seam (ADR-0001 abuse model). Today it accepts every
+/// writer — `WriterCert` is a reserved wire slot, not yet a policy. When a real
+/// credential (GhostKey) lands, gate writes here; the cert already rides on each
+/// record so doing so is an additive change, not a format break.
+fn verify_writer_cert(_cert: Option<&WriterCert>) -> bool {
+    true
+}
+
+/// Whether a reply is acceptable on this thread: within the length bound, bound
+/// to this thread (`reply_to == root`), self-verifying, and (vacuously today)
+/// carrying an acceptable writer credential.
+fn reply_is_acceptable(post: &Post, root: &str) -> bool {
+    !root.is_empty()
+        && post.reply_to == root
+        && post.content.len() <= MAX_CONTENT_LEN
+        && post.verify().is_ok()
+        && verify_writer_cert(None)
+}
+
+/// Whether a like record is acceptable: thread-bound self-verifying signature
+/// and an acceptable writer credential.
+fn like_is_acceptable(like: &LikeRecord, root: &str) -> bool {
+    !root.is_empty() && like.verify(root).is_ok() && verify_writer_cert(like.writer_cert.as_ref())
+}
+
+/// Whether a quote ref is acceptable: thread-bound self-verifying signature and
+/// an acceptable writer credential.
+fn quote_is_acceptable(quote: &QuoteRef, root: &str) -> bool {
+    !root.is_empty() && quote.verify(root).is_ok() && verify_writer_cert(quote.writer_cert.as_ref())
+}
+
+/// Per-key like merge: does `(new)` replace the current entry for a liker?
+/// Higher `seq` wins; on equal `seq` an **unlike** (`!liked`) wins. Identical to
+/// the user-shard follow rule — a deterministic, order-independent join.
+fn like_replaces(new_seq: u64, new_liked: bool, cur: &LikeState) -> bool {
+    if new_seq != cur.seq {
+        new_seq > cur.seq
+    } else {
+        // Equal seq: unlike wins. Only replaces if current is a like.
+        !new_liked && cur.liked
+    }
+}
+
+/// Insert/merge one accepted like into the map by the per-liker join rule.
+fn merge_like(likes: &mut BTreeMap<String, LikeState>, like: &LikeRecord) {
+    let next = LikeState {
+        seq: like.seq,
+        liked: like.liked,
+    };
+    match likes.get(&like.signer_pubkey) {
+        Some(cur) if !like_replaces(like.seq, like.liked, cur) => {}
+        _ => {
+            likes.insert(like.signer_pubkey.clone(), next);
+        }
+    }
+}
+
+/// Truncate replies to the newest `MAX_REPLIES` by `(timestamp, id)` desc — a
+/// total order, so every replica retains the identical set regardless of arrival
+/// order. Post-merge only (AGENTS.md → "bounded surfaces must truncate
+/// post-merge"). Best-effort lossy, like the user-shard post window.
+fn truncate_replies(replies: &mut BTreeMap<String, Post>) {
+    if replies.len() <= MAX_REPLIES {
+        return;
+    }
+    let mut keys: Vec<(u64, String)> = replies
+        .iter()
+        .map(|(id, p)| (p.timestamp, id.clone()))
+        .collect();
+    // Newest first: timestamp desc, then id desc as a stable total tie-break.
+    keys.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    for (_, id) in keys.into_iter().skip(MAX_REPLIES) {
+        replies.remove(&id);
+    }
+}
+
+/// Truncate likes to `MAX_LIKES` as a function of the key set: evict tombstones
+/// (unlikes) first, then the largest liker key. Deterministic and order-
+/// independent, and bounds tombstone growth (AGENTS.md → "bounded surfaces").
+fn truncate_likes(likes: &mut BTreeMap<String, LikeState>) {
+    if likes.len() <= MAX_LIKES {
+        return;
+    }
+    let mut order: Vec<(bool, String)> = likes.iter().map(|(k, v)| (v.liked, k.clone())).collect();
+    // Keep active likes (liked = true) before tombstones; within a class, keep
+    // smaller keys. Sort so survivors come first: liked desc, key asc.
+    order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    for (_, key) in order.into_iter().skip(MAX_LIKES) {
+        likes.remove(&key);
+    }
+}
+
+/// Truncate quotes to `MAX_QUOTES` by a total order over the quote-post-id key.
+/// Deterministic and order-independent.
+fn truncate_quotes(quotes: &mut BTreeMap<String, QuoteRef>) {
+    if quotes.len() <= MAX_QUOTES {
+        return;
+    }
+    let mut keys: Vec<String> = quotes.keys().cloned().collect();
+    keys.sort();
+    for key in keys.into_iter().skip(MAX_QUOTES) {
+        quotes.remove(&key);
+    }
+}
+
+/// Normalize a merged state: enforce all caps post-merge. Pure function of the
+/// accumulated sets.
+fn normalize(shard: &mut ThreadShard) {
+    truncate_replies(&mut shard.replies);
+    truncate_likes(&mut shard.likes);
+    truncate_quotes(&mut shard.quotes);
+}
+
+/// Apply one decoded `ThreadDelta` to the shard. Unacceptable entries are
+/// skipped (not fatal), the same tolerance the posts contract uses for a bad
+/// post in a batch.
+fn apply_thread_delta(shard: &mut ThreadShard, delta: ThreadDelta, root: &str) {
+    match delta {
+        ThreadDelta::Replies(replies) => {
+            for reply in replies {
+                if reply_is_acceptable(&reply, root) {
+                    // Dedup by content-addressed id: a content address is stable,
+                    // so re-inserting the same reply is idempotent.
+                    shard.replies.entry(reply.id.clone()).or_insert(reply);
+                }
+            }
+        }
+        ThreadDelta::Likes(likes) => {
+            for like in likes {
+                if like_is_acceptable(&like, root) {
+                    merge_like(&mut shard.likes, &like);
+                }
+            }
+        }
+        ThreadDelta::Quotes(quotes) => {
+            for quote in quotes {
+                if quote_is_acceptable(&quote, root) {
+                    shard
+                        .quotes
+                        .entry(quote.quote_post_id.clone())
+                        .or_insert(quote);
+                }
+            }
+        }
+    }
+}
+
+/// Try the tagged `ThreadDelta` form first, then a `ThreadStateDelta` (what
+/// `get_state_delta` ships — all three surfaces in one message), then a bare
+/// `Vec<Post>` (replies-only backward tolerance), then a full `ThreadShard`
+/// (state-as-delta).
+///
+/// Order matters: `ThreadStateDelta`'s fields are all `#[serde(default)]`, so it
+/// would also accept a bare `{}`; `ThreadDelta` (externally tagged, no defaults)
+/// is tried first so a real tagged delta is never mis-decoded as an empty
+/// state-delta.
+fn apply_delta_bytes(
+    shard: &mut ThreadShard,
+    bytes: &[u8],
+    root: &str,
+) -> Result<(), ContractError> {
+    if let Ok(delta) = serde_json::from_slice::<ThreadDelta>(bytes) {
+        apply_thread_delta(shard, delta, root);
+        return Ok(());
+    }
+    if let Ok(sd) = serde_json::from_slice::<ThreadStateDelta>(bytes) {
+        apply_state_delta(shard, sd, root);
+        return Ok(());
+    }
+    if let Ok(replies) = serde_json::from_slice::<Vec<Post>>(bytes) {
+        apply_thread_delta(shard, ThreadDelta::Replies(replies), root);
+        return Ok(());
+    }
+    let other =
+        serde_json::from_slice::<ThreadShard>(bytes).map_err(|_| ContractError::InvalidDelta)?;
+    merge_state(shard, other, root);
+    Ok(())
+}
+
+/// Apply a `ThreadStateDelta` (the sync delta from `get_state_delta`). Replies
+/// and quotes are full self-verifying records (re-checked here). Likes arrive as
+/// `(signer, seq, liked)` *state* tuples — the signature was already proven when
+/// the sending peer admitted the like, so they merge by the same `(seq, liked)`
+/// join rule as a full-state merge (the same trust model as `UpdateData::State`,
+/// which also carries unsigned like state).
+fn apply_state_delta(shard: &mut ThreadShard, sd: ThreadStateDelta, root: &str) {
+    for reply in sd.replies {
+        if reply_is_acceptable(&reply, root) {
+            shard.replies.entry(reply.id.clone()).or_insert(reply);
+        }
+    }
+    for quote in sd.quotes {
+        if quote_is_acceptable(&quote, root) {
+            shard
+                .quotes
+                .entry(quote.quote_post_id.clone())
+                .or_insert(quote);
+        }
+    }
+    for (signer, seq, liked) in sd.likes {
+        if hex::decode(&signer)
+            .map(|b| b.len() == ML_DSA_65_VK_LEN)
+            .unwrap_or(false)
+        {
+            let state = LikeState { seq, liked };
+            match shard.likes.get(&signer) {
+                Some(cur) if !like_replaces(seq, liked, cur) => {}
+                _ => {
+                    shard.likes.insert(signer, state);
+                }
+            }
+        }
+    }
+}
+
+/// Full-state merge: fold every surface of `other` into `shard` under the same
+/// acceptance + convergence rules as a delta, so a peer syncing its latest state
+/// reconciles replies + likes + quotes (not only replies).
+fn merge_state(shard: &mut ThreadShard, other: ThreadShard, root: &str) {
+    for (id, reply) in other.replies {
+        if reply_is_acceptable(&reply, root) {
+            shard.replies.entry(id).or_insert(reply);
+        }
+    }
+    for (signer, state) in other.likes {
+        // Reconstruct a record-shaped view for the join rule. The incoming state
+        // already passed validation as part of a self-verified record upstream;
+        // here we merge by (seq, liked) deterministically.
+        match shard.likes.get(&signer) {
+            Some(cur) if !like_replaces(state.seq, state.liked, cur) => {}
+            _ => {
+                shard.likes.insert(signer, state);
+            }
+        }
+    }
+    for (qid, quote) in other.quotes {
+        if quote_is_acceptable(&quote, root) {
+            shard.quotes.entry(qid).or_insert(quote);
+        }
+    }
+}
+
+#[contract]
+impl ContractInterface for ThreadShard {
+    fn validate_state(
+        parameters: Parameters<'static>,
+        state: State<'static>,
+        _related: RelatedContracts,
+    ) -> Result<ValidateResult, ContractError> {
+        let shard = ThreadShard::try_from(state)?;
+        let root = root_post_id(&parameters);
+
+        // Every reply must self-verify, be bound to this thread, fit the length
+        // bound, and key under its own content address (no duplicates / no
+        // misfiled id). update_state guarantees these, so validate_state must
+        // reject any state violating them (AGENTS.md → "validate agrees with
+        // update").
+        for (id, reply) in &shard.replies {
+            if id != &reply.id || !reply_is_acceptable(reply, &root) {
+                return Err(ContractError::InvalidState);
+            }
+        }
+        // Likes are stored as (seq, liked) keyed by signer. The full signature
+        // was checked at update time and is not retained in state, so the
+        // structural invariant here is that the key decodes as a valid ML-DSA-65
+        // VK (the right byte length) — a state carrying a non-VK liker key was
+        // never produced by update_state.
+        for signer in shard.likes.keys() {
+            let is_vk = hex::decode(signer)
+                .map(|b| b.len() == ML_DSA_65_VK_LEN)
+                .unwrap_or(false);
+            if !is_vk {
+                return Err(ContractError::InvalidState);
+            }
+        }
+        // Every quote must self-verify, be bound to this thread, and key under
+        // its quote_post_id.
+        for (qid, quote) in &shard.quotes {
+            if qid != &quote.quote_post_id || !quote_is_acceptable(quote, &root) {
+                return Err(ContractError::InvalidState);
+            }
+        }
+        Ok(ValidateResult::Valid)
+    }
+
+    fn update_state(
+        parameters: Parameters<'static>,
+        state: State<'static>,
+        delta: Vec<UpdateData>,
+    ) -> Result<UpdateModification<'static>, ContractError> {
+        let mut shard = ThreadShard::try_from(state)?;
+        let root = root_post_id(&parameters);
+
+        // Iterate EVERY update item (not just the first), dispatching per kind.
+        for item in &delta {
+            match item {
+                UpdateData::Delta(d) => apply_delta_bytes(&mut shard, d.as_ref(), &root)?,
+                UpdateData::State(s) => {
+                    let other = ThreadShard::try_from(State::from(s.to_vec()))?;
+                    merge_state(&mut shard, other, &root);
+                }
+                UpdateData::StateAndDelta { state: s, delta: d } => {
+                    let other = ThreadShard::try_from(State::from(s.to_vec()))?;
+                    merge_state(&mut shard, other, &root);
+                    apply_delta_bytes(&mut shard, d.as_ref(), &root)?;
+                }
+                _ => {}
+            }
+        }
+
+        normalize(&mut shard);
+        let bytes = serde_json::to_vec(&shard).map_err(|e| ContractError::Other(format!("{e}")))?;
+        Ok(UpdateModification::valid(State::from(bytes)))
+    }
+
+    fn summarize_state(
+        _parameters: Parameters<'static>,
+        state: State<'static>,
+    ) -> Result<StateSummary<'static>, ContractError> {
+        let shard = ThreadShard::try_from(state)?;
+        // Summary = the key sets per surface, so get_state_delta can compute what
+        // the requester is missing. Keys are deterministic (BTreeMap order).
+        let summary = ThreadSummary {
+            replies: shard.replies.keys().cloned().collect(),
+            likes: shard
+                .likes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.seq, v.liked))
+                .collect(),
+            quotes: shard.quotes.keys().cloned().collect(),
+        };
+        let bytes =
+            serde_json::to_vec(&summary).map_err(|e| ContractError::Other(format!("{e}")))?;
+        Ok(StateSummary::from(bytes))
+    }
+
+    fn get_state_delta(
+        parameters: Parameters<'static>,
+        state: State<'static>,
+        summary: StateSummary<'static>,
+    ) -> Result<StateDelta<'static>, ContractError> {
+        let shard = ThreadShard::try_from(state)?;
+        let _ = root_post_id(&parameters);
+        let have: ThreadSummary = serde_json::from_slice(summary.as_ref()).unwrap_or_default();
+
+        let have_replies: std::collections::HashSet<&String> = have.replies.iter().collect();
+        let have_quotes: std::collections::HashSet<&String> = have.quotes.iter().collect();
+        let have_likes: BTreeMap<&String, (u64, bool)> = have
+            .likes
+            .iter()
+            .map(|(k, seq, liked)| (k, (*seq, *liked)))
+            .collect();
+
+        // Replies the requester lacks.
+        let missing_replies: Vec<Post> = shard
+            .replies
+            .iter()
+            .filter(|(id, _)| !have_replies.contains(id))
+            .map(|(_, p)| p.clone())
+            .collect();
+        // Quotes the requester lacks.
+        let missing_quotes: Vec<QuoteRef> = shard
+            .quotes
+            .iter()
+            .filter(|(qid, _)| !have_quotes.contains(qid))
+            .map(|(_, q)| q.clone())
+            .collect();
+        // Likes the requester lacks or has at a lower (seq, liked-rank). We ship
+        // the current state view as a reconstructed record WITHOUT a signature;
+        // the receiving merge_state path merges by (seq, liked) deterministically.
+        let likes_delta: Vec<(String, u64, bool)> = shard
+            .likes
+            .iter()
+            .filter(|(k, v)| match have_likes.get(*k) {
+                Some((seq, liked)) => v.seq > *seq || (v.seq == *seq && *liked && !v.liked),
+                None => true,
+            })
+            .map(|(k, v)| (k.clone(), v.seq, v.liked))
+            .collect();
+
+        let delta = ThreadStateDelta {
+            replies: missing_replies,
+            quotes: missing_quotes,
+            likes: likes_delta,
+        };
+        let bytes = serde_json::to_vec(&delta).map_err(|e| ContractError::Other(format!("{e}")))?;
+        Ok(StateDelta::from(bytes))
+    }
+}
+
+/// Summary shape: the key sets the requester already holds, so `get_state_delta`
+/// can ship only what is missing.
+#[derive(Serialize, Deserialize, Default)]
+struct ThreadSummary {
+    #[serde(default)]
+    replies: Vec<String>,
+    /// (signer, seq, liked) so a stale like can be refreshed.
+    #[serde(default)]
+    likes: Vec<(String, u64, bool)>,
+    #[serde(default)]
+    quotes: Vec<String>,
+}
+
+/// The delta `get_state_delta` ships. Replies/quotes are full self-verifying
+/// records; likes are (signer, seq, liked) tuples merged by the join rule. This
+/// is intentionally NOT a `ThreadDelta` — it can convey all three surfaces in
+/// one message and carries the like *state* (not a re-signed record), which the
+/// merge path accepts via the full-state code path. Decoded by `apply_delta_bytes`
+/// → full-`ThreadShard` arm after reshaping below.
+#[derive(Serialize, Deserialize, Default)]
+struct ThreadStateDelta {
+    #[serde(default)]
+    replies: Vec<Post>,
+    #[serde(default)]
+    likes: Vec<(String, u64, bool)>,
+    #[serde(default)]
+    quotes: Vec<QuoteRef>,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use freenet_microblogging_common::thread::{LikeRecord, QuoteRef};
+    use ml_dsa::KeyGen;
+    use ml_dsa::signature::{Keypair, Signer};
+    use ml_dsa::{MlDsa65, Signature};
+
+    const ROOT: &str = "root_post_content_address_0001";
+
+    fn params() -> Parameters<'static> {
+        Parameters::from(ROOT.as_bytes().to_vec())
+    }
+
+    fn vk_hex(seed: [u8; 32]) -> String {
+        let sk = MlDsa65::from_seed(&seed.into());
+        hex::encode(sk.verifying_key().encode())
+    }
+
+    /// A signed reply to ROOT.
+    fn signed_reply(seed: [u8; 32], content: &str, ts: u64) -> Post {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut p = Post {
+            id: String::new(),
+            author_pubkey: hex::encode(sk.verifying_key().encode()),
+            author_name: "Bob".into(),
+            author_handle: "@bob".into(),
+            content: content.into(),
+            timestamp: ts,
+            reply_to: ROOT.into(),
+            signature: None,
+        };
+        p.id = p.compute_id();
+        let sig: Signature<MlDsa65> = sk.sign(&p.signing_payload());
+        p.signature = Some(hex::encode(sig.encode()));
+        p
+    }
+
+    fn signed_like(seed: [u8; 32], seq: u64, liked: bool) -> LikeRecord {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut r = LikeRecord {
+            signer_pubkey: hex::encode(sk.verifying_key().encode()),
+            seq,
+            liked,
+            writer_cert: None,
+            signature: None,
+        };
+        let sig: Signature<MlDsa65> = sk.sign(&r.signing_payload(ROOT));
+        r.signature = Some(hex::encode(sig.encode()));
+        r
+    }
+
+    fn signed_quote(seed: [u8; 32], qid: &str) -> QuoteRef {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut q = QuoteRef {
+            signer_pubkey: hex::encode(sk.verifying_key().encode()),
+            quote_post_id: qid.into(),
+            writer_cert: None,
+            signature: None,
+        };
+        let sig: Signature<MlDsa65> = sk.sign(&q.signing_payload(ROOT));
+        q.signature = Some(hex::encode(sig.encode()));
+        q
+    }
+
+    fn state_of(shard: &ThreadShard) -> State<'static> {
+        State::from(serde_json::to_vec(shard).unwrap())
+    }
+
+    fn delta_item(d: &ThreadDelta) -> UpdateData<'static> {
+        UpdateData::Delta(StateDelta::from(serde_json::to_vec(d).unwrap()))
+    }
+
+    fn run_update(shard: ThreadShard, items: Vec<UpdateData<'static>>) -> ThreadShard {
+        let res = ThreadShard::update_state(params(), state_of(&shard), items).unwrap();
+        serde_json::from_slice(res.unwrap_valid().as_ref()).unwrap()
+    }
+
+    #[test]
+    fn reply_accepted_only_when_bound_to_this_thread() {
+        let good = signed_reply([1u8; 32], "hi", 100);
+        // A reply whose reply_to is a different thread must be rejected.
+        let sk = MlDsa65::from_seed(&[1u8; 32].into());
+        let mut wrong = Post {
+            id: String::new(),
+            author_pubkey: hex::encode(sk.verifying_key().encode()),
+            author_name: "Bob".into(),
+            author_handle: "@bob".into(),
+            content: "hi".into(),
+            timestamp: 100,
+            reply_to: "some_other_thread".into(),
+            signature: None,
+        };
+        wrong.id = wrong.compute_id();
+        let sig: Signature<MlDsa65> = sk.sign(&wrong.signing_payload());
+        wrong.signature = Some(hex::encode(sig.encode()));
+
+        let out = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Replies(vec![good.clone(), wrong]))],
+        );
+        assert_eq!(out.replies.len(), 1);
+        assert!(out.replies.contains_key(&good.id));
+    }
+
+    #[test]
+    fn replies_dedup_by_content_address() {
+        let r = signed_reply([1u8; 32], "dup", 100);
+        let out = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Replies(vec![
+                r.clone(),
+                r.clone(),
+            ]))],
+        );
+        assert_eq!(out.replies.len(), 1);
+    }
+
+    #[test]
+    fn likes_converge_equal_seq_unlike_wins() {
+        // Same liker, same seq, Like vs Unlike → unlike wins regardless of order
+        // (the equal-seq tie-break; AGENTS.md → "Convergence").
+        let like = signed_like([2u8; 32], 5, true);
+        let unlike = signed_like([2u8; 32], 5, false);
+
+        let a = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Likes(vec![
+                like.clone(),
+                unlike.clone(),
+            ]))],
+        );
+        let b = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Likes(vec![unlike, like]))],
+        );
+        let signer = vk_hex([2u8; 32]);
+        assert!(!a.likes[&signer].liked);
+        assert_eq!(a.likes[&signer], b.likes[&signer]);
+    }
+
+    #[test]
+    fn likes_higher_seq_wins() {
+        let l1 = signed_like([2u8; 32], 1, true);
+        let l2 = signed_like([2u8; 32], 2, false);
+        let out = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Likes(vec![l2, l1]))],
+        );
+        let signer = vk_hex([2u8; 32]);
+        assert_eq!(out.likes[&signer].seq, 2);
+        assert!(!out.likes[&signer].liked);
+    }
+
+    #[test]
+    fn quotes_dedup_by_quote_post_id() {
+        let q = signed_quote([3u8; 32], "quote_aaa");
+        let out = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Quotes(vec![q.clone(), q.clone()]))],
+        );
+        assert_eq!(out.quotes.len(), 1);
+        assert!(out.quotes.contains_key("quote_aaa"));
+    }
+
+    #[test]
+    fn tampered_like_signature_rejected() {
+        let mut bad = signed_like([2u8; 32], 1, true);
+        bad.seq = 99; // breaks signature
+        let out = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Likes(vec![bad]))],
+        );
+        assert!(out.likes.is_empty());
+    }
+
+    #[test]
+    fn full_state_merge_reconciles_all_surfaces() {
+        let mut a = ThreadShard::default();
+        let r = signed_reply([1u8; 32], "r", 100);
+        a.replies.insert(r.id.clone(), r);
+        let lk = signed_like([2u8; 32], 1, true);
+        a.likes.insert(
+            lk.signer_pubkey.clone(),
+            LikeState {
+                seq: 1,
+                liked: true,
+            },
+        );
+
+        // Merge a's full state into an empty shard via UpdateData::State.
+        let out = run_update(
+            ThreadShard::default(),
+            vec![UpdateData::State(state_of(&a))],
+        );
+        assert_eq!(out.replies.len(), 1);
+        assert_eq!(out.likes.len(), 1);
+    }
+
+    #[test]
+    fn validate_rejects_misfiled_reply_id() {
+        let mut shard = ThreadShard::default();
+        let r = signed_reply([1u8; 32], "x", 100);
+        // File it under the wrong key.
+        shard.replies.insert("wrong_key".into(), r);
+        let res = ThreadShard::validate_state(params(), state_of(&shard), RelatedContracts::new());
+        assert!(!matches!(res, Ok(ValidateResult::Valid)));
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_state() {
+        let mut shard = ThreadShard::default();
+        let r = signed_reply([1u8; 32], "x", 100);
+        shard.replies.insert(r.id.clone(), r);
+        let q = signed_quote([3u8; 32], "qa");
+        shard.quotes.insert(q.quote_post_id.clone(), q);
+        let res = ThreadShard::validate_state(params(), state_of(&shard), RelatedContracts::new())
+            .unwrap();
+        assert!(matches!(res, ValidateResult::Valid));
+    }
+
+    #[test]
+    fn replies_truncate_deterministically() {
+        // Build > MAX_REPLIES replies across two orderings; both retain the same
+        // newest-by-(timestamp,id) set.
+        let mut items_fwd = Vec::new();
+        let mut items_rev = Vec::new();
+        let n = MAX_REPLIES + 25;
+        let mut replies: Vec<Post> = (0..n)
+            .map(|i| signed_reply([1u8; 32], &format!("c{i}"), 1000 + i as u64))
+            .collect();
+        for r in &replies {
+            items_fwd.push(r.clone());
+        }
+        replies.reverse();
+        for r in &replies {
+            items_rev.push(r.clone());
+        }
+        let a = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Replies(items_fwd))],
+        );
+        let b = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Replies(items_rev))],
+        );
+        assert_eq!(a.replies.len(), MAX_REPLIES);
+        assert_eq!(
+            a.replies.keys().collect::<Vec<_>>(),
+            b.replies.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_root_param_accepts_nothing() {
+        let r = signed_reply([1u8; 32], "hi", 100);
+        let res = ThreadShard::update_state(
+            Parameters::from(Vec::new()),
+            state_of(&ThreadShard::default()),
+            vec![delta_item(&ThreadDelta::Replies(vec![r]))],
+        )
+        .unwrap();
+        let out: ThreadShard = serde_json::from_slice(res.unwrap_valid().as_ref()).unwrap();
+        assert!(out.replies.is_empty());
+    }
+
+    #[test]
+    fn get_state_delta_output_is_applyable() {
+        // Regression: get_state_delta ships a ThreadStateDelta; apply_delta_bytes
+        // must be able to decode and apply it (round-trip), or peers never sync.
+        // Build a source with all three surfaces.
+        let mut src = ThreadShard::default();
+        let r = signed_reply([1u8; 32], "r", 100);
+        src.replies.insert(r.id.clone(), r);
+        let lk = signed_like([2u8; 32], 3, true);
+        src.likes.insert(
+            lk.signer_pubkey.clone(),
+            LikeState {
+                seq: 3,
+                liked: true,
+            },
+        );
+        let q = signed_quote([3u8; 32], "qa");
+        src.quotes.insert(q.quote_post_id.clone(), q);
+
+        // Empty requester summary → delta carries everything.
+        let empty_summary =
+            StateSummary::from(serde_json::to_vec(&ThreadSummary::default()).unwrap());
+        let delta = ThreadShard::get_state_delta(params(), state_of(&src), empty_summary).unwrap();
+
+        // Apply that delta to a fresh shard.
+        let out = run_update(
+            ThreadShard::default(),
+            vec![UpdateData::Delta(StateDelta::from(
+                delta.into_bytes().to_vec(),
+            ))],
+        );
+        assert_eq!(out.replies.len(), 1);
+        assert_eq!(out.likes.len(), 1);
+        assert_eq!(out.quotes.len(), 1);
+    }
+
+    #[test]
+    fn decodes_old_shape_state() {
+        let empty: ThreadShard = serde_json::from_slice(b"{}").unwrap();
+        assert!(empty.replies.is_empty() && empty.likes.is_empty() && empty.quotes.is_empty());
+        let forward: ThreadShard =
+            serde_json::from_slice(br#"{"replies":{},"likes":{},"quotes":{},"version":2}"#)
+                .unwrap();
+        assert!(forward.replies.is_empty());
+    }
+}

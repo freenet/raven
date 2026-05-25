@@ -273,6 +273,84 @@ secret storage with a `{ contract_type → recorded_hash }` map (mirroring mail'
 flow against each identity's derived key. Cross-version contact interop follows
 then.
 
+## Contract correctness invariants (review checklist)
+
+Hard-won rules from the ADR-0001 shard work. Every one of these was a real bug
+caught in review (issue refs are the review-round labels). **Check these on any
+PR that touches a contract `update_state` / `validate_state` / merge / delta
+path** — they pass local tests yet split replicas in production, so unit tests
+alone do not catch them.
+
+### Convergence: merges must be order-independent (C-1, MAJOR-1)
+
+A contract's `update_state` runs on every replica with deltas arriving in **any
+order**. Any merge rule that depends on arrival order produces a permanent,
+non-healing split-brain between replicas.
+
+- **Every per-key / per-element merge must be a pure function of the
+  accumulated set**, not of insertion order. Decide the winner from the values
+  (seq, content hash, tombstone flag), never from "who arrived first".
+- **Equal-rank ties need a deterministic tie-break.** A strict `seq >` is not
+  enough: concurrent ops at the *same* seq must resolve the same way on every
+  replica (e.g. Unfollow/Unlike wins an equal-seq tie). Without it, two replicas
+  that saw the two ops in opposite order disagree forever. (review C-1)
+- **Bounded surfaces must truncate post-merge, as a function of the retained
+  set** — never by skipping elements at insert time. Admission-order capping is
+  arrival-order-dependent and diverges at the cap boundary. Mirror the post
+  window: merge everything, then `truncate_*` deterministically (e.g. tombstones
+  first, then a total order over keys). Evicting tombstones first also bounds
+  tombstone growth. (review MAJOR-1)
+- A transiently over-bound merged state is **normal** — `validate_state` must
+  NOT enforce the window/cap, or it rejects legitimate merges and breaks
+  convergence. Authority + self-verification are the only validity invariants;
+  bounds are enforced only by post-merge truncation.
+
+### No clock in a contract
+
+`update_state` cannot read wall-clock time. Any "recent N" / "expire after"
+rule must be **count-based over a deterministic total order** (e.g.
+`(timestamp, content_id)` desc, where `timestamp` is author-signed data, not a
+read clock). Time-based truncation is impossible here — the ADR's "windows like
+mail" note is aspirational; mail bounds age sender-side in a delegate.
+
+### Deterministic signing payloads — never `serde_json`
+
+The bytes that are hashed for an id or signed/verified must be a **manual,
+length-prefixed concatenation** (`u32` LE len + bytes per field), with a
+domain-separation tag first. `serde_json` field order and whitespace are not
+guaranteed stable across versions, so a JSON signing payload silently breaks
+verification on a dependency bump. See `Post::signing_payload` /
+`SignedOp::signing_payload`.
+
+- **Domain-tag every payload** so a signature over one structure can never be
+  replayed as a signature over another (`raven:post:v1`, `raven:signed-op:v1`).
+- **Bind cross-shard context** for any envelope reused across shard types
+  (`USER_SHARD_CONTEXT`), so an op signed for one shard cannot be replayed into
+  another that shares the envelope. (review M-2)
+- **Append optional signed fields conditionally** (only when non-empty) if you
+  must keep existing ids/signatures byte-stable — see `Post::reply_to`. A field
+  added unconditionally to a signing payload rotates every existing id/sig.
+
+### `validate_state` must agree with `update_state`
+
+If `update_state` guarantees an invariant (e.g. no duplicate ids), then
+`validate_state` must **also reject** a state violating it — otherwise the two
+halves disagree and a peer can inject state the updater would never produce.
+(review MAJOR-1, #25 re-review)
+
+### No `unwrap()` / panic in contract WASM
+
+A panic in `update_state` / `validate_state` / `summarize_state` /
+`get_state_delta` aborts the WASM trap-style, not a clean error. Use `?` and
+return `ContractError`. (review MINOR-3)
+
+### Owner-writes via VK-param match
+
+An owner-writes shard is parameterized by the owner's raw encoded ML-DSA-65 VK
+bytes; a write is accepted iff it self-verifies **and** its signer hex equals
+`hex(parameters)`. Empty parameters → empty owner key that nothing matches (an
+un-parameterized shard accepts nothing — a safe default, not a footgun).
+
 ## Conventions
 
 - All Freenet protocol messages use FlatBuffers types from the stdlib
@@ -285,4 +363,5 @@ then.
 - Dark mode via `[data-theme="dark"]` attribute on `<html>`
 - UI components are pure TypeScript DOM functions (no framework)
 - Posts limited to 280 characters (validated in contract + UI)
-- Ed25519 signatures for post authenticity (via identity delegate)
+- ML-DSA-65 (FIPS 204, post-quantum) signatures for post/op authenticity (via
+  identity delegate); see ADR-0001 Phase 0. (Was Ed25519 in the prototype.)
