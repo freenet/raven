@@ -206,9 +206,10 @@ script_runner = "bash"
 script = '''
 set -euo pipefail
 ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
-cargo test -p freenet-microblogging-posts
-cargo test -p freenet-microblogging-follows
-cargo test -p freenet-microblogging-likes
+# Whole workspace so every contract, the common crate, and the identity delegate
+# are exercised — not a hand-maintained subset (the user/thread shards and the
+# delegate were previously omitted here and only ran in ad-hoc cargo test calls).
+cargo test --workspace
 cd "$ROOT/web" && npm test
 '''
 

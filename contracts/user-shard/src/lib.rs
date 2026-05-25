@@ -1119,3 +1119,275 @@ mod test {
         assert!(empty.follows.is_empty());
     }
 }
+
+/// Integration tests: drive the full `ContractInterface` through multi-replica
+/// reconciliation via the real sync protocol (`summarize_state` →
+/// `get_state_delta` → `update_state`) across all three owner-writes surfaces
+/// (posts, profile, follows). This is the layer above the per-function unit
+/// tests; what is new is the summarize/delta sync path and the validate-after-
+/// merge invariant, with real ML-DSA-65 owner keys.
+///
+/// Still a Rust-library drive of the contract, not compiled WASM in a node
+/// (that e2e tier is separate — see the `freenet:linux-test` skill).
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use freenet_microblogging_common::signed_op::Profile;
+    use ml_dsa::signature::{Keypair, Signer};
+    use ml_dsa::{KeyGen, MlDsa65};
+
+    // The owner of the shard under test. Posts/ops the owner signs are accepted;
+    // a different key is rejected (owner-writes). One owner per shard instance.
+    const OWNER: [u8; 32] = [42u8; 32];
+
+    fn params() -> Parameters<'static> {
+        let sk = MlDsa65::from_seed(&OWNER.into());
+        Parameters::from(sk.verifying_key().encode().to_vec())
+    }
+
+    fn signed_post(content: &str, ts: u64) -> Post {
+        let sk = MlDsa65::from_seed(&OWNER.into());
+        let mut p = Post {
+            id: String::new(),
+            author_pubkey: hex::encode(sk.verifying_key().encode()),
+            author_name: "Owner".into(),
+            author_handle: "@owner".into(),
+            content: content.into(),
+            timestamp: ts,
+            reply_to: String::new(),
+            signature: None,
+        };
+        p.id = p.compute_id();
+        let sig: ml_dsa::Signature<MlDsa65> = sk.sign(&p.signing_payload());
+        p.signature = Some(hex::encode(sig.encode()));
+        p
+    }
+
+    fn op(op_type: OpType, payload: Vec<u8>, seq: u64) -> SignedOp {
+        let sk = MlDsa65::from_seed(&OWNER.into());
+        let mut o = SignedOp {
+            op_type,
+            payload,
+            seq,
+            signer_pubkey: hex::encode(sk.verifying_key().encode()),
+            signature: None,
+        };
+        let sig: ml_dsa::Signature<MlDsa65> = sk.sign(&o.signing_payload(USER_SHARD_CONTEXT));
+        o.signature = Some(hex::encode(sig.encode()));
+        o
+    }
+
+    fn profile_op(p: &Profile, seq: u64) -> SignedOp {
+        op(OpType::Profile, serde_json::to_vec(p).unwrap(), seq)
+    }
+
+    fn follow_op(targets: &[&str], follow: bool, seq: u64) -> SignedOp {
+        let targets: Vec<String> = targets.iter().map(|s| s.to_string()).collect();
+        op(
+            if follow {
+                OpType::Follow
+            } else {
+                OpType::Unfollow
+            },
+            serde_json::to_vec(&targets).unwrap(),
+            seq,
+        )
+    }
+
+    fn state_of(shard: &UserShard) -> State<'static> {
+        State::from(serde_json::to_vec(shard).unwrap())
+    }
+
+    fn decode(state: State<'static>) -> UserShard {
+        serde_json::from_slice(state.as_ref()).unwrap()
+    }
+
+    fn apply(shard: &UserShard, items: Vec<ShardDelta>) -> UserShard {
+        let deltas: Vec<UpdateData> = items
+            .into_iter()
+            .map(|d| UpdateData::Delta(StateDelta::from(serde_json::to_vec(&d).unwrap())))
+            .collect();
+        let res = UserShard::update_state(params(), state_of(shard), deltas).unwrap();
+        decode(res.unwrap_valid())
+    }
+
+    fn validate(shard: &UserShard) -> bool {
+        matches!(
+            UserShard::validate_state(params(), state_of(shard), RelatedContracts::new()).unwrap(),
+            ValidateResult::Valid
+        )
+    }
+
+    /// One directional sync step, faithful to the node protocol: `dst` summarizes,
+    /// `src` computes the delta of what `dst` lacks, `dst` applies it. Both states
+    /// must stay valid.
+    fn sync_into(dst: &UserShard, src: &UserShard) -> UserShard {
+        assert!(validate(dst));
+        let summary = UserShard::summarize_state(params(), state_of(dst)).unwrap();
+        let d = UserShard::get_state_delta(params(), state_of(src), summary).unwrap();
+        let res = UserShard::update_state(
+            params(),
+            state_of(dst),
+            vec![UpdateData::Delta(StateDelta::from(d.into_bytes().to_vec()))],
+        )
+        .unwrap();
+        let merged = decode(res.unwrap_valid());
+        assert!(validate(&merged));
+        merged
+    }
+
+    /// Bidirectional reconcile (one round each way). For these state sizes a
+    /// single round each direction converges. Returns `(a', b')`, must be equal.
+    fn reconcile(a: &UserShard, b: &UserShard) -> (UserShard, UserShard) {
+        let a2 = sync_into(a, b);
+        let b2 = sync_into(b, a);
+        (a2, b2)
+    }
+
+    fn canonical(shard: &UserShard) -> Vec<u8> {
+        serde_json::to_vec(shard).unwrap()
+    }
+
+    #[test]
+    fn two_replicas_converge_all_surfaces_over_sync() {
+        // A and B each see disjoint owner writes across posts, profile, and
+        // follows, then reconcile via the sync protocol. They must converge.
+        let empty = UserShard::default();
+        let prof_a = Profile {
+            display_name: "A".into(),
+            handle: "@a".into(),
+            bio: "".into(),
+            avatar: "".into(),
+        };
+        let prof_b = Profile {
+            display_name: "B".into(),
+            handle: "@b".into(),
+            bio: "bio".into(),
+            avatar: "red".into(),
+        };
+
+        let a = apply(
+            &empty,
+            vec![
+                ShardDelta::Posts(vec![signed_post("post-1", 100)]),
+                ShardDelta::Op(profile_op(&prof_a, 1)),
+                ShardDelta::Op(follow_op(&["aa", "bb"], true, 1)),
+            ],
+        );
+        // B has a newer profile (seq 2 wins) and a different post + follow edit.
+        let b = apply(
+            &empty,
+            vec![
+                ShardDelta::Posts(vec![signed_post("post-2", 200)]),
+                ShardDelta::Op(profile_op(&prof_b, 2)),
+                ShardDelta::Op(follow_op(&["cc"], true, 1)),
+            ],
+        );
+
+        let (a2, b2) = reconcile(&a, &b);
+        assert_eq!(canonical(&a2), canonical(&b2), "replicas must converge");
+        assert_eq!(a2.posts.len(), 2, "both posts present");
+        // Profile LWW: seq 2 (B's) wins on both.
+        assert_eq!(a2.profile.as_ref().unwrap().seq, 2);
+        assert_eq!(a2.profile.as_ref().unwrap().profile.display_name, "B");
+        // Follows union of the followed keys.
+        assert!(a2.follows.get("aa").map(|f| f.following).unwrap_or(false));
+        assert!(a2.follows.get("cc").map(|f| f.following).unwrap_or(false));
+    }
+
+    #[test]
+    fn concurrent_follow_unfollow_equal_seq_converges_over_sync() {
+        // Same target, equal seq, follow on A and unfollow on B — the split-brain
+        // case C-1 guards. Over the sync protocol both must settle on unfollow,
+        // in either reconcile direction.
+        let empty = UserShard::default();
+        let a = apply(
+            &empty,
+            vec![ShardDelta::Op(follow_op(&["target"], true, 5))],
+        );
+        let b = apply(
+            &empty,
+            vec![ShardDelta::Op(follow_op(&["target"], false, 5))],
+        );
+
+        let (a2, b2) = reconcile(&a, &b);
+        assert_eq!(canonical(&a2), canonical(&b2));
+        assert!(
+            !a2.follows
+                .get("target")
+                .map(|f| f.following)
+                .unwrap_or(false),
+            "equal-seq unfollow wins after sync"
+        );
+
+        let (b3, a3) = reconcile(&b, &a);
+        assert_eq!(canonical(&a3), canonical(&b3));
+        assert!(
+            !a3.follows
+                .get("target")
+                .map(|f| f.following)
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn profile_lww_resolves_over_sync_regardless_of_replica() {
+        // A holds seq 3, B holds seq 1 for the profile register. After sync both
+        // hold seq 3 — the summary folds the profile so a register difference
+        // triggers shipping the newer state.
+        let empty = UserShard::default();
+        let old = Profile {
+            display_name: "Old".into(),
+            handle: "@o".into(),
+            bio: "".into(),
+            avatar: "".into(),
+        };
+        let new = Profile {
+            display_name: "New".into(),
+            handle: "@n".into(),
+            bio: "".into(),
+            avatar: "".into(),
+        };
+        let a = apply(&empty, vec![ShardDelta::Op(profile_op(&new, 3))]);
+        let b = apply(&empty, vec![ShardDelta::Op(profile_op(&old, 1))]);
+
+        let (a2, b2) = reconcile(&a, &b);
+        assert_eq!(canonical(&a2), canonical(&b2));
+        assert_eq!(a2.profile.as_ref().unwrap().seq, 3);
+        assert_eq!(a2.profile.as_ref().unwrap().profile.display_name, "New");
+    }
+
+    #[test]
+    fn non_owner_post_never_propagates_over_sync() {
+        // A malicious replica holds a post signed by a NON-owner key in its state.
+        // When an honest replica syncs from it, update_state re-checks owner
+        // authorship and drops it — owner-writes holds across the sync path.
+        let other = [7u8; 32];
+        let osk = MlDsa65::from_seed(&other.into());
+        let mut foreign = Post {
+            id: String::new(),
+            author_pubkey: hex::encode(osk.verifying_key().encode()),
+            author_name: "Intruder".into(),
+            author_handle: "@intruder".into(),
+            content: "not the owner".into(),
+            timestamp: 50,
+            reply_to: String::new(),
+            signature: None,
+        };
+        foreign.id = foreign.compute_id();
+        let sig: ml_dsa::Signature<MlDsa65> = osk.sign(&foreign.signing_payload());
+        foreign.signature = Some(hex::encode(sig.encode()));
+        // foreign self-verifies as a valid post, just not by the owner.
+        assert_eq!(foreign.verify(), Ok(()));
+
+        let mut malicious = UserShard::default();
+        malicious.posts.push(foreign);
+
+        let honest = UserShard::default();
+        let synced = sync_into(&honest, &malicious);
+        assert!(
+            synced.posts.is_empty(),
+            "non-owner post must not propagate to an honest replica"
+        );
+    }
+}
