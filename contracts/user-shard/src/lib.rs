@@ -1,48 +1,103 @@
 //! User shard contract (ADR-0001, Phase 1).
 //!
-//! One contract per user, **owner-writes only**. This phase carries the
-//! windowed recent-posts surface; profile and follows land in later slices
-//! (they share the same owner-writes / low-churn / read-by-followers axis, so
-//! they belong in this same contract — see ADR-0001 → "User shard").
+//! One contract per user, **owner-writes only**, parameterized by the owner's
+//! raw encoded ML-DSA-65 verifying key. It bundles the three owner-writes /
+//! low-churn / read-by-followers surfaces the ADR assigns to the user shard:
 //!
-//! ## Write authority — VK-param match
+//!   * **posts** — a windowed feed of the owner's recent posts;
+//!   * **profile** — a single last-write-wins register (display name, handle,
+//!     bio, avatar);
+//!   * **follows** — the set of pubkeys the owner follows.
 //!
-//! The contract is parameterized by its owner's ML-DSA-65 verifying key (the
-//! raw encoded VK bytes). A post is accepted iff:
-//!   1. it self-verifies (`common::post::Post::verify` — content-addressed id
-//!      matches the signed fields and the ML-DSA-65 signature is valid for
-//!      `author_pubkey`), **and**
-//!   2. its `author_pubkey` equals this contract's owner VK.
+//! ## Write authority
 //!
-//! (2) is what makes the shard owner-writes: a post signed by some *other*
-//! valid key self-verifies but is not the owner's, so it is rejected. The owner
-//! is whoever holds the seed for the parameter VK.
+//! Posts are self-signed and content-addressed, so a post proves owner-authorship
+//! directly (`common::post::Post::verify` + `author_pubkey == owner`). Profile and
+//! follow mutations are not posts, so they arrive as `common::signed_op::SignedOp`
+//! envelopes: an ML-DSA-65 signature by the owner over a domain-tagged payload.
+//! Both gates reduce to the same VK-param match — only the owner's key is accepted.
 //!
-//! ## Bounded state — post-merge count window
+//! ## Delta format
 //!
-//! The shard retains roughly the newest `MAX_POSTS` posts. Enforcement is a
-//! **post-merge truncation**, not a pre-write check: concurrent appends from
-//! different replicas can otherwise blow the bound at merge time. There is no
-//! clock inside a contract, so "newest" is a deterministic ordering over the
-//! merged set — `(timestamp, id)` descending — not a wall-clock decision. The
-//! ordering is total and stable, so every replica truncates to the same set.
+//! Updates are a `ShardDelta` (an externally-tagged enum), so a single contract
+//! can host more than one surface in one delta stream. `update_state` iterates
+//! **every** `UpdateData` item (not just the first) and dispatches per variant.
+//! Full-state (`UpdateData::State`) merges deserialize a whole `UserShard` and
+//! fold each surface, so a peer syncing its latest state reconciles all three
+//! surfaces — not only posts.
+//!
+//! ## Convergence
+//!
+//! * **posts** — grow-set deduped by content-address id, then truncated to the
+//!   newest `MAX_POSTS` by `(timestamp, id)` desc (a total order; no clock in a
+//!   contract). Order-independent.
+//! * **profile** — last-write-wins by a monotonic `seq` (tie-break by serialized
+//!   bytes for determinism). Order-independent.
+//! * **follows** — each followed key records the `seq` of the op that last
+//!   touched it and whether that op was Follow; merge keeps the higher seq per
+//!   key, and an Unfollow wins on equal seq. This per-key rule is a join
+//!   semilattice, so it is convergent under reordering, unlike a bare add/remove
+//!   set. The `MAX_FOLLOWS` cap is enforced post-merge by `truncate_follows` as
+//!   a function of the key set (tombstones evicted first, then largest key) —
+//!   never by arrival order, which would diverge. Over-cap eviction is
+//!   best-effort lossy, the same trade-off as the post window.
 
 use freenet_microblogging_common::post::{MAX_CONTENT_LEN, Post};
+use freenet_microblogging_common::signed_op::{OpType, Profile, SignedOp, USER_SHARD_CONTEXT};
 use freenet_stdlib::prelude::{
     blake3::{Hasher as Blake3, traits::digest::Digest},
     *,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Recent-post retention window. ADR-0001 starting policy: ~200.
 const MAX_POSTS: usize = 200;
 
-#[derive(Serialize, Deserialize)]
+/// Cap on the number of distinct followed keys retained. Like the profile field
+/// bounds, this caps an owner's self-bloat (the only blast radius for an
+/// owner-writes surface). Enforced post-merge in `validate_state` (transient
+/// over-bound during merge is tolerated, mirroring the post window).
+const MAX_FOLLOWS: usize = 5_000;
+
+/// Cap on targets a single follow/unfollow op may carry, so one op cannot
+/// blow the follow set in a single write.
+const MAX_FOLLOW_TARGETS_PER_OP: usize = 1_000;
+
+/// Maximum length of a followed-key hex string (an ML-DSA-65 VK is 1952 bytes →
+/// 3904 hex chars). Rejects malformed/oversized target strings.
+const MAX_TARGET_KEY_LEN: usize = 3904;
+
+/// Per-key follow record: the `seq` of the op that last touched this key and
+/// whether that op was a Follow (`true`) or an Unfollow (`false`). Merge keeps
+/// the entry with the higher `seq`, so concurrent follow/unfollow of the same
+/// key converges deterministically regardless of arrival order.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct FollowState {
+    seq: u64,
+    following: bool,
+}
+
+#[derive(Serialize, Deserialize, Default)]
 struct UserShard {
     // Schema-tolerance: defaults so older/newer wire shapes still decode.
     // See AGENTS.md → "Contract migration".
     #[serde(default)]
     posts: Vec<Post>,
+    /// Latest profile register, with the `seq` that set it (for LWW merge).
+    /// `None` until the owner first sets a profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<ProfileRegister>,
+    /// Followed pubkeys keyed by target VK hex (`BTreeMap` for deterministic
+    /// serialization order).
+    #[serde(default)]
+    follows: BTreeMap<String, FollowState>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct ProfileRegister {
+    profile: Profile,
+    seq: u64,
 }
 
 impl<'a> TryFrom<State<'a>> for UserShard {
@@ -53,12 +108,20 @@ impl<'a> TryFrom<State<'a>> for UserShard {
     }
 }
 
-/// The owner VK for this shard, taken from the contract parameters as a hex
-/// string to compare against a post's `author_pubkey` (also hex).
-///
-/// Parameters are the raw encoded ML-DSA-65 VK bytes. Empty parameters yield an
-/// empty owner key, which no real post can match — a shard with no owner accepts
-/// no posts.
+/// A single delta operation. Externally tagged so the wire form is unambiguous
+/// and new surfaces can be added without colliding with the post array.
+#[derive(Serialize, Deserialize)]
+enum ShardDelta {
+    /// One or more of the owner's posts (each self-signed + content-addressed).
+    Posts(Vec<Post>),
+    /// An owner-signed profile / follow / unfollow op.
+    Op(SignedOp),
+}
+
+/// The owner VK for this shard as hex, to compare against a post's
+/// `author_pubkey` / a `SignedOp`'s `signer_pubkey`. Parameters are the raw
+/// encoded ML-DSA-65 VK bytes; empty parameters yield an empty owner key that no
+/// real signed record can match (an un-parameterized shard accepts nothing).
 fn owner_vk_hex(parameters: &Parameters<'_>) -> String {
     hex::encode(parameters.as_ref())
 }
@@ -73,25 +136,22 @@ fn post_hash(post: &Post) -> [u8; 32] {
     key
 }
 
-/// A post is acceptable iff it is within the length bound, self-verifies, and
-/// its author is this shard's owner (owner-writes — ADR-0001).
+/// A post is acceptable iff within the length bound, self-verifying, and authored
+/// by this shard's owner (owner-writes — ADR-0001).
 fn post_is_acceptable(post: &Post, owner_vk_hex: &str) -> bool {
     post.content.len() <= MAX_CONTENT_LEN
         && post.author_pubkey == owner_vk_hex
         && post.verify().is_ok()
 }
 
-/// Deterministic "newest-first" ordering for the retention window: by author
-/// timestamp descending, then by content-addressed id descending as a stable,
-/// total tie-break. Used only to decide which posts survive truncation; it is
-/// not the storage order (state is stored sorted by `post_hash` for merge).
+/// Deterministic "newest-first" ordering for the retention window: timestamp
+/// desc, then content-addressed id desc as a stable, total tie-break.
 fn newest_first(a: &Post, b: &Post) -> std::cmp::Ordering {
     b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id))
 }
 
-/// Keep only the newest `MAX_POSTS` after a merge, then restore the canonical
-/// merge order (sorted by `post_hash`). Truncation is deterministic across
-/// replicas because `newest_first` is a total order.
+/// Keep only the newest `MAX_POSTS` after a merge, then restore canonical merge
+/// order (sorted by `post_hash`). Deterministic across replicas.
 fn truncate_window(posts: &mut Vec<Post>) {
     if posts.len() > MAX_POSTS {
         posts.sort_by(newest_first);
@@ -100,30 +160,233 @@ fn truncate_window(posts: &mut Vec<Post>) {
     posts.sort_by_cached_key(post_hash);
 }
 
-#[derive(Serialize, Deserialize)]
-struct ShardSummary {
-    summaries: Vec<MessageSummary>,
+/// Whether a slice of posts is a valid stored set: every post acceptable AND no
+/// two posts share a content-address id. (Uniqueness is what `update_state`
+/// guarantees via dedup; `validate_state` enforces the same invariant so the two
+/// halves of the contract agree on what a valid state is.)
+fn posts_are_valid_state(posts: &[Post], owner: &str) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(posts.len());
+    for post in posts {
+        if !post_is_acceptable(post, owner) {
+            return false;
+        }
+        if !seen.insert(post_hash(post)) {
+            return false; // duplicate id
+        }
+    }
+    true
 }
 
-impl<'a> From<&'a mut UserShard> for ShardSummary {
-    fn from(shard: &'a mut UserShard) -> Self {
-        let mut summaries = Vec::with_capacity(shard.posts.len());
-        for post in &shard.posts {
-            summaries.push(MessageSummary(post_hash(post)));
+/// Whether an incoming follow entry `(seq, following)` should replace the
+/// current one for a key. Higher seq always wins. On EQUAL seq the states must
+/// still converge regardless of arrival order, so a deterministic tie-break is
+/// required: an Unfollow (`following == false`) beats a Follow. Without this,
+/// concurrent Follow/Unfollow at the same seq diverges permanently (one replica
+/// keeps `true`, the other `false`, and neither heals on gossip).
+fn follow_replaces(new_seq: u64, new_following: bool, cur: &FollowState) -> bool {
+    if new_seq != cur.seq {
+        return new_seq > cur.seq;
+    }
+    // Equal seq: Unfollow (false) wins. Only a state actually changing matters,
+    // so replace iff the incoming differs and is the tie-break winner.
+    !new_following && cur.following
+}
+
+/// Apply an owner-signed op to the shard. Returns whether anything changed.
+/// Rejected (non-owner / bad signature / out-of-bounds) ops are silently
+/// skipped — a bad op in a batch is dropped, not fatal.
+fn apply_op(shard: &mut UserShard, op: &SignedOp, owner: &str) -> bool {
+    if op.verify(USER_SHARD_CONTEXT, owner).is_err() {
+        return false;
+    }
+    match op.op_type {
+        OpType::Profile => {
+            let Ok(profile) = serde_json::from_slice::<Profile>(&op.payload) else {
+                return false;
+            };
+            if !profile.within_bounds() {
+                return false;
+            }
+            // Last-write-wins by seq; tie-break by serialized bytes so two
+            // replicas applying different same-seq profiles still converge.
+            let replace = match &shard.profile {
+                None => true,
+                Some(cur) => {
+                    op.seq > cur.seq
+                        || (op.seq == cur.seq
+                            && serde_json::to_vec(&profile).unwrap_or_default()
+                                > serde_json::to_vec(&cur.profile).unwrap_or_default())
+                }
+            };
+            if replace {
+                shard.profile = Some(ProfileRegister {
+                    profile,
+                    seq: op.seq,
+                });
+                return true;
+            }
+            false
         }
-        ShardSummary { summaries }
+        OpType::Follow | OpType::Unfollow => {
+            // Payload is a JSON array of target pubkey hex strings.
+            let Ok(targets) = serde_json::from_slice::<Vec<String>>(&op.payload) else {
+                return false;
+            };
+            // Reject an over-large batch outright (fail closed, don't truncate).
+            if targets.len() > MAX_FOLLOW_TARGETS_PER_OP {
+                return false;
+            }
+            let following = matches!(op.op_type, OpType::Follow);
+            let mut changed = false;
+            for target in targets {
+                if target.len() > MAX_TARGET_KEY_LEN {
+                    continue; // skip malformed/oversized key, don't fail the batch
+                }
+                // Insert freely; the cap is enforced deterministically post-merge
+                // in `truncate_follows` (a function of the key set, not arrival
+                // order — see MAJOR-1 in review). Per-key convergence below the
+                // cap is exact via `follow_replaces`.
+                let apply = match shard.follows.get(&target) {
+                    None => true,
+                    Some(cur) => follow_replaces(op.seq, following, cur),
+                };
+                if apply {
+                    shard.follows.insert(
+                        target,
+                        FollowState {
+                            seq: op.seq,
+                            following,
+                        },
+                    );
+                    changed = true;
+                }
+            }
+            changed
+        }
+    }
+}
+
+/// Merge another whole `UserShard` (from a full-state update) into `shard`,
+/// honoring each surface's convergence rule.
+fn merge_state(shard: &mut UserShard, other: UserShard, owner: &str) {
+    for post in other.posts {
+        if post_is_acceptable(&post, owner) {
+            shard.posts.push(post);
+        }
+    }
+    // Profile: LWW by seq, same rule as apply_op (bytes tie-break).
+    if let Some(other_p) = other.profile {
+        let replace = match &shard.profile {
+            None => true,
+            Some(cur) => {
+                other_p.seq > cur.seq
+                    || (other_p.seq == cur.seq
+                        && serde_json::to_vec(&other_p.profile).unwrap_or_default()
+                            > serde_json::to_vec(&cur.profile).unwrap_or_default())
+            }
+        };
+        if replace {
+            shard.profile = Some(other_p);
+        }
+    }
+    // Follows: higher seq wins per key, with the same equal-seq tie-break as
+    // apply_op so a delta-applied state and a full-state merge converge. The cap
+    // is applied deterministically post-merge in `truncate_follows`, not here.
+    for (target, other_fs) in other.follows {
+        if target.len() > MAX_TARGET_KEY_LEN {
+            continue;
+        }
+        let keep = match shard.follows.get(&target) {
+            None => true,
+            Some(cur) => follow_replaces(other_fs.seq, other_fs.following, cur),
+        };
+        if keep {
+            shard.follows.insert(target, other_fs);
+        }
+    }
+}
+
+/// Enforce `MAX_FOLLOWS` deterministically as a function of the key SET (never
+/// arrival order — that was review MAJOR-1: arrival-order admission diverges
+/// permanently across replicas at the cap). When over the cap, drop entries by
+/// (tombstones first, then largest key) until at the cap. Dropping tombstoned
+/// (unfollowed) entries first also bounds tombstone accumulation (review NIT).
+fn truncate_follows(follows: &mut BTreeMap<String, FollowState>) {
+    if follows.len() <= MAX_FOLLOWS {
+        return;
+    }
+    // Eviction order: a tombstone (following == false) is dropped before any
+    // active follow; within the same class, the lexicographically larger key is
+    // dropped first. This is a total order over the keys, so every replica with
+    // the same map evicts the identical set.
+    let mut keys: Vec<(bool, String)> = follows
+        .iter()
+        .map(|(k, v)| (v.following, k.clone()))
+        .collect();
+    // Sort so the entries we KEEP come first: active before tombstone, then key
+    // ascending. (active=true should sort before false → reverse the bool.)
+    keys.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, key) in keys.into_iter().skip(MAX_FOLLOWS) {
+        follows.remove(&key);
+    }
+}
+
+/// Restore canonical order + enforce both bounded surfaces after any merge.
+/// Like the post window, follow eviction over the cap is best-effort lossy
+/// (same trade-off as recent-N posts): deterministic given an identical merged
+/// map, but an over-cap shard does not retain everything across partial syncs.
+fn normalize(shard: &mut UserShard) {
+    shard.posts.sort_by_cached_key(post_hash);
+    shard.posts.dedup_by_key(|p| post_hash(p));
+    truncate_window(&mut shard.posts);
+    truncate_follows(&mut shard.follows);
+}
+
+// ---------------------------------------------------------------------------
+// Summary: one fixed-width entry per surface so every surface reconciles via
+// the delta path. Post entries are per-post content hashes; profile + follows
+// fold to a single hash each (their full reconciliation rides the state path,
+// but the summary must still *differ* when they differ so a delta is requested).
+// ---------------------------------------------------------------------------
+#[derive(Serialize, Deserialize)]
+struct ShardSummary {
+    posts: Vec<MessageSummary>,
+    /// blake3 over the serialized profile register (zeroed if none).
+    profile: [u8; 32],
+    /// blake3 over the serialized follows map.
+    follows: [u8; 32],
+}
+
+fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake3::new();
+    hasher.update(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hasher.finalize().as_ref());
+    out
+}
+
+impl ShardSummary {
+    fn of(shard: &UserShard) -> Self {
+        let posts = shard
+            .posts
+            .iter()
+            .map(|p| MessageSummary(post_hash(p)))
+            .collect();
+        let profile = match &shard.profile {
+            Some(p) => hash_bytes(&serde_json::to_vec(p).unwrap_or_default()),
+            None => [0u8; 32],
+        };
+        let follows = hash_bytes(&serde_json::to_vec(&shard.follows).unwrap_or_default());
+        ShardSummary {
+            posts,
+            profile,
+            follows,
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct MessageSummary([u8; 32]);
-
-impl<'a> TryFrom<StateSummary<'a>> for MessageSummary {
-    type Error = ContractError;
-    fn try_from(value: StateSummary<'a>) -> Result<Self, Self::Error> {
-        serde_json::from_slice(&value).map_err(|_| ContractError::InvalidState)
-    }
-}
 
 #[contract]
 impl ContractInterface for UserShard {
@@ -134,14 +397,28 @@ impl ContractInterface for UserShard {
     ) -> Result<ValidateResult, ContractError> {
         let owner = owner_vk_hex(&parameters);
         let shard = UserShard::try_from(state)?;
-        // The window is a post-merge convenience, not a validity invariant: a
-        // state at exactly the bound is normal, and rejecting a transiently
-        // over-bound state would break merge. Authority + self-verification are
-        // the validity invariants we enforce here.
-        for post in &shard.posts {
-            if !post_is_acceptable(post, &owner) {
+        // Posts: every post acceptable AND ids unique (the invariant update_state
+        // guarantees). The retention *window* is deliberately NOT enforced here —
+        // a transiently over-bound merged state is normal and rejecting it would
+        // break convergence.
+        if !posts_are_valid_state(&shard.posts, &owner) {
+            return Ok(ValidateResult::Invalid);
+        }
+        // Profile: if present, must be within field bounds.
+        if let Some(reg) = &shard.profile {
+            if !reg.profile.within_bounds() {
                 return Ok(ValidateResult::Invalid);
             }
+        }
+        // Follows: cap the map size (owner self-bloat ceiling) and reject any
+        // malformed/oversized target key. The count of *actively followed* keys
+        // is what the cap bounds; tombstoned (unfollowed) entries are retained
+        // for convergence but also counted, so the cap is on total entries.
+        if shard.follows.len() > MAX_FOLLOWS {
+            return Ok(ValidateResult::Invalid);
+        }
+        if shard.follows.keys().any(|k| k.len() > MAX_TARGET_KEY_LEN) {
+            return Ok(ValidateResult::Invalid);
         }
         Ok(ValidateResult::Valid)
     }
@@ -157,106 +434,144 @@ impl ContractInterface for UserShard {
         let owner = owner_vk_hex(&parameters);
         let mut shard = UserShard::try_from(state)?;
 
-        let delta_bytes = match &delta[0] {
-            UpdateData::Delta(d) => d.as_ref(),
-            // NOTE: the `State` / `StateAndDelta` bytes are a full `UserShard`
-            // object (`{"posts":[...]}`), not a bare `Vec<Post>` array. They are
-            // parsed as `Vec<Post>` just below and therefore currently fail with
-            // `InvalidDelta` — a full-state merge is not yet supported. This is
-            // intentional for now (deltas are the only write path the delegate
-            // emits); a real `UserShard`-shaped merge would deserialize the
-            // object and fold its `posts`. Carried over from the posts contract.
-            UpdateData::State(s) => s.as_ref(),
-            UpdateData::StateAndDelta { delta, .. } => delta.as_ref(),
-            _ => {
-                shard.posts.sort_by_cached_key(post_hash);
-                return Ok(UpdateModification::valid(State::from(
-                    serde_json::to_vec(&shard).map_err(|e| ContractError::Other(format!("{e}")))?,
-                )));
-            }
-        };
-        let incoming = serde_json::from_slice::<Vec<Post>>(delta_bytes)
-            .map_err(|_| ContractError::InvalidDelta)?;
-
-        // Append every acceptable incoming post, then sort + dedup the whole
-        // combined set once. Deduping incrementally with binary_search while
-        // pushing to the tail is unsound — the push breaks the sort the search
-        // relies on, so an intra-batch duplicate of a *new* post (not yet in
-        // state) can slip past and double-count against the window. A single
-        // sort-then-dedup over the merged vec is order-independent and admits
-        // each distinct post exactly once.
-        for post in incoming {
-            // Skip anything not owner-authored / not self-verifying / over the
-            // length bound; a bad post in the batch is dropped, not fatal.
-            if post_is_acceptable(&post, &owner) {
-                shard.posts.push(post);
+        // Process EVERY update item (not just the first).
+        for item in &delta {
+            match item {
+                UpdateData::Delta(d) => apply_delta_bytes(&mut shard, d.as_ref(), &owner)?,
+                UpdateData::State(s) => {
+                    let other = UserShard::try_from(State::from(s.to_vec()))?;
+                    merge_state(&mut shard, other, &owner);
+                }
+                UpdateData::StateAndDelta { state, delta } => {
+                    let other = UserShard::try_from(State::from(state.to_vec()))?;
+                    merge_state(&mut shard, other, &owner);
+                    apply_delta_bytes(&mut shard, delta.as_ref(), &owner)?;
+                }
+                _ => {}
             }
         }
-        shard.posts.sort_by_cached_key(post_hash);
-        shard.posts.dedup_by_key(|p| post_hash(p));
 
-        // Post-merge truncation to the retention window.
-        truncate_window(&mut shard.posts);
-
+        normalize(&mut shard);
         let shard_bytes =
             serde_json::to_vec(&shard).map_err(|err| ContractError::Other(format!("{err}")))?;
         Ok(UpdateModification::valid(State::from(shard_bytes)))
     }
 
     fn summarize_state(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        let mut shard = UserShard::try_from(state).unwrap();
-        let only_posts = ShardSummary::from(&mut shard);
+        let _ = parameters;
+        let shard = UserShard::try_from(state)?;
+        let summary = ShardSummary::of(&shard);
         Ok(StateSummary::from(
-            serde_json::to_vec(&only_posts)
-                .map_err(|err| ContractError::Other(format!("{err}")))?,
+            serde_json::to_vec(&summary).map_err(|err| ContractError::Other(format!("{err}")))?,
         ))
     }
 
     fn get_state_delta(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        let shard = UserShard::try_from(state).unwrap();
-        let mut summary = match serde_json::from_slice::<ShardSummary>(&summary) {
-            Ok(summary) => summary,
-            Err(_) => ShardSummary { summaries: vec![] },
-        };
-        summary.summaries.sort();
-        let mut final_posts = vec![];
-        for post in shard.posts {
-            let hash = post_hash(&post);
-            if summary
-                .summaries
-                .binary_search_by(|m| m.0.as_ref().cmp(&hash[..]))
-                .is_err()
-            {
-                final_posts.push(post);
+        let _ = parameters;
+        let shard = UserShard::try_from(state)?;
+        let remote = serde_json::from_slice::<ShardSummary>(&summary).unwrap_or(ShardSummary {
+            posts: vec![],
+            profile: [0u8; 32],
+            follows: [0u8; 32],
+        });
+
+        // Posts the remote lacks → emit as a Posts delta.
+        let mut remote_posts: Vec<[u8; 32]> = remote.posts.iter().map(|m| m.0).collect();
+        remote_posts.sort();
+        let mut missing_posts = vec![];
+        for post in &shard.posts {
+            let hash = post_hash(post);
+            if remote_posts.binary_search(&hash).is_err() {
+                missing_posts.push(post.clone());
             }
         }
+
+        // A `Posts` delta cannot convey the profile/follows registers. So if
+        // either register differs, ship the full serialized shard as the delta
+        // payload — `apply_delta_bytes` recognises a whole `UserShard` and
+        // `merge_state`s it, reconciling every surface (posts ride along). When
+        // only posts differ, the smaller `Posts` delta suffices.
+        let local = ShardSummary::of(&shard);
+        let registers_differ = local.profile != remote.profile || local.follows != remote.follows;
+
+        let payload = if registers_differ {
+            serde_json::to_vec(&shard)
+        } else {
+            serde_json::to_vec(&ShardDelta::Posts(missing_posts))
+        };
         Ok(StateDelta::from(
-            serde_json::to_vec(&final_posts)
-                .map_err(|err| ContractError::Other(format!("{err}")))?,
+            payload.map_err(|err| ContractError::Other(format!("{err}")))?,
         ))
     }
+}
+
+/// Parse a `ShardDelta` from raw delta bytes and apply it to the shard.
+fn apply_delta_bytes(
+    shard: &mut UserShard,
+    bytes: &[u8],
+    owner: &str,
+) -> Result<(), ContractError> {
+    // A delta is a `ShardDelta`. For backward tolerance also accept a bare
+    // `Vec<Post>` (the Phase-1 posts-only wire form) and a full `UserShard`
+    // object (a state shipped as a delta — see get_state_delta register path).
+    if let Ok(d) = serde_json::from_slice::<ShardDelta>(bytes) {
+        match d {
+            ShardDelta::Posts(posts) => {
+                for post in posts {
+                    if post_is_acceptable(&post, owner) {
+                        shard.posts.push(post);
+                    }
+                }
+            }
+            ShardDelta::Op(op) => {
+                apply_op(shard, &op, owner);
+            }
+        }
+        return Ok(());
+    }
+    if let Ok(posts) = serde_json::from_slice::<Vec<Post>>(bytes) {
+        for post in posts {
+            if post_is_acceptable(&post, owner) {
+                shard.posts.push(post);
+            }
+        }
+        return Ok(());
+    }
+    if let Ok(other) = serde_json::from_slice::<UserShard>(bytes) {
+        merge_state(shard, other, owner);
+        return Ok(());
+    }
+    Err(ContractError::InvalidDelta)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use freenet_microblogging_common::signed_op::Profile;
     use ml_dsa::signature::{Keypair, Signer};
     use ml_dsa::{KeyGen, MlDsa65};
 
-    /// Owner VK (raw encoded bytes) for a seed, to use as contract parameters.
     fn owner_params(seed: [u8; 32]) -> Vec<u8> {
         let sk = MlDsa65::from_seed(&seed.into());
         sk.verifying_key().encode().to_vec()
     }
 
-    /// Build a fully-signed post for `seed`'s identity (as the delegate would).
+    fn params_of(seed: [u8; 32]) -> Parameters<'static> {
+        Parameters::from(owner_params(seed))
+    }
+
+    fn vk_hex(seed: [u8; 32]) -> String {
+        let sk = MlDsa65::from_seed(&seed.into());
+        hex::encode(sk.verifying_key().encode())
+    }
+
     fn signed_post(seed: [u8; 32], content: &str, timestamp: u64) -> Post {
         let sk = MlDsa65::from_seed(&seed.into());
         let author_pubkey = hex::encode(sk.verifying_key().encode());
@@ -275,259 +590,531 @@ mod test {
         p
     }
 
-    fn params_of(seed: [u8; 32]) -> Parameters<'static> {
-        Parameters::from(owner_params(seed))
-    }
-
-    #[test]
-    fn conversions() -> Result<(), Box<dyn std::error::Error>> {
-        let shard = UserShard {
-            posts: vec![signed_post([1u8; 32], "Hello world", 1)],
+    fn signed_op(seed: [u8; 32], op_type: OpType, payload: Vec<u8>, seq: u64) -> SignedOp {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut op = SignedOp {
+            op_type,
+            payload,
+            seq,
+            signer_pubkey: hex::encode(sk.verifying_key().encode()),
+            signature: None,
         };
-        let bytes = serde_json::to_vec(&shard)?;
-        let _shard = UserShard::try_from(State::from(bytes))?;
-        Ok(())
+        let sig: ml_dsa::Signature<MlDsa65> = sk.sign(&op.signing_payload(USER_SHARD_CONTEXT));
+        op.signature = Some(hex::encode(sig.encode()));
+        op
+    }
+
+    fn profile_op(seed: [u8; 32], p: &Profile, seq: u64) -> SignedOp {
+        signed_op(seed, OpType::Profile, serde_json::to_vec(p).unwrap(), seq)
+    }
+
+    fn follow_op(seed: [u8; 32], targets: &[&str], follow: bool, seq: u64) -> SignedOp {
+        let targets: Vec<String> = targets.iter().map(|s| s.to_string()).collect();
+        signed_op(
+            seed,
+            if follow {
+                OpType::Follow
+            } else {
+                OpType::Unfollow
+            },
+            serde_json::to_vec(&targets).unwrap(),
+            seq,
+        )
+    }
+
+    fn apply(owner: [u8; 32], state: Vec<u8>, items: Vec<ShardDelta>) -> Vec<u8> {
+        let deltas: Vec<UpdateData> = items
+            .into_iter()
+            .map(|d| UpdateData::Delta(StateDelta::from(serde_json::to_vec(&d).unwrap())))
+            .collect();
+        UserShard::update_state(params_of(owner), State::from(state), deltas)
+            .unwrap()
+            .unwrap_valid()
+            .into_bytes()
+    }
+
+    fn empty_state() -> Vec<u8> {
+        b"{}".to_vec()
+    }
+
+    fn sample_profile() -> Profile {
+        Profile {
+            display_name: "Alice".into(),
+            handle: "@alice".into(),
+            bio: "hi".into(),
+            avatar: "blue".into(),
+        }
     }
 
     #[test]
-    fn decodes_old_shape_state() -> Result<(), Box<dyn std::error::Error>> {
-        // Schema-tolerance guard: an unknown forward-compat field and a post
-        // missing `signature` must both still decode (decoding tolerance is
-        // separate from acceptance).
-        let json = r#"{
-            "version": 2,
-            "posts": [
-                {
-                    "id": "deadbeef",
-                    "author_pubkey": "deadbeef",
-                    "author_name": "Alice",
-                    "author_handle": "@alice",
-                    "content": "Hello world",
-                    "timestamp": 1700000000000,
-                    "reply_to": "future-field"
-                }
-            ]
-        }"#;
-        let shard = UserShard::try_from(State::from(json.as_bytes()))?;
+    fn posts_merge_dedup_and_owner_only() {
+        let owner = [1u8; 32];
+        let other = [2u8; 32];
+        let p = signed_post(owner, "first", 1);
+        let bytes = apply(
+            owner,
+            empty_state(),
+            vec![ShardDelta::Posts(vec![
+                p.clone(),
+                p.clone(), // intra-batch duplicate
+                signed_post(other, "foreign", 2),
+            ])],
+        );
+        let shard: UserShard = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(shard.posts.len(), 1);
-        assert!(shard.posts[0].signature.is_none());
-
-        let empty = UserShard::try_from(State::from(b"{}".as_ref()))?;
-        assert!(empty.posts.is_empty());
-        Ok(())
     }
 
     #[test]
-    fn validate_owner_post_is_valid() -> Result<(), Box<dyn std::error::Error>> {
+    fn profile_lww_by_seq() {
         let owner = [1u8; 32];
-        let shard = UserShard {
-            posts: vec![signed_post(owner, "Hello!", 1)],
-        };
-        let valid = UserShard::validate_state(
-            params_of(owner),
-            State::from(serde_json::to_vec(&shard)?),
-            RelatedContracts::new(),
-        )?;
-        assert!(matches!(valid, ValidateResult::Valid));
-        Ok(())
+        let mut p1 = sample_profile();
+        p1.display_name = "v1".into();
+        let mut p2 = sample_profile();
+        p2.display_name = "v2".into();
+
+        // Apply seq=2 then seq=1; higher seq must win regardless of order.
+        let bytes = apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Op(profile_op(owner, &p2, 2)),
+                ShardDelta::Op(profile_op(owner, &p1, 1)),
+            ],
+        );
+        let shard: UserShard = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(shard.profile.unwrap().profile.display_name, "v2");
     }
 
     #[test]
-    fn validate_rejects_foreign_author() -> Result<(), Box<dyn std::error::Error>> {
-        // A post signed by a DIFFERENT valid key self-verifies but is not the
-        // owner's — owner-writes rejects it.
-        let owner = [1u8; 32];
-        let other = [2u8; 32];
-        let shard = UserShard {
-            posts: vec![signed_post(other, "Not the owner", 1)],
-        };
-        let invalid = UserShard::validate_state(
-            params_of(owner),
-            State::from(serde_json::to_vec(&shard)?),
-            RelatedContracts::new(),
-        )?;
-        assert!(matches!(invalid, ValidateResult::Invalid));
-        Ok(())
-    }
-
-    #[test]
-    fn validate_rejects_tampered_and_unsigned() -> Result<(), Box<dyn std::error::Error>> {
-        let owner = [1u8; 32];
-
-        let mut tampered = signed_post(owner, "Hello!", 1);
-        tampered.content = "tampered".to_string();
-        let invalid = UserShard::validate_state(
-            params_of(owner),
-            State::from(serde_json::to_vec(&UserShard {
-                posts: vec![tampered],
-            })?),
-            RelatedContracts::new(),
-        )?;
-        assert!(matches!(invalid, ValidateResult::Invalid));
-
-        let mut unsigned = signed_post(owner, "Hello!", 1);
-        unsigned.signature = None;
-        let invalid2 = UserShard::validate_state(
-            params_of(owner),
-            State::from(serde_json::to_vec(&UserShard {
-                posts: vec![unsigned],
-            })?),
-            RelatedContracts::new(),
-        )?;
-        assert!(matches!(invalid2, ValidateResult::Invalid));
-        Ok(())
-    }
-
-    #[test]
-    fn update_merges_owner_skips_foreign() -> Result<(), Box<dyn std::error::Error>> {
+    fn profile_rejects_oversized_and_foreign() {
         let owner = [1u8; 32];
         let other = [2u8; 32];
 
-        let p1 = signed_post(owner, "First", 1);
+        // Oversized bio rejected.
+        let mut big = sample_profile();
+        big.bio = "x".repeat(10_000);
+        let bytes = apply(
+            owner,
+            empty_state(),
+            vec![ShardDelta::Op(profile_op(owner, &big, 1))],
+        );
+        let shard: UserShard = serde_json::from_slice(&bytes).unwrap();
+        assert!(shard.profile.is_none());
+
+        // Foreign signer rejected (signed by `other`, shard owned by `owner`).
+        let bytes2 = apply(
+            owner,
+            empty_state(),
+            vec![ShardDelta::Op(profile_op(other, &sample_profile(), 1))],
+        );
+        let shard2: UserShard = serde_json::from_slice(&bytes2).unwrap();
+        assert!(shard2.profile.is_none());
+    }
+
+    #[test]
+    fn follows_add_remove_converge() {
+        let owner = [1u8; 32];
+        let a = vk_hex([10u8; 32]);
+        let b = vk_hex([11u8; 32]);
+
+        // Follow a,b (seq1); unfollow a (seq2). a gone, b present.
+        let bytes = apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Op(follow_op(owner, &[&a, &b], true, 1)),
+                ShardDelta::Op(follow_op(owner, &[&a], false, 2)),
+            ],
+        );
+        let shard: UserShard = serde_json::from_slice(&bytes).unwrap();
+        assert!(!shard.follows.get(&a).unwrap().following);
+        assert!(shard.follows.get(&b).unwrap().following);
+
+        // Reorder: apply unfollow-a(seq2) BEFORE follow-a,b(seq1). Same result —
+        // higher seq wins per key.
+        let bytes2 = apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Op(follow_op(owner, &[&a], false, 2)),
+                ShardDelta::Op(follow_op(owner, &[&a, &b], true, 1)),
+            ],
+        );
+        let shard2: UserShard = serde_json::from_slice(&bytes2).unwrap();
+        assert!(!shard2.follows.get(&a).unwrap().following);
+        assert!(shard2.follows.get(&b).unwrap().following);
+    }
+
+    #[test]
+    fn follows_equal_seq_converges() {
+        // Regression for review C-1: Follow(k) and Unfollow(k) at the SAME seq
+        // must converge regardless of order (was a permanent split-brain — one
+        // replica kept following=true, the other false, neither healed). The
+        // deterministic tie-break is "Unfollow wins on equal seq".
+        let owner = [1u8; 32];
+        let k = vk_hex([10u8; 32]);
+
+        // Follow(seq=5) then Unfollow(seq=5).
+        let s1: UserShard = serde_json::from_slice(&apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Op(follow_op(owner, &[&k], true, 5)),
+                ShardDelta::Op(follow_op(owner, &[&k], false, 5)),
+            ],
+        ))
+        .unwrap();
+
+        // Unfollow(seq=5) then Follow(seq=5) — reverse order.
+        let s2: UserShard = serde_json::from_slice(&apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Op(follow_op(owner, &[&k], false, 5)),
+                ShardDelta::Op(follow_op(owner, &[&k], true, 5)),
+            ],
+        ))
+        .unwrap();
+
+        // Both converge to the same result (Unfollow wins on tie).
+        assert_eq!(s1.follows.get(&k), s2.follows.get(&k));
+        assert!(!s1.follows.get(&k).unwrap().following);
+
+        // And a full-state merge of one into the other also converges.
+        let s1_bytes = serde_json::to_vec(&s1).unwrap();
+        let merged = UserShard::update_state(
+            params_of(owner),
+            State::from(serde_json::to_vec(&s2).unwrap()),
+            vec![UpdateData::State(State::from(s1_bytes))],
+        )
+        .unwrap()
+        .unwrap_valid();
+        let sm: UserShard = serde_json::from_slice(merged.as_ref()).unwrap();
+        assert!(!sm.follows.get(&k).unwrap().following);
+    }
+
+    #[test]
+    fn follows_rejects_oversized_op_and_caps_map() {
+        let owner = [1u8; 32];
+        // An op carrying more than MAX_FOLLOW_TARGETS_PER_OP targets is dropped.
+        let many: Vec<String> = (0..MAX_FOLLOW_TARGETS_PER_OP + 1)
+            .map(|i| format!("{i:0>8}"))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        let bytes = apply(
+            owner,
+            empty_state(),
+            vec![ShardDelta::Op(follow_op(owner, &refs, true, 1))],
+        );
+        let shard: UserShard = serde_json::from_slice(&bytes).unwrap();
+        assert!(shard.follows.is_empty());
+
+        // validate_state rejects a state whose follows map exceeds MAX_FOLLOWS.
+        let mut over = UserShard::default();
+        for i in 0..=MAX_FOLLOWS {
+            over.follows.insert(
+                format!("{i:0>8}"),
+                FollowState {
+                    seq: 1,
+                    following: true,
+                },
+            );
+        }
+        assert!(matches!(
+            UserShard::validate_state(
+                params_of(owner),
+                State::from(serde_json::to_vec(&over).unwrap()),
+                RelatedContracts::new(),
+            )
+            .unwrap(),
+            ValidateResult::Invalid
+        ));
+    }
+
+    #[test]
+    fn follows_cap_eviction_is_order_independent() {
+        // Regression for review MAJOR-1: building an over-cap follow set in two
+        // different op orders must yield the SAME retained key set (eviction is
+        // a function of the key set, not arrival order). truncate_follows keeps
+        // the lexicographically-smallest active keys.
+        let keys: Vec<String> = (0..MAX_FOLLOWS + 200)
+            .map(|i| format!("{i:0>10}"))
+            .collect();
+        assert!(keys.len() > MAX_FOLLOWS);
+
+        let mut f1 = BTreeMap::new();
+        for k in &keys {
+            f1.insert(
+                k.clone(),
+                FollowState {
+                    seq: 1,
+                    following: true,
+                },
+            );
+        }
+        let mut f2 = BTreeMap::new();
+        for k in keys.iter().rev() {
+            f2.insert(
+                k.clone(),
+                FollowState {
+                    seq: 1,
+                    following: true,
+                },
+            );
+        }
+        truncate_follows(&mut f1);
+        truncate_follows(&mut f2);
+        assert_eq!(f1.len(), MAX_FOLLOWS);
+        assert_eq!(f1.keys().collect::<Vec<_>>(), f2.keys().collect::<Vec<_>>());
+        // Smallest keys retained: "0000000000" present, the largest absent.
+        assert!(f1.contains_key(&keys[0]));
+        assert!(!f1.contains_key(keys.last().unwrap()));
+    }
+
+    #[test]
+    fn follows_cap_evicts_tombstones_first() {
+        // Review NIT: tombstones (unfollowed) are dropped before active follows
+        // when over the cap, so churn can't wedge the map full of tombstones.
+        let mut f = BTreeMap::new();
+        // MAX_FOLLOWS active + 10 tombstones = over cap by 10.
+        for i in 0..MAX_FOLLOWS {
+            f.insert(
+                format!("a{i:0>10}"),
+                FollowState {
+                    seq: 1,
+                    following: true,
+                },
+            );
+        }
+        for i in 0..10 {
+            f.insert(
+                format!("z{i:0>10}"),
+                FollowState {
+                    seq: 2,
+                    following: false,
+                },
+            );
+        }
+        truncate_follows(&mut f);
+        assert_eq!(f.len(), MAX_FOLLOWS);
+        // All tombstones evicted; all actives retained.
+        assert!(f.values().all(|v| v.following));
+    }
+
+    #[test]
+    fn mixed_surfaces_in_one_update() {
+        let owner = [1u8; 32];
+        let a = vk_hex([10u8; 32]);
+        let bytes = apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Posts(vec![signed_post(owner, "hello", 1)]),
+                ShardDelta::Op(profile_op(owner, &sample_profile(), 1)),
+                ShardDelta::Op(follow_op(owner, &[&a], true, 1)),
+            ],
+        );
+        let shard: UserShard = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(shard.posts.len(), 1);
+        assert_eq!(shard.profile.unwrap().profile.display_name, "Alice");
+        assert!(shard.follows.get(&a).unwrap().following);
+    }
+
+    #[test]
+    fn full_state_merge_reconciles_all_surfaces() {
+        let owner = [1u8; 32];
+        // Build a populated shard, serialize, feed it back as UpdateData::State
+        // into an empty shard — all surfaces must transfer.
+        let src = apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Posts(vec![signed_post(owner, "p", 1)]),
+                ShardDelta::Op(profile_op(owner, &sample_profile(), 3)),
+                ShardDelta::Op(follow_op(owner, &[&vk_hex([10u8; 32])], true, 1)),
+            ],
+        );
+        let merged = UserShard::update_state(
+            params_of(owner),
+            State::from(empty_state()),
+            vec![UpdateData::State(State::from(src))],
+        )
+        .unwrap()
+        .unwrap_valid();
+        let shard: UserShard = serde_json::from_slice(merged.as_ref()).unwrap();
+        assert_eq!(shard.posts.len(), 1);
+        assert_eq!(shard.profile.unwrap().seq, 3);
+        assert_eq!(shard.follows.len(), 1);
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_ids() {
+        let owner = [1u8; 32];
+        let p = signed_post(owner, "dup", 1);
         let shard = UserShard {
-            posts: vec![p1.clone()],
+            posts: vec![p.clone(), p],
+            ..Default::default()
         };
-        let state_bytes = serde_json::to_vec(&shard)?;
-
-        // Delta carries one owner post and one foreign post; only the owner's
-        // is merged.
-        let delta = serde_json::to_vec(&vec![
-            signed_post(owner, "Second", 2),
-            signed_post(other, "Foreign", 3),
-        ])?;
-        let new_state = UserShard::update_state(
+        let res = UserShard::validate_state(
             params_of(owner),
-            State::from(state_bytes),
-            vec![UpdateData::Delta(StateDelta::from(delta))],
-        )?
-        .unwrap_valid();
-        let updated: UserShard = serde_json::from_slice(new_state.as_ref())?;
-        assert_eq!(updated.posts.len(), 2);
-
-        // Commutativity: re-applying an existing post adds no duplicate.
-        let dup = serde_json::to_vec(&vec![p1])?;
-        let new_state2 = UserShard::update_state(
-            params_of(owner),
-            new_state,
-            vec![UpdateData::Delta(StateDelta::from(dup))],
-        )?
-        .unwrap_valid();
-        let updated2: UserShard = serde_json::from_slice(new_state2.as_ref())?;
-        assert_eq!(updated2.posts.len(), 2);
-        Ok(())
+            State::from(serde_json::to_vec(&shard).unwrap()),
+            RelatedContracts::new(),
+        )
+        .unwrap();
+        assert!(matches!(res, ValidateResult::Invalid));
     }
 
     #[test]
-    fn update_dedups_intra_batch_duplicate_of_new_post() -> Result<(), Box<dyn std::error::Error>> {
-        // Regression guard: a single delta batch carrying the SAME new post
-        // twice must store it exactly once. (The old incremental
-        // binary_search-while-pushing dedup admitted both copies because the
-        // tail push broke the sort the search relied on — corrupting the
-        // MAX_POSTS count and diverging replicas.)
+    fn validate_rejects_foreign_and_oversized_profile() {
         let owner = [1u8; 32];
-        let p = signed_post(owner, "dup me", 1);
-        let delta = serde_json::to_vec(&vec![p.clone(), p.clone()])?;
-        let new_state = UserShard::update_state(
-            params_of(owner),
-            State::from(b"{}".to_vec()),
-            vec![UpdateData::Delta(StateDelta::from(delta))],
-        )?
-        .unwrap_valid();
-        let updated: UserShard = serde_json::from_slice(new_state.as_ref())?;
-        assert_eq!(updated.posts.len(), 1);
+        // Foreign-author post.
+        let shard = UserShard {
+            posts: vec![signed_post([2u8; 32], "x", 1)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            UserShard::validate_state(
+                params_of(owner),
+                State::from(serde_json::to_vec(&shard).unwrap()),
+                RelatedContracts::new(),
+            )
+            .unwrap(),
+            ValidateResult::Invalid
+        ));
 
-        // And a duplicate of an ALREADY-stored post (mixed with a genuinely new
-        // one) in the same batch is also collapsed correctly.
-        let p2 = signed_post(owner, "second", 2);
-        let delta2 = serde_json::to_vec(&vec![p.clone(), p2.clone(), p2.clone()])?;
-        let new_state2 = UserShard::update_state(
-            params_of(owner),
-            new_state,
-            vec![UpdateData::Delta(StateDelta::from(delta2))],
-        )?
-        .unwrap_valid();
-        let updated2: UserShard = serde_json::from_slice(new_state2.as_ref())?;
-        assert_eq!(updated2.posts.len(), 2);
-        Ok(())
+        // Oversized profile register.
+        let mut big = sample_profile();
+        big.bio = "x".repeat(10_000);
+        let shard2 = UserShard {
+            profile: Some(ProfileRegister {
+                profile: big,
+                seq: 1,
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            UserShard::validate_state(
+                params_of(owner),
+                State::from(serde_json::to_vec(&shard2).unwrap()),
+                RelatedContracts::new(),
+            )
+            .unwrap(),
+            ValidateResult::Invalid
+        ));
     }
 
     #[test]
-    fn update_truncates_to_window() -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_accepts_well_formed() {
         let owner = [1u8; 32];
-        // Build MAX_POSTS + 50 owner posts, distinct content+timestamp.
+        let bytes = apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Posts(vec![signed_post(owner, "ok", 1)]),
+                ShardDelta::Op(profile_op(owner, &sample_profile(), 1)),
+            ],
+        );
+        assert!(matches!(
+            UserShard::validate_state(
+                params_of(owner),
+                State::from(bytes),
+                RelatedContracts::new()
+            )
+            .unwrap(),
+            ValidateResult::Valid
+        ));
+    }
+
+    #[test]
+    fn truncates_to_window() {
+        let owner = [1u8; 32];
         let total = MAX_POSTS + 50;
         let mut all = Vec::with_capacity(total);
         for i in 0..total {
             all.push(signed_post(owner, &format!("post {i}"), i as u64));
         }
-        let delta = serde_json::to_vec(&all)?;
-        let new_state = UserShard::update_state(
-            params_of(owner),
-            State::from(b"{}".to_vec()),
-            vec![UpdateData::Delta(StateDelta::from(delta))],
-        )?
-        .unwrap_valid();
-        let updated: UserShard = serde_json::from_slice(new_state.as_ref())?;
-        assert_eq!(updated.posts.len(), MAX_POSTS);
-
-        // The newest by (timestamp, id) survive: the highest timestamp must be
-        // present, the lowest must be gone.
-        let timestamps: Vec<u64> = updated.posts.iter().map(|p| p.timestamp).collect();
-        assert!(timestamps.contains(&((total - 1) as u64)));
-        assert!(!timestamps.contains(&0));
-        Ok(())
+        let bytes = apply(owner, empty_state(), vec![ShardDelta::Posts(all)]);
+        let shard: UserShard = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(shard.posts.len(), MAX_POSTS);
+        let ts: Vec<u64> = shard.posts.iter().map(|p| p.timestamp).collect();
+        assert!(ts.contains(&((total - 1) as u64)));
+        assert!(!ts.contains(&0));
     }
 
     #[test]
-    fn truncation_is_deterministic_across_orderings() -> Result<(), Box<dyn std::error::Error>> {
-        // Two replicas that received the same posts in different delta orders
-        // must converge to the same windowed set.
+    fn summary_changes_when_registers_change() {
         let owner = [1u8; 32];
-        let total = MAX_POSTS + 10;
-        let mut all = Vec::with_capacity(total);
-        for i in 0..total {
-            all.push(signed_post(owner, &format!("post {i}"), i as u64));
-        }
-        let mut reversed = all.clone();
-        reversed.reverse();
-
-        let apply = |posts: &Vec<Post>| -> Result<Vec<String>, Box<dyn std::error::Error>> {
-            let delta = serde_json::to_vec(posts)?;
-            let st = UserShard::update_state(
-                params_of(owner),
-                State::from(b"{}".to_vec()),
-                vec![UpdateData::Delta(StateDelta::from(delta))],
-            )?
-            .unwrap_valid();
-            let s: UserShard = serde_json::from_slice(st.as_ref())?;
-            let mut ids: Vec<String> = s.posts.iter().map(|p| p.id.clone()).collect();
-            ids.sort();
-            Ok(ids)
-        };
-
-        assert_eq!(apply(&all)?, apply(&reversed)?);
-        Ok(())
+        let base = apply(
+            owner,
+            empty_state(),
+            vec![ShardDelta::Posts(vec![signed_post(owner, "p", 1)])],
+        );
+        let with_profile = apply(
+            owner,
+            base.clone(),
+            vec![ShardDelta::Op(profile_op(owner, &sample_profile(), 1))],
+        );
+        let s1 = ShardSummary::of(&serde_json::from_slice::<UserShard>(&base).unwrap());
+        let s2 = ShardSummary::of(&serde_json::from_slice::<UserShard>(&with_profile).unwrap());
+        assert_ne!(s1.profile, s2.profile);
     }
 
     #[test]
-    fn summarize_and_delta_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    fn get_delta_ships_state_when_registers_differ() {
         let owner = [1u8; 32];
-        let p1 = signed_post(owner, "First", 1);
-        let p2 = signed_post(owner, "Second", 2);
-        let shard = UserShard {
-            posts: vec![p1.clone(), p2.clone()],
+        // Local has a profile; remote summary has none → delta must carry the
+        // full state so the profile reconciles. Feeding it back must restore it.
+        let local = apply(
+            owner,
+            empty_state(),
+            vec![ShardDelta::Op(profile_op(owner, &sample_profile(), 1))],
+        );
+        let remote_summary = ShardSummary {
+            posts: vec![],
+            profile: [0u8; 32],
+            follows: [0u8; 32],
         };
-        let state_bytes = serde_json::to_vec(&shard)?;
-
-        let summary = ShardSummary::from(&mut UserShard { posts: vec![p1] });
         let delta = UserShard::get_state_delta(
             params_of(owner),
-            State::from(state_bytes),
-            serde_json::to_vec(&summary).unwrap().into(),
-        )?;
-        let delta_posts: Vec<Post> = serde_json::from_slice(delta.as_ref())?;
-        assert_eq!(delta_posts.len(), 1);
-        assert_eq!(delta_posts[0].id, p2.id);
-        Ok(())
+            State::from(local),
+            StateSummary::from(serde_json::to_vec(&remote_summary).unwrap()),
+        )
+        .unwrap();
+        // Apply the delta to an empty shard; profile must appear.
+        let merged = UserShard::update_state(
+            params_of(owner),
+            State::from(empty_state()),
+            vec![UpdateData::Delta(StateDelta::from(delta.to_vec()))],
+        )
+        .unwrap()
+        .unwrap_valid();
+        let shard: UserShard = serde_json::from_slice(merged.as_ref()).unwrap();
+        assert!(shard.profile.is_some());
+    }
+
+    #[test]
+    fn backward_compat_bare_post_array_delta() {
+        // The Phase-1 posts-only wire form (a bare Vec<Post>) must still apply.
+        let owner = [1u8; 32];
+        let posts = vec![signed_post(owner, "legacy", 1)];
+        let merged = UserShard::update_state(
+            params_of(owner),
+            State::from(empty_state()),
+            vec![UpdateData::Delta(StateDelta::from(
+                serde_json::to_vec(&posts).unwrap(),
+            ))],
+        )
+        .unwrap()
+        .unwrap_valid();
+        let shard: UserShard = serde_json::from_slice(merged.as_ref()).unwrap();
+        assert_eq!(shard.posts.len(), 1);
+    }
+
+    #[test]
+    fn decodes_empty_and_old_shape() {
+        let empty = UserShard::try_from(State::from(b"{}".as_ref())).unwrap();
+        assert!(empty.posts.is_empty());
+        assert!(empty.profile.is_none());
+        assert!(empty.follows.is_empty());
     }
 }

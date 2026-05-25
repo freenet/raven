@@ -131,6 +131,69 @@ which use empty parameters): per-owner parameterization means each owner derives
 a distinct key at runtime from the one build-stable `user_shard_code_hash`. UI
 wiring + migration of the existing global feed into per-user shards is Phase 4.
 
+### Phase 1b — profile + follows (completes the user shard)
+
+The user shard now carries all three owner-writes surfaces. State is
+`{ posts, profile: Option<ProfileRegister>, follows: BTreeMap<vk, FollowState> }`.
+
+**Non-post owner mutations use a signed envelope** (`common::signed_op::SignedOp`):
+profile and follow edits are not `Post`s, so they carry no intrinsic signature.
+`SignedOp` is an ML-DSA-65 signature by the owner over a domain-tagged
+(`raven:signed-op:v1`, distinct from the post tag), length-prefixed payload of
+`(op_type, payload, seq, signer_pubkey)`. `op.verify(owner)` checks the signer is
+the owner *and* the signature is valid — the same VK-param match as posts. The
+generic envelope is reused for all three op types (`Profile` / `Follow` /
+`Unfollow`); `op_type` and `seq` are inside the signed bytes so an op cannot be
+replayed against another surface or have its `seq` bumped to win a race.
+
+**Convergence per surface** (all order-independent — required because deltas
+arrive in any order across replicas):
+- *profile* — last-write-wins by monotonic `seq`, tie-broken by serialized bytes
+  (no clock in a contract; the delegate supplies a monotonic counter).
+- *follows* — each target key stores the `seq` of the op that last touched it and
+  whether it was a Follow; merge keeps the higher `seq` per key, and on **equal
+  seq an Unfollow wins** (a deterministic tie-break). This is convergent under
+  reordering, unlike the bare add/remove set in the legacy global `follows`
+  contract (whose own NOTE admits Follow/Unfollow is not commutative). The
+  equal-seq tie-break is load-bearing: without it, concurrent Follow/Unfollow at
+  the same seq splits replicas permanently (review C-1).
+
+The envelope is **bound to a shard context** (`USER_SHARD_CONTEXT =
+"raven:user-shard:v1"`) mixed into `signing_payload`, so a future thread/inbox
+shard reusing `SignedOp` cannot have a user-shard op replayed into it (review
+M-2). Follows are also bounded — `MAX_FOLLOWS` map entries, `MAX_FOLLOW_TARGETS_
+PER_OP` per op, and a target-key length cap — so an owner cannot self-bloat the
+shard (review M-1). The cap is applied **post-merge by `truncate_follows` as a
+function of the key set** (tombstones evicted first, then largest key), never by
+arrival order: an earlier draft skipped new keys at insert time, which made the
+retained set order-dependent and split replicas permanently at the cap (review
+MAJOR-1, fourth round — the same convergence class as C-1). Over-cap eviction is
+best-effort lossy, the same trade-off as the recent-N post window. Evicting
+tombstones first also bounds tombstone accumulation (review NIT).
+
+**Delta format is now a tagged `ShardDelta` enum** (`Posts(Vec<Post>)` |
+`Op(SignedOp)`), forced by review finding MAJOR-2: the Phase-1 bare-`Vec<Post>`
+delta could not host a second surface, and changing it later (after non-test
+state exists) would need a migration. `update_state` now iterates **every**
+`UpdateData` item (not just `delta[0]`) and the `State`/`StateAndDelta` arms do a
+real full-`UserShard` merge (so a peer syncing state reconciles profile + follows,
+not only posts). `apply_delta_bytes` still accepts a bare `Vec<Post>` for
+backward tolerance. `summarize_state` folds profile + follows into one hash each
+so a register difference triggers a delta; `get_state_delta` ships the full state
+when a register differs (a `Posts` delta cannot convey registers) and just the
+missing posts otherwise.
+
+**Review fixes folded in** (from the post-merge re-review of #25): `validate_state`
+now also rejects duplicate post ids (MAJOR-1 — the invariant `update_state`'s
+dedup guarantees, so the two halves agree) and oversized profile fields;
+`summarize_state`/`get_state_delta` use `?` instead of `unwrap()` (MINOR-3,
+panic-in-WASM footgun); `MAX_CONTENT_LEN` doc corrected to say bytes, not chars
+(NIT). The window is still deliberately not enforced in `validate_state`.
+
+This rotates the user-shard WASM hash again; still no migration entry (no
+migratable prior state — Phase 1 shipped no real user-shard data). UI wiring is
+still Phase 4.
+
 ## Caveat: ADR vs. mail on windowing
 
 The ADR states the bounded-state window mirrors "how `freenet/mail` windows its
