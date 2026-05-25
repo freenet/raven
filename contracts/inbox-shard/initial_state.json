@@ -1,5 +1,4 @@
 {
     "notifs": {},
-    "tombstones": {},
-    "pruned_before": 0
+    "prune_ids_ops": {}
 }

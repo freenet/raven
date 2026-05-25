@@ -31,27 +31,37 @@
 //!
 //! The hard part of an owner-prune on an anyone-writes surface is that a *stale
 //! replica* still holding a pruned notification must not **resurrect** it when it
-//! merges with a pruned replica. So a prune leaves durable, convergent evidence:
+//! merges with a pruned replica. So a prune leaves durable, convergent evidence —
+//! but because *removal is the owner's exclusive right*, that evidence must itself
+//! carry the owner's signature on **every** path, exactly like a notification
+//! carries its sender's. State therefore retains the **owner-signed prune ops**,
+//! not a sig-stripped projection of their effect:
 //!
-//! * **`pruned_before`** — a single monotonic high-water, merged **max-wins**. A
-//!   notification with `seq < pruned_before` is dropped on *every* path and never
-//!   re-admitted.
-//! * **`tombstones`** — a grow-set `id -> owner_seq` for selectively-pruned ids.
-//!   A tombstoned id is dropped on every path. Merged by max owner-seq per id.
-//! * **`notifs`** — a grow-set keyed by content-addressed id, admitted only if
-//!   the notification self-verifies, is **not** tombstoned, and is **not** below
-//!   the high-water.
+//! * **`prune_before_op`** — the single highest-`seq` owner-signed `PruneBefore`
+//!   op. The high-water is that op's `seq`; because `seq` is inside the signed
+//!   payload, a peer cannot forge `pruned_before = u64::MAX` without the owner
+//!   key. Merged by keeping the higher-`seq` *verified* op.
+//! * **`prune_ids_ops`** — owner-signed `PruneIds` ops (keyed by op `seq`), each
+//!   carrying `(id, notif_seq)` pairs. A tombstone for `id` exists only while
+//!   backed by such a verified op. Merged as a verified-op union.
+//! * **`notifs`** — a grow-set keyed by content-addressed id, admitted only if it
+//!   self-verifies, is **not** tombstoned, and is **not** below the high-water.
 //!
-//! `tombstones` is kept minimal: a tombstone whose notification `seq` is already
-//! below `pruned_before` is **redundant** (the high-water alone suppresses it) and
-//! is garbage-collected post-merge. So selective tombstones only persist while
-//! newer than the bulk high-water, and the set cannot grow unbounded.
+//! Tombstones stay bounded *and* genuinely collectible: a `(id, notif_seq)` pair
+//! is **redundant** once `notif_seq < pruned_before` (the high-water already
+//! suppresses it), and a `PruneIds` op whose every pair is redundant is dropped
+//! post-merge. So selective tombstones only persist while newer than the bulk
+//! high-water.
 //!
-//! Every prune op is re-verified against the owner on *every* path (delta,
-//! full-state merge, sync delta); `validate_state` re-proves every stored
-//! notification and rejects any that should have been pruned — the same "every
-//! write path verifies, the two halves agree" discipline as the thread shard
-//! (AGENTS.md → "Every write path verifies").
+//! **Every prune op is re-verified against the owner on *every* path** (delta,
+//! full-state merge, sync delta) before it can raise the high-water or add a
+//! tombstone — there is no "the peer already pruned it" shortcut, because trusting
+//! an unsigned removal claim lets any peer wipe an honest inbox network-wide
+//! (`max`-wins never heals — review CRITICAL, sixth round). `validate_state`
+//! re-proves every retained prune op *and* every stored notification, and rejects
+//! a notification that the retained prune state should have removed — the same
+//! "every write path verifies, the two halves agree" discipline as the thread
+//! shard (AGENTS.md → "Every write path verifies").
 
 use freenet_microblogging_common::inbox::{Notification, WriterCert};
 use freenet_microblogging_common::signed_op::{INBOX_SHARD_CONTEXT, OpType, SignedOp};
@@ -64,13 +74,14 @@ use std::collections::BTreeMap;
 /// the owner's own pruning.
 const MAX_NOTIFS: usize = 10_000;
 
-/// Cap on retained tombstones. Tombstones are GC'd against the high-water, so
-/// this only bites if an owner selectively prunes a huge number of ids that are
-/// all newer than their bulk high-water; the cap keeps even that bounded.
-const MAX_TOMBSTONES: usize = 10_000;
+/// Cap on retained `PruneIds` ops. Ops whose every pair is redundant (below the
+/// high-water) are GC'd, so this only bites if an owner selectively prunes a huge
+/// number of ids all newer than their bulk high-water; the cap keeps even that
+/// bounded.
+const MAX_PRUNE_IDS_OPS: usize = 1_000;
 
-/// Max explicit ids one `PruneIds` op may carry, so a single signed op cannot
-/// be made arbitrarily large.
+/// Max explicit `(id, notif_seq)` pairs one `PruneIds` op may carry, so a single
+/// signed op cannot be made arbitrarily large.
 const MAX_PRUNE_IDS_PER_OP: usize = 1_000;
 
 /// Max length of a notification id (hex of a 32-byte blake3 hash = 64 chars);
@@ -79,12 +90,15 @@ const MAX_ID_LEN: usize = 128;
 
 /// Inbox shard state for one owner.
 ///
-/// `notifs` stores the **full signed `Notification`**, not a stripped view: the
-/// inbox is public-write, so the contract must assume adversarial `UpdateData`
-/// and re-verify a notification on *every* path it can enter state. Retaining
-/// the signature is what lets `validate_state` re-prove a notification and makes
-/// a forged one (any peer, no key) impossible (the thread-shard CRITICAL lesson,
-/// AGENTS.md → "Every write path verifies").
+/// Both surfaces retain **owner-/sender-signed records**, never a sig-stripped
+/// projection: the inbox is public-write *and* owner-pruned, so the contract must
+/// assume adversarial `UpdateData` and re-verify, on *every* path, both who sent
+/// a notification (its sender) and who authorized a removal (the owner). A
+/// notification keeps its signature; a prune keeps its owner-signed `SignedOp`.
+/// This is what lets `validate_state` re-prove the whole state and makes both a
+/// forged delivery and a forged *removal* impossible (the thread-shard CRITICAL
+/// lesson and its sixth-round suppression variant; AGENTS.md → "Every write path
+/// verifies").
 #[derive(Serialize, Deserialize, Default)]
 struct InboxShard {
     // Schema-tolerance: defaults so older/newer wire shapes still decode
@@ -92,15 +106,16 @@ struct InboxShard {
     /// Notifications keyed by their content-addressed id.
     #[serde(default)]
     notifs: BTreeMap<String, Notification>,
-    /// Selectively-pruned notification ids → the owner `seq` of the prune op
-    /// that removed them (merged max-wins). A grow-set, GC'd against the
-    /// high-water so it stays minimal.
+    /// The highest-`seq` owner-signed `PruneBefore` op, if any. Its `seq` is the
+    /// monotonic high-water; retaining the signed op is what makes the high-water
+    /// unforgeable (a peer cannot claim `u64::MAX` without the owner key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prune_before_op: Option<SignedOp>,
+    /// Owner-signed `PruneIds` ops keyed by their op `seq`. Each carries
+    /// `(id, notif_seq)` pairs; the union of their ids is the tombstone set. An
+    /// op is GC'd once all its pairs are below the high-water (redundant).
     #[serde(default)]
-    tombstones: BTreeMap<String, u64>,
-    /// Monotonic high-water: every notification with `seq < pruned_before` is
-    /// dropped. Merged max-wins.
-    #[serde(default)]
-    pruned_before: u64,
+    prune_ids_ops: BTreeMap<u64, SignedOp>,
 }
 
 impl<'a> TryFrom<State<'a>> for InboxShard {
@@ -139,6 +154,30 @@ fn verify_writer_cert(_cert: Option<&WriterCert>) -> bool {
     true
 }
 
+/// The current high-water: the `seq` of the retained `PruneBefore` op, or 0 if
+/// none. Every notification with `seq < pruned_before` is suppressed.
+fn pruned_before(shard: &InboxShard) -> u64 {
+    shard.prune_before_op.as_ref().map(|op| op.seq).unwrap_or(0)
+}
+
+/// The live tombstone id set: the ids named by every retained `PruneIds` op whose
+/// pair is not yet redundant under the high-water. Recomputed from the verified
+/// ops (never stored as a bare projection), so a tombstone exists only while
+/// backed by an owner signature.
+fn tombstone_ids(shard: &InboxShard) -> std::collections::HashSet<String> {
+    let hw = pruned_before(shard);
+    let mut ids = std::collections::HashSet::new();
+    for op in shard.prune_ids_ops.values() {
+        for (id, notif_seq) in decode_prune_ids(&op.payload) {
+            // A pair below the high-water is already suppressed by it.
+            if notif_seq >= hw {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
+}
+
 /// Whether a notification is, on its own merits, a well-formed delivery for this
 /// inbox: bound to the owner, self-verifying, keyed under its own content
 /// address, and carrying an acceptable writer credential. Does **not** consider
@@ -154,17 +193,16 @@ fn notif_is_acceptable(id: &str, notif: &Notification, owner: &str) -> bool {
 /// Whether a notification may currently live in the inbox: acceptable on its own
 /// merits **and** not suppressed by a prune (tombstoned, or below the
 /// high-water). This is the single admission predicate every write path and
-/// `validate_state` agree on.
+/// `validate_state` agree on. `tombstones` is the derived live set; `hw` the
+/// high-water — both computed once per merge by the caller.
 fn notif_admissible(
     id: &str,
     notif: &Notification,
     owner: &str,
-    tombstones: &BTreeMap<String, u64>,
-    pruned_before: u64,
+    tombstones: &std::collections::HashSet<String>,
+    hw: u64,
 ) -> bool {
-    notif_is_acceptable(id, notif, owner)
-        && !tombstones.contains_key(id)
-        && notif.seq >= pruned_before
+    notif_is_acceptable(id, notif, owner) && !tombstones.contains(id) && notif.seq >= hw
 }
 
 /// Admit one notification if currently admissible. Every path into `notifs` goes
@@ -172,88 +210,115 @@ fn notif_admissible(
 /// the owner has pruned — is never stored, no matter which peer sent it.
 fn merge_notif(shard: &mut InboxShard, notif: Notification, owner: &str) {
     let id = notif.id(owner);
-    if notif_admissible(&id, &notif, owner, &shard.tombstones, shard.pruned_before) {
+    let tombstones = tombstone_ids(shard);
+    let hw = pruned_before(shard);
+    if notif_admissible(&id, &notif, owner, &tombstones, hw) {
         // Content address is stable, so re-inserting the same notification is
         // idempotent (grow-set dedup).
         shard.notifs.entry(id).or_insert(notif);
     }
 }
 
-/// Apply a verified owner prune op to the shard, recording durable, convergent
-/// evidence and dropping the now-suppressed notifications. Caller must have
-/// already verified `op` against the owner.
-fn apply_prune(shard: &mut InboxShard, op: &SignedOp) {
+/// Merge one owner-signed prune op into the shard's retained-op set. **The caller
+/// must have already verified `op` against the owner** for `INBOX_SHARD_CONTEXT`;
+/// this only sequences the convergent retention. Suppression of now-pruned notifs
+/// is applied in [`normalize`], so this is purely additive (order-independent).
+fn merge_prune_op(shard: &mut InboxShard, op: SignedOp) {
     match op.op_type {
-        OpType::PruneIds => {
-            // payload is a length-prefixed list of hex notif ids.
-            for id in decode_prune_ids(&op.payload) {
-                if id.len() > MAX_ID_LEN {
-                    continue;
-                }
-                // Tombstone (max owner-seq wins) and drop the live notif.
-                let cur = shard.tombstones.entry(id.clone()).or_insert(0);
-                *cur = (*cur).max(op.seq);
-                shard.notifs.remove(&id);
+        OpType::PruneBefore => {
+            // Keep the higher-seq op (max-wins, but on the *signed* op so the
+            // high-water cannot be forged past what the owner actually signed).
+            let replace = match &shard.prune_before_op {
+                None => true,
+                Some(cur) => op.seq > cur.seq,
+            };
+            if replace {
+                shard.prune_before_op = Some(op);
             }
         }
-        OpType::PruneBefore => {
-            // Advance the high-water monotonically (max-wins) and drop everything
-            // below it.
-            shard.pruned_before = shard.pruned_before.max(op.seq);
-            shard.notifs.retain(|_, n| n.seq >= shard.pruned_before);
+        OpType::PruneIds => {
+            // Union by op seq; identical ops dedupe. A peer cannot fabricate a new
+            // op (it would not verify), so this is a grow-set of genuine ops.
+            shard.prune_ids_ops.entry(op.seq).or_insert(op);
         }
         // A non-prune op type is not a valid inbox mutation; ignore it.
         OpType::Profile | OpType::Follow | OpType::Unfollow => {}
     }
 }
 
-/// Decode a `PruneIds` payload: a length-prefixed (u32 LE) concatenation of hex
-/// id strings, capped at [`MAX_PRUNE_IDS_PER_OP`]. Malformed input yields the ids
-/// parsed so far (tolerant, never panics — AGENTS.md → "No unwrap/panic").
-fn decode_prune_ids(payload: &[u8]) -> Vec<String> {
-    let mut ids = Vec::new();
+/// Decode a `PruneIds` payload: a length-prefixed (u32 LE) sequence of records,
+/// each `[id_len:u32][id bytes][notif_seq:u64 LE]`, capped at
+/// [`MAX_PRUNE_IDS_PER_OP`]. Malformed input yields the pairs parsed so far
+/// (tolerant, never panics — AGENTS.md → "No unwrap/panic").
+fn decode_prune_ids(payload: &[u8]) -> Vec<(String, u64)> {
+    let mut pairs = Vec::new();
     let mut i = 0;
-    while i + 4 <= payload.len() && ids.len() < MAX_PRUNE_IDS_PER_OP {
+    while i + 4 <= payload.len() && pairs.len() < MAX_PRUNE_IDS_PER_OP {
         let len = u32::from_le_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]])
             as usize;
         i += 4;
-        if i + len > payload.len() {
+        // Need the id bytes plus an 8-byte notif_seq trailer.
+        if len > MAX_ID_LEN || i + len + 8 > payload.len() {
             break;
         }
-        if let Ok(s) = std::str::from_utf8(&payload[i..i + len]) {
-            ids.push(s.to_owned());
-        }
+        let Ok(s) = std::str::from_utf8(&payload[i..i + len]) else {
+            break;
+        };
         i += len;
+        let notif_seq = u64::from_le_bytes([
+            payload[i],
+            payload[i + 1],
+            payload[i + 2],
+            payload[i + 3],
+            payload[i + 4],
+            payload[i + 5],
+            payload[i + 6],
+            payload[i + 7],
+        ]);
+        i += 8;
+        pairs.push((s.to_owned(), notif_seq));
     }
-    ids
+    pairs
 }
 
-/// Encode a `PruneIds` payload from a list of ids (mirror of [`decode_prune_ids`]).
-/// Lives in the contract so tests and any future delegate share one encoder.
-pub fn encode_prune_ids(ids: &[String]) -> Vec<u8> {
+/// Encode a `PruneIds` payload from `(id, notif_seq)` pairs (mirror of
+/// [`decode_prune_ids`]). Lives in the contract so tests and any future delegate
+/// share one encoder; the bytes go into the op's signed payload, so the owner
+/// attests both *which* ids and *at what seq* they pruned.
+pub fn encode_prune_ids(pairs: &[(String, u64)]) -> Vec<u8> {
     let mut buf = Vec::new();
-    for id in ids {
+    for (id, notif_seq) in pairs {
         buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
         buf.extend_from_slice(id.as_bytes());
+        buf.extend_from_slice(&notif_seq.to_le_bytes());
     }
     buf
 }
 
-/// GC redundant tombstones: a tombstone whose id is below the high-water is
-/// already suppressed by `pruned_before`, so it carries no extra information.
-/// We cannot know a tombstoned id's original `seq` (the notif is gone), so we
-/// instead bound the set by [`MAX_TOMBSTONES`] using a deterministic total order
-/// over the key — keeping the largest keys is arbitrary but order-independent and
-/// identical on every replica. (The high-water is the real bound on growth; this
-/// is the backstop.)
-fn truncate_tombstones(tombstones: &mut BTreeMap<String, u64>) {
-    if tombstones.len() <= MAX_TOMBSTONES {
-        return;
-    }
-    let mut keys: Vec<String> = tombstones.keys().cloned().collect();
-    keys.sort();
-    for key in keys.into_iter().skip(MAX_TOMBSTONES) {
-        tombstones.remove(&key);
+/// GC `PruneIds` ops whose every `(id, notif_seq)` pair is redundant — i.e. all
+/// below the high-water, which already suppresses those ids. This is what keeps
+/// the tombstone set genuinely bounded by the high-water (not arbitrary lossy
+/// eviction). Then bound the retained-op count as a backstop, by a deterministic
+/// total order over op seq.
+fn gc_prune_ids_ops(shard: &mut InboxShard) {
+    let hw = pruned_before(shard);
+    shard.prune_ids_ops.retain(|_seq, op| {
+        decode_prune_ids(&op.payload)
+            .iter()
+            .any(|(_, notif_seq)| *notif_seq >= hw)
+    });
+    if shard.prune_ids_ops.len() > MAX_PRUNE_IDS_OPS {
+        // Keep the highest op seqs (most recent prunes). Deterministic; the
+        // BTreeMap is already ordered by seq.
+        let drop: Vec<u64> = shard
+            .prune_ids_ops
+            .keys()
+            .take(shard.prune_ids_ops.len() - MAX_PRUNE_IDS_OPS)
+            .cloned()
+            .collect();
+        for seq in drop {
+            shard.prune_ids_ops.remove(&seq);
+        }
     }
 }
 
@@ -272,23 +337,18 @@ fn truncate_notifs(notifs: &mut BTreeMap<String, Notification>) {
     }
 }
 
-/// Normalize a merged state: drop any notification a prune now suppresses, then
-/// enforce all caps post-merge. Pure function of the accumulated sets, so it is
-/// order-independent. Run after every merge so a notification that arrived before
-/// the prune that suppresses it is still removed (the prune may merge in second).
+/// Normalize a merged state: GC redundant prune ops, drop any notification the
+/// prune state now suppresses, then enforce the notif cap — all post-merge. Pure
+/// function of the accumulated sets, so it is order-independent. Run after every
+/// merge so a notification that arrived before the prune that suppresses it is
+/// still removed (the prune may merge in second).
 fn normalize(shard: &mut InboxShard) {
-    let pruned_before = shard.pruned_before;
-    // Re-apply prune suppression: a notif is only retained if not tombstoned and
-    // not below the high-water. (Acceptance was already checked at insert; this
-    // catches the case where the prune merged in *after* the notif.)
-    let tombstones = std::mem::take(&mut shard.tombstones);
+    gc_prune_ids_ops(shard);
+    let hw = pruned_before(shard);
+    let tombstones = tombstone_ids(shard);
     shard
         .notifs
-        .retain(|id, n| !tombstones.contains_key(id) && n.seq >= pruned_before);
-    shard.tombstones = tombstones;
-    // GC tombstones already covered by the high-water is not possible without the
-    // original seq; bound the set instead.
-    truncate_tombstones(&mut shard.tombstones);
+        .retain(|id, n| !tombstones.contains(id) && n.seq >= hw);
     truncate_notifs(&mut shard.notifs);
 }
 
@@ -303,10 +363,9 @@ fn apply_inbox_delta(shard: &mut InboxShard, delta: InboxDelta, owner: &str) {
             }
         }
         InboxDelta::Prune(op) => {
-            if owner.is_empty() || op.verify(INBOX_SHARD_CONTEXT, owner).is_err() {
-                return;
-            }
-            apply_prune(shard, &op);
+            // Single-op convenience path; verification is centralized in
+            // merge_prune_ops so every path enforces the owner check identically.
+            merge_prune_ops(shard, vec![op], owner);
         }
     }
 }
@@ -342,51 +401,45 @@ fn apply_delta_bytes(
     Ok(())
 }
 
+/// Re-verify and merge a batch of owner-signed prune ops. **Every op is checked
+/// against the owner for `INBOX_SHARD_CONTEXT` here** — a prune is the owner's
+/// exclusive right, so an unverified prune op from any peer (delta, sync, or
+/// full-state) is dropped, not trusted. This is the suppression-side of "every
+/// write path verifies": without it, a peer could ship `pruned_before = u64::MAX`
+/// and wipe an honest inbox network-wide (review CRITICAL, sixth round).
+fn merge_prune_ops(shard: &mut InboxShard, ops: Vec<SignedOp>, owner: &str) {
+    if owner.is_empty() {
+        return;
+    }
+    for op in ops {
+        if op.verify(INBOX_SHARD_CONTEXT, owner).is_ok() {
+            merge_prune_op(shard, op);
+        }
+    }
+}
+
 /// Apply an `InboxStateDelta` (the sync delta from `get_state_delta`). It carries
-/// the prune evidence (`tombstones`, `pruned_before`) and the full self-verifying
-/// notifications the requester lacks. Prune evidence is **owner-authored** and
-/// merged first (so a notification the requester is about to receive is correctly
-/// suppressed); notifications are re-verified by `merge_notif`.
-///
-/// Note the prune evidence here is not individually re-signed — it is the
-/// *result* of owner prune ops the source already verified. Trusting a peer's
-/// claimed `pruned_before` / `tombstones` can only ever *remove* notifications,
-/// never add or forge one, so the worst a lying peer can do over sync is hide
-/// notifications from a replica that syncs *from* it — never inject a forged
-/// notification (those are re-verified) and never affect a replica that does not
-/// sync from it. Removal-only is monotone and convergent, so this is safe; a
-/// forged *addition* would not be.
+/// the owner-signed prune ops and the full self-verifying notifications the
+/// requester lacks. Prune ops are re-verified and merged first (so a notification
+/// the requester is about to receive is correctly suppressed); notifications are
+/// re-verified by `merge_notif`. Nothing here is trusted on the sender's say-so.
 fn apply_state_delta(shard: &mut InboxShard, sd: InboxStateDelta, owner: &str) {
-    merge_prune_evidence(shard, sd.pruned_before, &sd.tombstones);
+    merge_prune_ops(shard, sd.prune_before_op.into_iter().collect(), owner);
+    merge_prune_ops(shard, sd.prune_ids_ops, owner);
     for notif in sd.notifs {
         merge_notif(shard, notif, owner);
     }
 }
 
-/// Merge owner-authored prune evidence: high-water max-wins, tombstones unioned
-/// (max owner-seq per id). Shared by state-delta and full-state merges.
-fn merge_prune_evidence(
-    shard: &mut InboxShard,
-    pruned_before: u64,
-    tombstones: &BTreeMap<String, u64>,
-) {
-    shard.pruned_before = shard.pruned_before.max(pruned_before);
-    for (id, seq) in tombstones {
-        if id.len() > MAX_ID_LEN {
-            continue;
-        }
-        let cur = shard.tombstones.entry(id.clone()).or_insert(0);
-        *cur = (*cur).max(*seq);
-    }
-}
-
 /// Full-state merge: fold `other` into `shard` under the same acceptance +
-/// convergence rules as a delta. Prune evidence merges first; then every
+/// convergence rules as a delta. Prune ops re-verify and merge first; then every
 /// notification of `other` is re-verified — `other` came over the wire from a
-/// possibly-adversarial peer, so "it was already validated upstream" is not an
-/// assumption the contract may make (the thread-shard CRITICAL / M-1 lesson).
+/// possibly-adversarial peer, so neither its notifications nor its prune ops may
+/// be trusted as "already validated upstream" (the thread-shard CRITICAL / M-1
+/// lesson, plus its suppression variant — review CRITICAL, sixth round).
 fn merge_state(shard: &mut InboxShard, other: InboxShard, owner: &str) {
-    merge_prune_evidence(shard, other.pruned_before, &other.tombstones);
+    merge_prune_ops(shard, other.prune_before_op.into_iter().collect(), owner);
+    merge_prune_ops(shard, other.prune_ids_ops.into_values().collect(), owner);
     for (_id, notif) in other.notifs {
         merge_notif(shard, notif, owner);
     }
@@ -402,15 +455,39 @@ impl ContractInterface for InboxShard {
         let shard = InboxShard::try_from(state)?;
         let owner = owner_vk_hex(&parameters);
 
+        // Every retained prune op must be a genuine owner signature for this inbox
+        // context, and keyed under its own seq — update_state only ever stores
+        // verified ops, so a state carrying an unverifiable (forged) prune op, or
+        // a PruneBefore op of the wrong type, is invalid. This is what makes the
+        // high-water / tombstones unforgeable: a peer cannot smuggle a removal
+        // claim past validate (review CRITICAL, sixth round).
+        if let Some(op) = &shard.prune_before_op {
+            if op.op_type != OpType::PruneBefore || op.verify(INBOX_SHARD_CONTEXT, &owner).is_err()
+            {
+                return Err(ContractError::InvalidState);
+            }
+        }
+        for (seq, op) in &shard.prune_ids_ops {
+            if op.op_type != OpType::PruneIds
+                || op.seq != *seq
+                || op.verify(INBOX_SHARD_CONTEXT, &owner).is_err()
+            {
+                return Err(ContractError::InvalidState);
+            }
+        }
+
         // Every stored notification must be admissible: self-verifying, bound to
         // this owner, keyed under its own content address, AND not suppressed by
-        // the prune state it is stored alongside. update_state guarantees all of
-        // these, so validate_state must reject any state violating them (AGENTS.md
-        // → "validate agrees with update"). In particular a notification that is
-        // tombstoned or below the high-water would have been dropped by
-        // update_state, so its presence here is invalid (a forged resurrection).
+        // the (now-proven) prune state it is stored alongside. update_state
+        // guarantees all of these, so validate_state must reject any state
+        // violating them (AGENTS.md → "validate agrees with update"). In
+        // particular a notification that is tombstoned or below the high-water
+        // would have been dropped by update_state, so its presence is invalid (a
+        // forged resurrection).
+        let hw = pruned_before(&shard);
+        let tombstones = tombstone_ids(&shard);
         for (id, notif) in &shard.notifs {
-            if !notif_admissible(id, notif, &owner, &shard.tombstones, shard.pruned_before) {
+            if !notif_admissible(id, notif, &owner, &tombstones, hw) {
                 return Err(ContractError::InvalidState);
             }
         }
@@ -452,13 +529,13 @@ impl ContractInterface for InboxShard {
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
         let shard = InboxShard::try_from(state)?;
-        // Summary = the notif id set + prune evidence, so get_state_delta can
-        // compute what the requester is missing (notifs) and whether it is behind
-        // on pruning (high-water / tombstones).
+        // Summary = the notif id set + which prune ops the holder has (the
+        // PruneBefore seq, and the PruneIds op seqs), so get_state_delta can ship
+        // only the notifs and prune ops the requester lacks.
         let summary = InboxSummary {
             notifs: shard.notifs.keys().cloned().collect(),
-            tombstones: shard.tombstones.keys().cloned().collect(),
-            pruned_before: shard.pruned_before,
+            prune_before_seq: shard.prune_before_op.as_ref().map(|op| op.seq),
+            prune_ids_seqs: shard.prune_ids_ops.keys().cloned().collect(),
         };
         let bytes =
             serde_json::to_vec(&summary).map_err(|e| ContractError::Other(format!("{e}")))?;
@@ -475,6 +552,8 @@ impl ContractInterface for InboxShard {
         let have: InboxSummary = serde_json::from_slice(summary.as_ref()).unwrap_or_default();
 
         let have_notifs: std::collections::HashSet<&String> = have.notifs.iter().collect();
+        let have_prune_ids: std::collections::HashSet<u64> =
+            have.prune_ids_seqs.iter().cloned().collect();
 
         // Notifications the requester lacks — full signed records, re-verified on
         // the receiving side (a sync delta is no more trusted than any other).
@@ -485,44 +564,59 @@ impl ContractInterface for InboxShard {
             .map(|(_, n)| n.clone())
             .collect();
 
-        // Always ship our prune evidence so the requester suppresses the right
-        // notifications even if it is ahead on some and behind on pruning. This is
-        // removal-only and convergent (see apply_state_delta).
+        // Ship our PruneBefore op if it is newer than the requester's high-water,
+        // and any PruneIds ops the requester lacks — the **signed ops**, so the
+        // receiver re-verifies them (a prune is owner-authority; the receiver
+        // never trusts our claimed effect, only a proven op). This is what keeps
+        // suppression unforgeable across sync (review CRITICAL, sixth round).
+        let prune_before_op = match (&shard.prune_before_op, have.prune_before_seq) {
+            (Some(op), Some(have_seq)) if op.seq <= have_seq => None,
+            (Some(op), _) => Some(op.clone()),
+            (None, _) => None,
+        };
+        let prune_ids_ops: Vec<SignedOp> = shard
+            .prune_ids_ops
+            .iter()
+            .filter(|(seq, _)| !have_prune_ids.contains(seq))
+            .map(|(_, op)| op.clone())
+            .collect();
+
         let delta = InboxStateDelta {
             notifs: missing_notifs,
-            tombstones: shard.tombstones.clone(),
-            pruned_before: shard.pruned_before,
+            prune_before_op,
+            prune_ids_ops,
         };
         let bytes = serde_json::to_vec(&delta).map_err(|e| ContractError::Other(format!("{e}")))?;
         Ok(StateDelta::from(bytes))
     }
 }
 
-/// Summary shape: the notif id set the requester already holds plus its prune
-/// position, so `get_state_delta` can ship only what is missing.
+/// Summary shape: the notif id set the requester already holds plus which prune
+/// ops it has (the PruneBefore seq, the PruneIds op seqs), so `get_state_delta`
+/// can ship only what is missing.
 #[derive(Serialize, Deserialize, Default)]
 struct InboxSummary {
     #[serde(default)]
     notifs: Vec<String>,
     #[serde(default)]
-    tombstones: Vec<String>,
+    prune_before_seq: Option<u64>,
     #[serde(default)]
-    pruned_before: u64,
+    prune_ids_seqs: Vec<u64>,
 }
 
 /// The delta `get_state_delta` ships: full self-verifying notifications the
-/// requester lacks, plus the owner-authored prune evidence (removal-only). It is
-/// intentionally NOT an `InboxDelta` so it can convey notifs and prune state at
-/// once; `apply_delta_bytes` decodes it via `apply_state_delta`, which re-verifies
-/// each notification.
+/// requester lacks, plus the **owner-signed prune ops** it lacks (not their
+/// stripped effect). It is intentionally NOT an `InboxDelta` so it can convey
+/// notifs and prune ops at once; `apply_delta_bytes` decodes it via
+/// `apply_state_delta`, which re-verifies every notification AND every prune op.
 #[derive(Serialize, Deserialize, Default)]
 struct InboxStateDelta {
     #[serde(default)]
     notifs: Vec<Notification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prune_before_op: Option<SignedOp>,
     #[serde(default)]
-    tombstones: BTreeMap<String, u64>,
-    #[serde(default)]
-    pruned_before: u64,
+    prune_ids_ops: Vec<SignedOp>,
 }
 
 #[cfg(test)]
@@ -649,10 +743,11 @@ mod test {
         );
         assert_eq!(base.notifs.len(), 1);
 
-        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[id.clone()]), 1);
+        // PruneIds carries (id, notif_seq) pairs; the owner attests both.
+        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[(id.clone(), 5)]), 1);
         let out = run_update(base, vec![delta_item(&InboxDelta::Prune(op))]);
         assert!(out.notifs.is_empty(), "pruned notif removed");
-        assert!(out.tombstones.contains_key(&id), "tombstone recorded");
+        assert!(tombstone_ids(&out).contains(&id), "tombstone recorded");
     }
 
     #[test]
@@ -661,7 +756,7 @@ mod test {
         // notif. The tombstone must keep it out (no resurrection).
         let n = signed_notif([2u8; 32], NotifKind::Reply, "p", 5);
         let id = n.id(&owner_vk());
-        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[id.clone()]), 1);
+        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[(id.clone(), 5)]), 1);
 
         // Prune first, then the (late) re-delivery arrives.
         let pruned = run_update(
@@ -686,7 +781,7 @@ mod test {
         let op = prune_op(OpType::PruneBefore, Vec::new(), 5);
         let out = run_update(base, vec![delta_item(&InboxDelta::Prune(op))]);
         assert_eq!(out.notifs.len(), 1, "old dropped, new kept");
-        assert_eq!(out.pruned_before, 5);
+        assert_eq!(pruned_before(&out), 5);
 
         // A late old notif (seq 4) cannot be admitted below the high-water.
         let late = signed_notif([4u8; 32], NotifKind::Reply, "late", 4);
@@ -698,7 +793,8 @@ mod test {
     fn prune_before_is_monotonic() {
         let op_hi = prune_op(OpType::PruneBefore, Vec::new(), 10);
         let op_lo = prune_op(OpType::PruneBefore, Vec::new(), 3);
-        // Apply high then low: the low must not lower the high-water.
+        // Apply high then low: the low must not lower the high-water (we keep the
+        // higher-seq signed op).
         let out = run_update(
             InboxShard::default(),
             vec![
@@ -706,7 +802,7 @@ mod test {
                 delta_item(&InboxDelta::Prune(op_lo)),
             ],
         );
-        assert_eq!(out.pruned_before, 10);
+        assert_eq!(pruned_before(&out), 10);
     }
 
     #[test]
@@ -724,7 +820,7 @@ mod test {
         let attacker = MlDsa65::from_seed(&[2u8; 32].into());
         let mut op = SignedOp {
             op_type: OpType::PruneIds,
-            payload: encode_prune_ids(&[id.clone()]),
+            payload: encode_prune_ids(&[(id.clone(), 5)]),
             seq: 1,
             signer_pubkey: hex::encode(attacker.verifying_key().encode()),
             signature: None,
@@ -734,7 +830,7 @@ mod test {
 
         let out = run_update(base, vec![delta_item(&InboxDelta::Prune(op))]);
         assert_eq!(out.notifs.len(), 1, "non-owner prune must be ignored");
-        assert!(out.tombstones.is_empty());
+        assert!(out.prune_ids_ops.is_empty());
     }
 
     #[test]
@@ -752,7 +848,7 @@ mod test {
         let sk = MlDsa65::from_seed(&owner_seed().into());
         let mut op = SignedOp {
             op_type: OpType::PruneIds,
-            payload: encode_prune_ids(&[id]),
+            payload: encode_prune_ids(&[(id, 5)]),
             seq: 1,
             signer_pubkey: owner_vk(),
             signature: None,
@@ -767,25 +863,92 @@ mod test {
 
     #[test]
     fn notif_arriving_before_prune_is_normalized_out() {
-        // Prune evidence may merge in AFTER the notif (reordering). normalize must
-        // drop a notif the high-water now suppresses even though it was admissible
-        // when first inserted. Drive via two full-state merges.
+        // A prune op may merge in AFTER the notif (reordering). normalize must drop
+        // a notif the high-water now suppresses even though it was admissible when
+        // first inserted. Drive via a full-state merge of a peer holding the signed
+        // PruneBefore op.
         let old = signed_notif([2u8; 32], NotifKind::Reply, "old", 3);
         let with_notif = run_update(
             InboxShard::default(),
             vec![delta_item(&InboxDelta::Notifs(vec![old]))],
         );
 
-        // A peer state that has only advanced the high-water (no notifs).
+        // A peer state that holds the owner-signed high-water op (seq 5), no notifs.
         let mut pruned_peer = InboxShard::default();
-        pruned_peer.pruned_before = 5;
+        pruned_peer.prune_before_op = Some(prune_op(OpType::PruneBefore, Vec::new(), 5));
 
         let out = run_update(with_notif, vec![UpdateData::State(state_of(&pruned_peer))]);
         assert!(
             out.notifs.is_empty(),
             "notif below merged-in high-water normalized out"
         );
-        assert_eq!(out.pruned_before, 5);
+        assert_eq!(pruned_before(&out), 5);
+    }
+
+    #[test]
+    fn forged_unsigned_prune_evidence_cannot_suppress() {
+        // CRITICAL regression (sixth round): a peer crafts a state whose
+        // prune_before_op is unsigned (or signed by a non-owner) claiming
+        // u64::MAX, shipped as UpdateData::State, trying to wipe an honest inbox.
+        // merge_state must re-verify the op against the owner and DROP it, so the
+        // honest replica's high-water stays 0 and its notif survives.
+        let n = signed_notif([2u8; 32], NotifKind::Reply, "keep", 5);
+        let honest = run_update(
+            InboxShard::default(),
+            vec![delta_item(&InboxDelta::Notifs(vec![n]))],
+        );
+        assert_eq!(honest.notifs.len(), 1);
+
+        // Forged: a PruneBefore op with seq=u64::MAX but NO valid owner signature.
+        let mut malicious = InboxShard::default();
+        malicious.prune_before_op = Some(SignedOp {
+            op_type: OpType::PruneBefore,
+            payload: Vec::new(),
+            seq: u64::MAX,
+            signer_pubkey: owner_vk(),
+            signature: None, // forged: not signed
+        });
+        // Also a forged tombstone op naming the honest notif's id.
+        let id = honest.notifs.keys().next().unwrap().clone();
+        malicious.prune_ids_ops.insert(
+            7,
+            SignedOp {
+                op_type: OpType::PruneIds,
+                payload: encode_prune_ids(&[(id, 5)]),
+                seq: 7,
+                signer_pubkey: owner_vk(),
+                signature: None, // forged
+            },
+        );
+
+        let out = run_update(honest, vec![UpdateData::State(state_of(&malicious))]);
+        assert_eq!(
+            pruned_before(&out),
+            0,
+            "forged high-water must not be adopted"
+        );
+        assert_eq!(
+            out.notifs.len(),
+            1,
+            "honest notif must survive a forged suppression attempt"
+        );
+        assert!(out.prune_ids_ops.is_empty(), "forged tombstone op dropped");
+    }
+
+    #[test]
+    fn validate_rejects_forged_prune_before_op() {
+        // A state carrying an unsigned/forged PruneBefore op must fail validate —
+        // update_state only ever stores verified ops, so the two halves agree.
+        let mut shard = InboxShard::default();
+        shard.prune_before_op = Some(SignedOp {
+            op_type: OpType::PruneBefore,
+            payload: Vec::new(),
+            seq: 99,
+            signer_pubkey: owner_vk(),
+            signature: None,
+        });
+        let res = InboxShard::validate_state(params(), state_of(&shard), RelatedContracts::new());
+        assert!(!matches!(res, Ok(ValidateResult::Valid)));
     }
 
     #[test]
@@ -821,13 +984,19 @@ mod test {
 
     #[test]
     fn validate_rejects_tombstoned_notif_present() {
-        // A notif that is also tombstoned in the same state would have been removed
-        // by update_state, so its presence is invalid (a resurrection forgery).
+        // A notif present alongside an owner-signed PruneIds op that names it would
+        // have been removed by update_state, so its presence is invalid (a
+        // resurrection forgery). The tombstone op must itself be genuine, else
+        // validate would reject on the op instead — we want to prove the notif
+        // check fires.
         let n = signed_notif([2u8; 32], NotifKind::Reply, "p", 5);
         let id = n.id(&owner_vk());
         let mut shard = InboxShard::default();
         shard.notifs.insert(id.clone(), n);
-        shard.tombstones.insert(id, 1);
+        // Genuine owner-signed PruneIds op tombstoning that id (notif_seq 5, at or
+        // above the high-water of 0, so the tombstone is live).
+        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[(id, 5)]), 1);
+        shard.prune_ids_ops.insert(1, op);
         let res = InboxShard::validate_state(params(), state_of(&shard), RelatedContracts::new());
         assert!(!matches!(res, Ok(ValidateResult::Valid)));
     }
@@ -902,8 +1071,17 @@ mod test {
         let mut src = InboxShard::default();
         let n = signed_notif([2u8; 32], NotifKind::Reply, "r", 5);
         src.notifs.insert(n.id(&owner_vk()), n);
-        src.pruned_before = 2;
-        src.tombstones.insert("some_pruned_id".into(), 1);
+        // Genuine owner-signed prune ops on the source.
+        src.prune_before_op = Some(prune_op(OpType::PruneBefore, Vec::new(), 2));
+        let pruned_id = signed_notif([6u8; 32], NotifKind::Reply, "gone", 9).id(&owner_vk());
+        src.prune_ids_ops.insert(
+            3,
+            prune_op(
+                OpType::PruneIds,
+                encode_prune_ids(&[(pruned_id.clone(), 9)]),
+                3,
+            ),
+        );
 
         let empty_summary =
             StateSummary::from(serde_json::to_vec(&InboxSummary::default()).unwrap());
@@ -916,8 +1094,8 @@ mod test {
             ))],
         );
         assert_eq!(out.notifs.len(), 1);
-        assert_eq!(out.pruned_before, 2);
-        assert!(out.tombstones.contains_key("some_pruned_id"));
+        assert_eq!(pruned_before(&out), 2);
+        assert!(tombstone_ids(&out).contains(&pruned_id));
     }
 
     #[test]
@@ -950,9 +1128,13 @@ mod test {
     #[test]
     fn decodes_old_shape_state() {
         let empty: InboxShard = serde_json::from_slice(b"{}").unwrap();
-        assert!(empty.notifs.is_empty() && empty.tombstones.is_empty() && empty.pruned_before == 0);
+        assert!(
+            empty.notifs.is_empty()
+                && empty.prune_before_op.is_none()
+                && empty.prune_ids_ops.is_empty()
+        );
         let forward: InboxShard = serde_json::from_slice(
-            br#"{"notifs":{},"tombstones":{},"pruned_before":0,"version":2}"#,
+            br#"{"notifs":{},"prune_ids_ops":{},"pruned_before":0,"version":2}"#,
         )
         .unwrap();
         assert!(forward.notifs.is_empty());
@@ -960,9 +1142,13 @@ mod test {
 
     #[test]
     fn prune_ids_payload_round_trips() {
-        let ids = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
-        let encoded = encode_prune_ids(&ids);
-        assert_eq!(decode_prune_ids(&encoded), ids);
+        let pairs = vec![
+            ("aaa".to_string(), 1u64),
+            ("bbb".to_string(), 7u64),
+            ("ccc".to_string(), 42u64),
+        ];
+        let encoded = encode_prune_ids(&pairs);
+        assert_eq!(decode_prune_ids(&encoded), pairs);
         // Truncated/garbage trailing bytes are tolerated (no panic).
         let mut trunc = encoded.clone();
         trunc.truncate(encoded.len() - 1);
@@ -1121,7 +1307,7 @@ mod integration {
             &a_delivered,
             vec![delta(&InboxDelta::Prune(prune_op(
                 OpType::PruneIds,
-                encode_prune_ids(&[id.clone()]),
+                encode_prune_ids(&[(id.clone(), 5)]),
                 1,
             )))],
         );
@@ -1133,7 +1319,7 @@ mod integration {
             a2.notifs.is_empty() && b2.notifs.is_empty(),
             "pruned notif must stay pruned on both replicas (no resurrection)"
         );
-        assert!(a2.tombstones.contains_key(&id));
+        assert!(tombstone_ids(&a2).contains(&id));
     }
 
     #[test]
@@ -1161,7 +1347,7 @@ mod integration {
 
         let (a2, b2) = reconcile(&a, &b);
         assert_eq!(canonical(&a2), canonical(&b2));
-        assert_eq!(a2.pruned_before, 5);
+        assert_eq!(pruned_before(&a2), 5);
         assert_eq!(
             a2.notifs.len(),
             1,

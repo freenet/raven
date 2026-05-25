@@ -318,47 +318,67 @@ thread shard: it is **anyone-writes for delivery, owner-only for pruning**.
 On an anyone-writes surface, the new failure mode is **resurrection**: a stale
 replica still holding a notification the owner pruned must not re-add it when it
 merges with a pruned replica. A prune therefore leaves **durable, convergent
-evidence**, and state is `{ notifs, tombstones: Map<id,owner_seq>, pruned_before:
-u64 }`:
+evidence** — but because *removal is the owner's exclusive right*, that evidence
+must itself carry the owner's signature on every path. State retains the
+**owner-signed prune ops**, never a sig-stripped projection of their effect:
+`{ notifs, prune_before_op: Option<SignedOp>, prune_ids_ops: Map<op_seq,SignedOp> }`.
 
-- *pruned_before* — a single monotonic high-water, merged **max-wins**. Any notif
-  with `seq < pruned_before` is dropped on every path and never re-admitted.
-- *tombstones* — a grow-set of selectively-pruned ids, merged by max owner-seq per
-  id. A tombstoned id is dropped on every path.
+- *prune_before_op* — the single highest-`seq` owner-signed `PruneBefore` op. The
+  high-water *is* that op's `seq`; because `seq` is inside the signed payload, a
+  peer cannot claim `pruned_before = u64::MAX` without the owner key. Merged by
+  keeping the higher-`seq` **verified** op.
+- *prune_ids_ops* — owner-signed `PruneIds` ops (keyed by op `seq`), each carrying
+  signed `(id, notif_seq)` pairs. The live tombstone set is *derived* from these
+  verified ops; a tombstone exists only while backed by an owner signature.
 - *notifs* — a grow-set keyed by content address, admitted only if it
   self-verifies for this owner **and** is neither tombstoned nor below the
   high-water (`notif_admissible`, the single predicate every write path and
   `validate_state` agree on).
 
-The hybrid (selective ids + bulk high-water) is what keeps tombstones from growing
-unbounded: the high-water collapses the common case (clear-everything-older), and
-explicit tombstones only persist for ids newer than the water line. `normalize`
-re-applies prune suppression **post-merge** (the same discipline as the caps), so
-a notif that arrived before the prune that suppresses it — i.e. the prune merged
-in second — is still removed. Notifs are capped post-merge to the newest
-`MAX_NOTIFS` by `(seq, id)` desc (a total order; no clock).
+The hybrid (selective ids + bulk high-water) keeps tombstones bounded *and*
+genuinely collectible: a `(id, notif_seq)` pair is **redundant** once `notif_seq <
+pruned_before` (the high-water already suppresses it), and a `PruneIds` op whose
+every pair is redundant is dropped in `normalize` (`gc_prune_ids_ops`). `normalize`
+also re-applies prune suppression **post-merge** (the same discipline as the
+caps), so a notif that arrived before the prune that suppresses it — i.e. the
+prune op merged in second — is still removed. Notifs are capped post-merge to the
+newest `MAX_NOTIFS` by `(seq, id)` desc (a total order; no clock).
 
-### Sync delta carries prune evidence (removal-only, so trusting it is safe)
+### Sync delta carries the **signed prune ops** — there is no removal-only shortcut (review CRITICAL, sixth round)
 
-`summarize_state` ships the notif id set + prune position; `get_state_delta` ships
-the full self-verifying notifications the requester lacks **plus** the
-`tombstones` + `pruned_before` evidence. That evidence is **not individually
-re-signed** in the delta — it is the *result* of owner prune ops the source
-already verified. This is the one deliberate asymmetry vs. the thread shard's
-"re-verify everything" rule, and it is sound because trusting a peer's claimed
-prune position can only ever **remove** notifications, never add or forge one:
-the notifications themselves are still re-verified by `merge_notif` on every path
-(`apply_state_delta`, `merge_state`), so a forged *addition* is impossible, and
-removal is monotone and convergent. The worst a lying peer can do over sync is
-hide notifications from a replica that syncs *from* it — never inject one, and
-never affect a replica that does not sync from it. (Documented inline on
-`apply_state_delta` so a future reviewer does not "fix" it into re-verification of
-unsigned evidence, which would break high-water convergence.)
+The first cut of this contract stored a bare `{ tombstones, pruned_before }` and
+shipped it un-re-signed over sync, on the argument that "trusting prune evidence
+can only *remove* notifications, never forge one, so it is safe." **That argument
+was wrong, and review caught it as a CRITICAL.** On an inbox, *removal is itself
+the owner's exclusive privilege* — an unsigned removal claim is a forgeable
+authority claim. Any peer (no key, no relationship to the victim) could ship a
+state with `pruned_before = u64::MAX`; an honest replica merging it would
+`max`-adopt the high-water, `retain` would wipe **every** notification, and
+because the poisoned high-water is then durable state it would re-propagate
+network-wide via that replica's own `get_state_delta`/`merge_state`, with
+`max`-wins guaranteeing it never heals. A single push wipes an honest user's inbox
+everywhere, permanently. This is the same class as the thread-shard CRITICAL — a
+sig-stripped projection trusted from an upstream peer — applied to *suppression*
+instead of injection.
 
-`validate_state` re-proves every stored notification is admissible — including
-that it is **not** tombstoned and **not** below the high-water — so a forged
-resurrection in a state object fails validation (the two halves agree, the
-thread-shard CRITICAL lesson applied to the inbox).
+The fix is the same discipline: **retain and re-verify the owner-signed prune
+ops on every path.** `summarize_state` ships the notif id set + which prune ops
+the holder has (the `PruneBefore` seq, the `PruneIds` op seqs); `get_state_delta`
+ships the missing **signed ops** (not their effect); `apply_state_delta` /
+`merge_state` route every op through `merge_prune_ops`, which calls
+`op.verify(INBOX_SHARD_CONTEXT, owner)` before it may raise the high-water or add
+a tombstone. A forged `PruneBefore { seq: u64::MAX, signature: None }` simply
+fails verification and is dropped, so the honest replica's high-water stays put
+and its notifications survive (regression
+`forged_unsigned_prune_evidence_cannot_suppress`). Notifications continue to be
+re-verified by `merge_notif` on every path, exactly as before. The cost is real —
+prune ops accumulate — but a `PruneBefore` collapses to one op (highest seq) and
+`PruneIds` ops are GC'd once redundant, so it stays bounded.
+
+`validate_state` re-proves **every retained prune op** (genuine owner signature,
+correct op type, keyed under its own seq) *and* every stored notification's
+admissibility, so a forged prune op or a resurrected notification in a state
+object fails validation (the two halves agree).
 
 This adds the `inbox_shard_code_hash` build artifact (parameterized, so no single
 instance id — like the user and thread shards). No migration entry (no prior
