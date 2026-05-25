@@ -263,6 +263,11 @@ fn apply_op(shard: &mut UserShard, op: &SignedOp, owner: &str) -> bool {
             }
             changed
         }
+        // Inbox-shard prune ops are not valid user-shard mutations. They are
+        // bound to INBOX_SHARD_CONTEXT (so they would not even verify here under
+        // USER_SHARD_CONTEXT), but reject them explicitly so the match stays
+        // exhaustive and an inbox op can never mutate user-shard state.
+        OpType::PruneIds | OpType::PruneBefore => false,
     }
 }
 

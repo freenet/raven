@@ -281,6 +281,118 @@ instance id — like the user shard). No migration entry (no prior thread-shard
 state). UI wiring + cross-contract quote/notification delivery are Phase 4 / the
 inbox shard (Phase 3).
 
+## Phase 3 decisions (inbox shard)
+
+The inbox shard (`contracts/inbox-shard`) is the **last shard type**: one contract
+per user, parameterized by the owner's ML-DSA-65 VK bytes (`parameters =
+owner_vk_bytes`, exactly like the user shard), so `contract_key =
+blake3(inbox_shard_wasm || owner_vk)` — distinct per user and, because the WASM
+hash differs, distinct from that user's user shard with the same parameters. It
+holds incoming **notifications** (reply / mention / follow / quote) targeting the
+owner.
+
+### Write authority — anyone-writes deliveries, owner-prunes
+
+The inbox is the second public-write surface, but with a twist absent from the
+thread shard: it is **anyone-writes for delivery, owner-only for pruning**.
+
+- A **notification** (`common::inbox::Notification`, kind
+  `Reply`/`Mention`/`Follow`/`Quote`) is signed by its **sender** and bound to
+  the **recipient owner VK** (domain tag `raven:inbox-notif:v1`, recipient +
+  kind mixed into the length-prefixed payload), so it self-verifies and cannot
+  be replayed into another user's inbox or presented as a different kind. Its
+  `id` is the content address `blake3(signing_payload)`, the map key and the
+  handle the owner names when pruning one. As on the thread shard, *who* may be a
+  sender is the abuse question left to a credential mechanism — the `WriterCert`
+  slot is reserved and gated by `verify_writer_cert` (accepts everything today).
+- A **prune** reuses the owner-bound `signed_op::SignedOp` envelope (the same
+  type the user shard uses for profile/follows) under a new
+  `INBOX_SHARD_CONTEXT = "raven:inbox-shard:v1"`, so an inbox prune cannot be
+  replayed into the user shard or vice versa. Two new `OpType`s were added:
+  `PruneIds` (drop explicit ids in the payload — selective) and `PruneBefore`
+  (advance a high-water to `op.seq` — bulk). `SignedOp::verify` already requires
+  `signer == owner`, so only the owner can prune.
+
+### The owner-prune convergence invariant (the hard part)
+
+On an anyone-writes surface, the new failure mode is **resurrection**: a stale
+replica still holding a notification the owner pruned must not re-add it when it
+merges with a pruned replica. A prune therefore leaves **durable, convergent
+evidence** — but because *removal is the owner's exclusive right*, that evidence
+must itself carry the owner's signature on every path. State retains the
+**owner-signed prune ops**, never a sig-stripped projection of their effect:
+`{ notifs, prune_before_op: Option<SignedOp>, prune_ids_ops: Map<op_seq,SignedOp> }`.
+
+- *prune_before_op* — the single highest-`seq` owner-signed `PruneBefore` op. The
+  high-water *is* that op's `seq`; because `seq` is inside the signed payload, a
+  peer cannot claim `pruned_before = u64::MAX` without the owner key. Merged by
+  keeping the higher-`seq` **verified** op.
+- *prune_ids_ops* — owner-signed `PruneIds` ops (keyed by op `seq`), each naming
+  the ids it prunes. The live tombstone set is *derived* from these verified ops;
+  a tombstone exists only while backed by an owner signature.
+- *notifs* — a grow-set keyed by content address, admitted only if it
+  self-verifies for this owner **and** is neither tombstoned nor below the
+  high-water (`notif_admissible`, the single predicate every write path and
+  `validate_state` agree on).
+
+`PruneBefore` is the bulk-cleanup tool: a single max-wins op, no GC needed.
+Selective `PruneIds` tombstones are a **pure grow-set**, bounded only by the
+`MAX_PRUNE_IDS_OPS` backstop (oldest op `seq`s evicted, best-effort lossy — the
+same trade as the notif window). A second draft tried to GC a `PruneIds` op once
+an owner-attested per-id `notif_seq` fell below the high-water, but that seq was
+never tied to the notif's *real* seq: an understated value (a delegate bug or a
+careless owner) let GC drop a live tombstone and resurrect the notif, with no
+`validate_state` backstop — owner-self-harm, not attacker-reachable, but it
+silently re-opened the exact resurrection class the prune machinery exists to
+prevent (review **MAJOR**, seventh round). There is no sound high-water GC for a
+bare id, so `notif_seq` was dropped entirely and `gc_prune_ids_ops` keeps only the
+count backstop. `normalize` re-applies prune suppression **post-merge** (the same
+discipline as the caps), so a notif that arrived before the prune op that
+suppresses it — i.e. the prune merged in second — is still removed. Notifs are
+capped post-merge to the newest `MAX_NOTIFS` by `(seq, id)` desc (a total order;
+no clock).
+
+### Sync delta carries the **signed prune ops** — there is no removal-only shortcut (review CRITICAL, sixth round)
+
+The first cut of this contract stored a bare `{ tombstones, pruned_before }` and
+shipped it un-re-signed over sync, on the argument that "trusting prune evidence
+can only *remove* notifications, never forge one, so it is safe." **That argument
+was wrong, and review caught it as a CRITICAL.** On an inbox, *removal is itself
+the owner's exclusive privilege* — an unsigned removal claim is a forgeable
+authority claim. Any peer (no key, no relationship to the victim) could ship a
+state with `pruned_before = u64::MAX`; an honest replica merging it would
+`max`-adopt the high-water, `retain` would wipe **every** notification, and
+because the poisoned high-water is then durable state it would re-propagate
+network-wide via that replica's own `get_state_delta`/`merge_state`, with
+`max`-wins guaranteeing it never heals. A single push wipes an honest user's inbox
+everywhere, permanently. This is the same class as the thread-shard CRITICAL — a
+sig-stripped projection trusted from an upstream peer — applied to *suppression*
+instead of injection.
+
+The fix is the same discipline: **retain and re-verify the owner-signed prune
+ops on every path.** `summarize_state` ships the notif id set + which prune ops
+the holder has (the `PruneBefore` seq, the `PruneIds` op seqs); `get_state_delta`
+ships the missing **signed ops** (not their effect); `apply_state_delta` /
+`merge_state` route every op through `merge_prune_ops`, which calls
+`op.verify(INBOX_SHARD_CONTEXT, owner)` before it may raise the high-water or add
+a tombstone. A forged `PruneBefore { seq: u64::MAX, signature: None }` simply
+fails verification and is dropped, so the honest replica's high-water stays put
+and its notifications survive (regression
+`forged_unsigned_prune_evidence_cannot_suppress`). Notifications continue to be
+re-verified by `merge_notif` on every path, exactly as before. The cost is real —
+prune ops accumulate — but a `PruneBefore` collapses to one op (highest seq) and
+`PruneIds` ops are capped by the `MAX_PRUNE_IDS_OPS` backstop, so it stays bounded.
+
+`validate_state` re-proves **every retained prune op** (genuine owner signature,
+correct op type, keyed under its own seq) *and* every stored notification's
+admissibility, so a forged prune op or a resurrected notification in a state
+object fails validation (the two halves agree).
+
+This adds the `inbox_shard_code_hash` build artifact (parameterized, so no single
+instance id — like the user and thread shards). No migration entry (no prior
+inbox-shard state). With this slice **all three shard types now exist**, so the
+migration + UI wiring (Phase 4) is unblocked.
+
 ## Testing tiers
 
 - **Unit** — per-function `#[test]`s inside each contract crate's `test` module:

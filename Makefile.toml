@@ -131,6 +131,26 @@ printf '%s' "$hash" > "$ROOT/build/thread_shard_code_hash"
 echo "wrote build/thread_shard_code_hash: $hash"
 '''
 
+[tasks.build-inbox-shard]
+description = "Build inbox-shard contract WASM + code_hash"
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+cd "$ROOT/contracts/inbox-shard"
+CARGO_TARGET_DIR="$ROOT/target" fdev build
+hash=$(CARGO_TARGET_DIR="$ROOT/target" fdev inspect \
+    "$ROOT/contracts/inbox-shard/build/freenet/freenet_microblogging_inbox_shard" code | \
+    grep 'code hash:' | cut -d' ' -f3)
+mkdir -p "$ROOT/build"
+# Inbox shards are PARAMETERIZED (parameters = owner VK bytes), so there is no
+# single contract instance id: each owner derives a distinct key from this
+# code_hash + their VK. Only the code_hash is build-stable; instance ids are
+# computed per owner at runtime (ADR-0001 → "Inbox shard").
+printf '%s' "$hash" > "$ROOT/build/inbox_shard_code_hash"
+echo "wrote build/inbox_shard_code_hash: $hash"
+'''
+
 [tasks.build-identity]
 description = "Build identity delegate WASM + code_hash + delegate_key bytes"
 script_runner = "bash"
@@ -158,7 +178,7 @@ echo "identity hash=$hash key=$key_hex"
 
 [tasks.build-contracts]
 description = "Build all contracts + delegates (WASM + code_hash files)"
-dependencies = ["build-posts", "build-follows", "build-likes", "build-user-shard", "build-thread-shard", "build-identity"]
+dependencies = ["build-posts", "build-follows", "build-likes", "build-user-shard", "build-thread-shard", "build-inbox-shard", "build-identity"]
 
 [tasks.build-web-container]
 description = "Build web/container Rust crate (WASM)"

@@ -613,6 +613,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-microblogging-inbox-shard"
+version = "0.0.0"
+dependencies = [
+ "freenet-microblogging-common",
+ "freenet-stdlib",
+ "hex",
+ "ml-dsa",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "freenet-microblogging-likes"
 version = "0.0.0"
 dependencies = [
