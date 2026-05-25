@@ -883,3 +883,328 @@ mod test {
         assert!(forward.replies.is_empty());
     }
 }
+
+/// Integration tests: drive the full `ContractInterface` (validate / update /
+/// summarize / get_state_delta) through multi-replica and multi-author scenarios
+/// — the layer above the per-function unit tests. The key scenario is **two
+/// replicas reconciling via the real sync protocol** (`summarize_state` →
+/// `get_state_delta` → `update_state`), which the unit tests do not exercise.
+///
+/// These still call the contract as a Rust library (not compiled WASM in a
+/// node); true WASM-in-node e2e is a separate, heavier tier (see the
+/// `freenet:linux-test` skill). What is new here vs. the unit tests: real
+/// multi-party ML-DSA-65 keys, the summarize/delta sync path, and cross-shard
+/// consistency between a post and its thread.
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use freenet_microblogging_common::thread::{LikeRecord, QuoteRef};
+    use ml_dsa::signature::{Keypair, Signer};
+    use ml_dsa::{KeyGen, MlDsa65, Signature};
+
+    const ROOT: &str = "integration_root_post_address";
+
+    fn params() -> Parameters<'static> {
+        Parameters::from(ROOT.as_bytes().to_vec())
+    }
+
+    fn state_of(shard: &ThreadShard) -> State<'static> {
+        State::from(serde_json::to_vec(shard).unwrap())
+    }
+
+    fn decode(state: State<'static>) -> ThreadShard {
+        serde_json::from_slice(state.as_ref()).unwrap()
+    }
+
+    /// A reply to ROOT by the author with `seed`.
+    fn reply(seed: [u8; 32], content: &str, ts: u64) -> Post {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut p = Post {
+            id: String::new(),
+            author_pubkey: hex::encode(sk.verifying_key().encode()),
+            author_name: "Author".into(),
+            author_handle: "@author".into(),
+            content: content.into(),
+            timestamp: ts,
+            reply_to: ROOT.into(),
+            signature: None,
+        };
+        p.id = p.compute_id();
+        let sig: Signature<MlDsa65> = sk.sign(&p.signing_payload());
+        p.signature = Some(hex::encode(sig.encode()));
+        p
+    }
+
+    fn like(seed: [u8; 32], seq: u64, liked: bool) -> LikeRecord {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut r = LikeRecord {
+            signer_pubkey: hex::encode(sk.verifying_key().encode()),
+            seq,
+            liked,
+            writer_cert: None,
+            signature: None,
+        };
+        let sig: Signature<MlDsa65> = sk.sign(&r.signing_payload(ROOT));
+        r.signature = Some(hex::encode(sig.encode()));
+        r
+    }
+
+    fn quote(seed: [u8; 32], qid: &str) -> QuoteRef {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut q = QuoteRef {
+            signer_pubkey: hex::encode(sk.verifying_key().encode()),
+            quote_post_id: qid.into(),
+            writer_cert: None,
+            signature: None,
+        };
+        let sig: Signature<MlDsa65> = sk.sign(&q.signing_payload(ROOT));
+        q.signature = Some(hex::encode(sig.encode()));
+        q
+    }
+
+    /// Apply a batch of deltas to a replica, returning its new state — the
+    /// contract's own `update_state`, exactly as a node would call it.
+    fn apply(shard: &ThreadShard, items: Vec<UpdateData<'static>>) -> ThreadShard {
+        let res = ThreadShard::update_state(params(), state_of(shard), items).unwrap();
+        decode(res.unwrap_valid())
+    }
+
+    fn delta(d: &ThreadDelta) -> UpdateData<'static> {
+        UpdateData::Delta(StateDelta::from(serde_json::to_vec(d).unwrap()))
+    }
+
+    /// One directional sync step, faithful to the node protocol: `dst` summarizes
+    /// what it has, `src` computes the delta of what `dst` is missing, `dst`
+    /// applies it. Returns `dst`'s new state. Every state must stay valid.
+    fn sync_into(dst: &ThreadShard, src: &ThreadShard) -> ThreadShard {
+        // dst is valid before syncing.
+        assert!(matches!(
+            ThreadShard::validate_state(params(), state_of(dst), RelatedContracts::new()).unwrap(),
+            ValidateResult::Valid
+        ));
+        let summary = ThreadShard::summarize_state(params(), state_of(dst)).unwrap();
+        let d = ThreadShard::get_state_delta(params(), state_of(src), summary).unwrap();
+        let merged = apply(
+            dst,
+            vec![UpdateData::Delta(StateDelta::from(d.into_bytes().to_vec()))],
+        );
+        // dst stays valid after syncing.
+        assert!(matches!(
+            ThreadShard::validate_state(params(), state_of(&merged), RelatedContracts::new())
+                .unwrap(),
+            ValidateResult::Valid
+        ));
+        merged
+    }
+
+    /// Full bidirectional reconcile: sync each way once. For these state sizes a
+    /// single round each direction converges (the delta carries everything the
+    /// peer lacks). Returns `(a', b')`, which must be equal.
+    fn reconcile(a: &ThreadShard, b: &ThreadShard) -> (ThreadShard, ThreadShard) {
+        let a2 = sync_into(a, b);
+        let b2 = sync_into(b, a);
+        (a2, b2)
+    }
+
+    fn canonical(shard: &ThreadShard) -> Vec<u8> {
+        serde_json::to_vec(shard).unwrap()
+    }
+
+    #[test]
+    fn two_replicas_converge_over_sync_protocol() {
+        // A and B each see a disjoint set of writes from different authors, then
+        // reconcile via summarize/get_state_delta/update_state. They must reach
+        // byte-identical state — exercising the real sync path, not direct merge.
+        let empty = ThreadShard::default();
+
+        let a = apply(
+            &empty,
+            vec![
+                delta(&ThreadDelta::Replies(vec![reply([1; 32], "a-reply", 100)])),
+                delta(&ThreadDelta::Likes(vec![like([2; 32], 1, true)])),
+                delta(&ThreadDelta::Quotes(vec![quote([3; 32], "qa")])),
+            ],
+        );
+        let b = apply(
+            &empty,
+            vec![
+                delta(&ThreadDelta::Replies(vec![reply([4; 32], "b-reply", 200)])),
+                delta(&ThreadDelta::Likes(vec![like([5; 32], 1, true)])),
+            ],
+        );
+
+        let (a2, b2) = reconcile(&a, &b);
+        assert_eq!(canonical(&a2), canonical(&b2), "replicas must converge");
+        // Union of all writes present on both.
+        assert_eq!(a2.replies.len(), 2);
+        assert_eq!(a2.likes.len(), 2);
+        assert_eq!(a2.quotes.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_like_unlike_converges_over_sync() {
+        // Same liker, equal seq, opposite intents on the two replicas — the
+        // hardest convergence case. Over the sync protocol both must settle on
+        // the unlike (equal-seq tie-break), in either reconcile direction.
+        let empty = ThreadShard::default();
+        let a = apply(
+            &empty,
+            vec![delta(&ThreadDelta::Likes(vec![like([7; 32], 5, true)]))],
+        );
+        let b = apply(
+            &empty,
+            vec![delta(&ThreadDelta::Likes(vec![like([7; 32], 5, false)]))],
+        );
+
+        let (a2, b2) = reconcile(&a, &b);
+        assert_eq!(canonical(&a2), canonical(&b2));
+        let signer = hex::encode(
+            MlDsa65::from_seed(&[7u8; 32].into())
+                .verifying_key()
+                .encode(),
+        );
+        assert!(!a2.likes[&signer].liked, "equal-seq unlike wins after sync");
+
+        // And the reverse reconcile order yields the same fixed point.
+        let (b3, a3) = reconcile(&b, &a);
+        assert_eq!(canonical(&a3), canonical(&b3));
+        assert!(!a3.likes[&signer].liked);
+    }
+
+    #[test]
+    fn higher_seq_like_propagates_over_sync() {
+        // A has an old like (seq 1, liked); B has the same liker's newer unlike
+        // (seq 2). After sync both hold the unlike — the summary carries (seq,
+        // liked) so get_state_delta ships the newer record.
+        let empty = ThreadShard::default();
+        let a = apply(
+            &empty,
+            vec![delta(&ThreadDelta::Likes(vec![like([8; 32], 1, true)]))],
+        );
+        let b = apply(
+            &empty,
+            vec![delta(&ThreadDelta::Likes(vec![like([8; 32], 2, false)]))],
+        );
+        let signer = hex::encode(
+            MlDsa65::from_seed(&[8u8; 32].into())
+                .verifying_key()
+                .encode(),
+        );
+
+        let (a2, b2) = reconcile(&a, &b);
+        assert_eq!(canonical(&a2), canonical(&b2));
+        assert_eq!(a2.likes[&signer].seq, 2);
+        assert!(!a2.likes[&signer].liked);
+    }
+
+    #[test]
+    fn forged_like_does_not_propagate_over_sync() {
+        // A holds a forged (unsigned) like in its state. When B syncs from A, the
+        // forged like rides in the delta but B's update_state re-verifies and
+        // drops it — a malicious replica cannot inject a like into an honest one.
+        let victim = hex::encode(
+            MlDsa65::from_seed(&[9u8; 32].into())
+                .verifying_key()
+                .encode(),
+        );
+        let mut malicious = ThreadShard::default();
+        malicious.likes.insert(
+            victim.clone(),
+            LikeRecord {
+                signer_pubkey: victim.clone(),
+                seq: 1,
+                liked: true,
+                writer_cert: None,
+                signature: None, // forged
+            },
+        );
+        // (A malicious peer's own state need not be valid; we only care what an
+        // honest peer accepts from it.)
+        let honest = ThreadShard::default();
+        let synced = sync_into(&honest, &malicious);
+        assert!(
+            synced.likes.is_empty(),
+            "honest replica must reject forged like over sync"
+        );
+    }
+
+    #[test]
+    fn cross_shard_post_and_reply_use_consistent_keys() {
+        // A post authored on a user shard and a reply to it on the thread shard
+        // are both `common::post::Post`s signed by their authors with the single
+        // trusted encoder. The thread is keyed by the root post's content id, and
+        // a reply's reply_to must equal that id. This checks the cross-shard
+        // contract: the thread param is exactly the user-shard post's id, and a
+        // reply bound to it is accepted while one bound to a different id is not.
+        let author = [10u8; 32];
+        let sk = MlDsa65::from_seed(&author.into());
+        // The "root" post as it would live on the author's user shard.
+        let mut root_post = Post {
+            id: String::new(),
+            author_pubkey: hex::encode(sk.verifying_key().encode()),
+            author_name: "Root".into(),
+            author_handle: "@root".into(),
+            content: "the original post".into(),
+            timestamp: 1_000,
+            reply_to: String::new(),
+            signature: None,
+        };
+        root_post.id = root_post.compute_id();
+        let sig: Signature<MlDsa65> = sk.sign(&root_post.signing_payload());
+        root_post.signature = Some(hex::encode(sig.encode()));
+        assert_eq!(root_post.verify(), Ok(()));
+
+        // The thread shard for this post is parameterized by its content id.
+        let thread_params = Parameters::from(root_post.id.as_bytes().to_vec());
+
+        // A reply bound to that id (by a different author) is accepted.
+        let replier = [11u8; 32];
+        let rsk = MlDsa65::from_seed(&replier.into());
+        let mut good_reply = Post {
+            id: String::new(),
+            author_pubkey: hex::encode(rsk.verifying_key().encode()),
+            author_name: "Replier".into(),
+            author_handle: "@replier".into(),
+            content: "good reply".into(),
+            timestamp: 1_001,
+            reply_to: root_post.id.clone(),
+            signature: None,
+        };
+        good_reply.id = good_reply.compute_id();
+        let rsig: Signature<MlDsa65> = rsk.sign(&good_reply.signing_payload());
+        good_reply.signature = Some(hex::encode(rsig.encode()));
+
+        let res = ThreadShard::update_state(
+            thread_params.clone(),
+            State::from(serde_json::to_vec(&ThreadShard::default()).unwrap()),
+            vec![UpdateData::Delta(StateDelta::from(
+                serde_json::to_vec(&ThreadDelta::Replies(vec![good_reply.clone()])).unwrap(),
+            ))],
+        )
+        .unwrap();
+        let out: ThreadShard = serde_json::from_slice(res.unwrap_valid().as_ref()).unwrap();
+        assert_eq!(
+            out.replies.len(),
+            1,
+            "reply bound to the root id is accepted"
+        );
+        assert!(out.replies.contains_key(&good_reply.id));
+
+        // The same reply offered to the WRONG thread (different root param) is
+        // rejected — its signed reply_to no longer matches that thread's root.
+        let wrong_params = Parameters::from(b"some_other_root_id".to_vec());
+        let res2 = ThreadShard::update_state(
+            wrong_params,
+            State::from(serde_json::to_vec(&ThreadShard::default()).unwrap()),
+            vec![UpdateData::Delta(StateDelta::from(
+                serde_json::to_vec(&ThreadDelta::Replies(vec![good_reply])).unwrap(),
+            ))],
+        )
+        .unwrap();
+        let out2: ThreadShard = serde_json::from_slice(res2.unwrap_valid().as_ref()).unwrap();
+        assert!(
+            out2.replies.is_empty(),
+            "reply must not land on the wrong thread"
+        );
+    }
+}

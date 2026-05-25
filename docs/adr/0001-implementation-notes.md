@@ -281,6 +281,35 @@ instance id — like the user shard). No migration entry (no prior thread-shard
 state). UI wiring + cross-contract quote/notification delivery are Phase 4 / the
 inbox shard (Phase 3).
 
+## Testing tiers
+
+- **Unit** — per-function `#[test]`s inside each contract crate's `test` module:
+  one `validate_state` / `update_state` / merge / truncation rule at a time, with
+  real ML-DSA-65 keys. The convergence and forgery regressions live here.
+- **Integration** — an `integration` module inside the user-shard and thread-shard
+  crates that drives the **full `ContractInterface` through the real sync
+  protocol**: a `sync_into` helper does `dst.summarize_state` →
+  `src.get_state_delta(summary)` → `dst.update_state(delta)` and asserts `dst`
+  stays valid, and `reconcile` runs it both directions and asserts the two
+  replicas reach byte-identical state. This covers what unit tests skip — the
+  summarize/delta wire path and the validate-after-merge invariant — across
+  multi-replica convergence (incl. equal-seq follow/unfollow and like/unlike
+  fixed points in both reconcile orders), adversarial-replica rejection (a forged
+  like / non-owner post in a peer's state must not propagate to an honest
+  replica), and cross-shard key consistency (a user-shard post's content id is the
+  thread-shard param, and a reply bound to it lands only on that thread).
+- **Deferred — WASM-in-node e2e**: these integration tests drive the contract as a
+  Rust library, not the compiled WASM inside a running node, so they do not catch
+  WASM-compilation or transport differences. A real-node tier (via the
+  `freenet:linux-test` / `freenet:local-dev` skills — publish the shards, drive
+  reply/like/quote + two-peer sync over the live WS) is the next testing slice;
+  it is heavier and not a per-PR CI fit. The identity delegate also still lacks
+  unit coverage (deferred from Phase 0).
+
+`cargo make test` now runs `cargo test --workspace` (was a hand-maintained subset
+that omitted the user/thread shards and the delegate) so every crate — and these
+integration tests — run in CI.
+
 ## Caveat: ADR vs. mail on windowing
 
 The ADR states the bounded-state window mirrors "how `freenet/mail` windows its
