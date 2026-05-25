@@ -53,21 +53,15 @@ const MAX_LIKES: usize = 50_000;
 /// Cap on distinct quote references retained.
 const MAX_QUOTES: usize = 5_000;
 
-/// Encoded ML-DSA-65 verifying key length in bytes (FIPS 204). A liker key in
-/// state must decode to exactly this.
-const ML_DSA_65_VK_LEN: usize = 1952;
-
-/// Per-liker like record: the `seq` of the op that last touched this liker and
-/// whether that op was a like. Merge keeps the higher `seq`; an unlike wins an
-/// equal-`seq` tie, so concurrent like/unlike converges regardless of arrival
-/// order (the same join-semilattice rule as the user shard's follows).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-struct LikeState {
-    seq: u64,
-    liked: bool,
-}
-
 /// Thread shard state: replies, likes, and quote references for one root post.
+///
+/// Likes store the **full signed `LikeRecord`**, not a stripped `(seq, liked)`
+/// view: a thread shard is public-write, so the contract must assume adversarial
+/// `UpdateData` and re-verify a like's signature on *every* path it can enter
+/// state (delta, full-state merge, sync delta) — exactly as replies and quotes
+/// do. Retaining the signature is what lets `validate_state` re-prove a like and
+/// makes a forged/overwritten like (any peer, no key) impossible (review
+/// CRITICAL). The ~3.3 KB/like is the cost of an unforgeable per-liker counter.
 #[derive(Serialize, Deserialize, Default)]
 struct ThreadShard {
     // Schema-tolerance: defaults so older/newer wire shapes still decode
@@ -76,9 +70,10 @@ struct ThreadShard {
     /// serialization).
     #[serde(default)]
     replies: BTreeMap<String, Post>,
-    /// Likes keyed by liker VK hex.
+    /// Likes keyed by liker VK hex; the value is the full signed record, kept so
+    /// every merge path can re-verify it.
     #[serde(default)]
-    likes: BTreeMap<String, LikeState>,
+    likes: BTreeMap<String, LikeRecord>,
     /// Quote references keyed by the quoting post's content-addressed id.
     #[serde(default)]
     quotes: BTreeMap<String, QuoteRef>,
@@ -143,10 +138,11 @@ fn quote_is_acceptable(quote: &QuoteRef, root: &str) -> bool {
     !root.is_empty() && quote.verify(root).is_ok() && verify_writer_cert(quote.writer_cert.as_ref())
 }
 
-/// Per-key like merge: does `(new)` replace the current entry for a liker?
-/// Higher `seq` wins; on equal `seq` an **unlike** (`!liked`) wins. Identical to
-/// the user-shard follow rule — a deterministic, order-independent join.
-fn like_replaces(new_seq: u64, new_liked: bool, cur: &LikeState) -> bool {
+/// Per-key like merge: does the incoming `(new_seq, new_liked)` replace the
+/// current record for a liker? Higher `seq` wins; on equal `seq` an **unlike**
+/// (`!liked`) wins. Identical to the user-shard follow rule — a deterministic,
+/// order-independent join.
+fn like_replaces(new_seq: u64, new_liked: bool, cur: &LikeRecord) -> bool {
     if new_seq != cur.seq {
         new_seq > cur.seq
     } else {
@@ -155,16 +151,18 @@ fn like_replaces(new_seq: u64, new_liked: bool, cur: &LikeState) -> bool {
     }
 }
 
-/// Insert/merge one accepted like into the map by the per-liker join rule.
-fn merge_like(likes: &mut BTreeMap<String, LikeState>, like: &LikeRecord) {
-    let next = LikeState {
-        seq: like.seq,
-        liked: like.liked,
-    };
+/// Re-verify one like for `root` and merge it by the per-liker join rule. Every
+/// path into `shard.likes` goes through here, so a like that does not carry a
+/// valid signature for its named signer + this thread is never stored — no
+/// caller may assume an upstream peer already checked it (public-write surface).
+fn merge_like(likes: &mut BTreeMap<String, LikeRecord>, like: LikeRecord, root: &str) {
+    if !like_is_acceptable(&like, root) {
+        return;
+    }
     match likes.get(&like.signer_pubkey) {
         Some(cur) if !like_replaces(like.seq, like.liked, cur) => {}
         _ => {
-            likes.insert(like.signer_pubkey.clone(), next);
+            likes.insert(like.signer_pubkey.clone(), like);
         }
     }
 }
@@ -191,7 +189,7 @@ fn truncate_replies(replies: &mut BTreeMap<String, Post>) {
 /// Truncate likes to `MAX_LIKES` as a function of the key set: evict tombstones
 /// (unlikes) first, then the largest liker key. Deterministic and order-
 /// independent, and bounds tombstone growth (AGENTS.md → "bounded surfaces").
-fn truncate_likes(likes: &mut BTreeMap<String, LikeState>) {
+fn truncate_likes(likes: &mut BTreeMap<String, LikeRecord>) {
     if likes.len() <= MAX_LIKES {
         return;
     }
@@ -241,9 +239,7 @@ fn apply_thread_delta(shard: &mut ThreadShard, delta: ThreadDelta, root: &str) {
         }
         ThreadDelta::Likes(likes) => {
             for like in likes {
-                if like_is_acceptable(&like, root) {
-                    merge_like(&mut shard.likes, &like);
-                }
+                merge_like(&mut shard.likes, like, root);
             }
         }
         ThreadDelta::Quotes(quotes) => {
@@ -291,12 +287,10 @@ fn apply_delta_bytes(
     Ok(())
 }
 
-/// Apply a `ThreadStateDelta` (the sync delta from `get_state_delta`). Replies
-/// and quotes are full self-verifying records (re-checked here). Likes arrive as
-/// `(signer, seq, liked)` *state* tuples — the signature was already proven when
-/// the sending peer admitted the like, so they merge by the same `(seq, liked)`
-/// join rule as a full-state merge (the same trust model as `UpdateData::State`,
-/// which also carries unsigned like state).
+/// Apply a `ThreadStateDelta` (the sync delta from `get_state_delta`). Every
+/// surface carries full self-verifying records — replies, quotes, **and likes**
+/// — each re-checked here. A like is never trusted on the sender's say-so (the
+/// sender may be adversarial); `merge_like` re-verifies its signature.
 fn apply_state_delta(shard: &mut ThreadShard, sd: ThreadStateDelta, root: &str) {
     for reply in sd.replies {
         if reply_is_acceptable(&reply, root) {
@@ -311,41 +305,25 @@ fn apply_state_delta(shard: &mut ThreadShard, sd: ThreadStateDelta, root: &str) 
                 .or_insert(quote);
         }
     }
-    for (signer, seq, liked) in sd.likes {
-        if hex::decode(&signer)
-            .map(|b| b.len() == ML_DSA_65_VK_LEN)
-            .unwrap_or(false)
-        {
-            let state = LikeState { seq, liked };
-            match shard.likes.get(&signer) {
-                Some(cur) if !like_replaces(seq, liked, cur) => {}
-                _ => {
-                    shard.likes.insert(signer, state);
-                }
-            }
-        }
+    for like in sd.likes {
+        merge_like(&mut shard.likes, like, root);
     }
 }
 
 /// Full-state merge: fold every surface of `other` into `shard` under the same
 /// acceptance + convergence rules as a delta, so a peer syncing its latest state
-/// reconciles replies + likes + quotes (not only replies).
+/// reconciles replies + likes + quotes (not only replies). Every entry is
+/// re-verified — `other` came over the wire from a possibly-adversarial peer, so
+/// "it was already validated upstream" is not an assumption the contract may make
+/// (review CRITICAL / M-1).
 fn merge_state(shard: &mut ThreadShard, other: ThreadShard, root: &str) {
     for (id, reply) in other.replies {
         if reply_is_acceptable(&reply, root) {
             shard.replies.entry(id).or_insert(reply);
         }
     }
-    for (signer, state) in other.likes {
-        // Reconstruct a record-shaped view for the join rule. The incoming state
-        // already passed validation as part of a self-verified record upstream;
-        // here we merge by (seq, liked) deterministically.
-        match shard.likes.get(&signer) {
-            Some(cur) if !like_replaces(state.seq, state.liked, cur) => {}
-            _ => {
-                shard.likes.insert(signer, state);
-            }
-        }
+    for (_signer, like) in other.likes {
+        merge_like(&mut shard.likes, like, root);
     }
     for (qid, quote) in other.quotes {
         if quote_is_acceptable(&quote, root) {
@@ -374,16 +352,11 @@ impl ContractInterface for ThreadShard {
                 return Err(ContractError::InvalidState);
             }
         }
-        // Likes are stored as (seq, liked) keyed by signer. The full signature
-        // was checked at update time and is not retained in state, so the
-        // structural invariant here is that the key decodes as a valid ML-DSA-65
-        // VK (the right byte length) — a state carrying a non-VK liker key was
-        // never produced by update_state.
-        for signer in shard.likes.keys() {
-            let is_vk = hex::decode(signer)
-                .map(|b| b.len() == ML_DSA_65_VK_LEN)
-                .unwrap_or(false);
-            if !is_vk {
+        // Every like must self-verify for this thread and key under its own
+        // signer — the same full re-proof update_state performs, so the two
+        // halves agree and a forged like cannot validate (review CRITICAL).
+        for (signer, like) in &shard.likes {
+            if signer != &like.signer_pubkey || !like_is_acceptable(like, &root) {
                 return Err(ContractError::InvalidState);
             }
         }
@@ -436,6 +409,9 @@ impl ContractInterface for ThreadShard {
         // the requester is missing. Keys are deterministic (BTreeMap order).
         let summary = ThreadSummary {
             replies: shard.replies.keys().cloned().collect(),
+            // (signer, seq, liked) is enough to diff which likers the requester
+            // is stale on; the full signed record is shipped in the delta, not
+            // the summary.
             likes: shard
                 .likes
                 .iter()
@@ -479,17 +455,17 @@ impl ContractInterface for ThreadShard {
             .filter(|(qid, _)| !have_quotes.contains(qid))
             .map(|(_, q)| q.clone())
             .collect();
-        // Likes the requester lacks or has at a lower (seq, liked-rank). We ship
-        // the current state view as a reconstructed record WITHOUT a signature;
-        // the receiving merge_state path merges by (seq, liked) deterministically.
-        let likes_delta: Vec<(String, u64, bool)> = shard
+        // Likes the requester lacks or has at a lower (seq, liked-rank). Ship the
+        // **full signed record** so the receiver re-verifies it (a sync delta is
+        // no more trusted than any other delta — review CRITICAL / MIN-1).
+        let likes_delta: Vec<LikeRecord> = shard
             .likes
             .iter()
             .filter(|(k, v)| match have_likes.get(*k) {
                 Some((seq, liked)) => v.seq > *seq || (v.seq == *seq && *liked && !v.liked),
                 None => true,
             })
-            .map(|(k, v)| (k.clone(), v.seq, v.liked))
+            .map(|(_, v)| v.clone())
             .collect();
 
         let delta = ThreadStateDelta {
@@ -515,18 +491,17 @@ struct ThreadSummary {
     quotes: Vec<String>,
 }
 
-/// The delta `get_state_delta` ships. Replies/quotes are full self-verifying
-/// records; likes are (signer, seq, liked) tuples merged by the join rule. This
-/// is intentionally NOT a `ThreadDelta` — it can convey all three surfaces in
-/// one message and carries the like *state* (not a re-signed record), which the
-/// merge path accepts via the full-state code path. Decoded by `apply_delta_bytes`
-/// → full-`ThreadShard` arm after reshaping below.
+/// The delta `get_state_delta` ships: all three surfaces in one message, each a
+/// full self-verifying record (replies, likes, quotes). It is intentionally NOT
+/// a `ThreadDelta` so it can convey every surface at once; `apply_delta_bytes`
+/// decodes it via `apply_state_delta`, which re-verifies each entry — a sync
+/// delta is no more trusted than any other.
 #[derive(Serialize, Deserialize, Default)]
 struct ThreadStateDelta {
     #[serde(default)]
     replies: Vec<Post>,
     #[serde(default)]
-    likes: Vec<(String, u64, bool)>,
+    likes: Vec<LikeRecord>,
     #[serde(default)]
     quotes: Vec<QuoteRef>,
 }
@@ -713,13 +688,7 @@ mod test {
         let r = signed_reply([1u8; 32], "r", 100);
         a.replies.insert(r.id.clone(), r);
         let lk = signed_like([2u8; 32], 1, true);
-        a.likes.insert(
-            lk.signer_pubkey.clone(),
-            LikeState {
-                seq: 1,
-                liked: true,
-            },
-        );
+        a.likes.insert(lk.signer_pubkey.clone(), lk);
 
         // Merge a's full state into an empty shard via UpdateData::State.
         let out = run_update(
@@ -806,13 +775,7 @@ mod test {
         let r = signed_reply([1u8; 32], "r", 100);
         src.replies.insert(r.id.clone(), r);
         let lk = signed_like([2u8; 32], 3, true);
-        src.likes.insert(
-            lk.signer_pubkey.clone(),
-            LikeState {
-                seq: 3,
-                liked: true,
-            },
-        );
+        src.likes.insert(lk.signer_pubkey.clone(), lk);
         let q = signed_quote([3u8; 32], "qa");
         src.quotes.insert(q.quote_post_id.clone(), q);
 
@@ -831,6 +794,83 @@ mod test {
         assert_eq!(out.replies.len(), 1);
         assert_eq!(out.likes.len(), 1);
         assert_eq!(out.quotes.len(), 1);
+    }
+
+    #[test]
+    fn forged_like_via_full_state_merge_rejected() {
+        // CRITICAL regression: an adversary crafts a ThreadShard whose `likes`
+        // map carries an unsigned (or mis-signed) like attributed to a victim VK,
+        // and ships it as UpdateData::State. merge_state must re-verify and drop
+        // it — no key, no like.
+        let victim = vk_hex([2u8; 32]);
+        let mut forged = ThreadShard::default();
+        forged.likes.insert(
+            victim.clone(),
+            LikeRecord {
+                signer_pubkey: victim.clone(),
+                seq: 9,
+                liked: true,
+                writer_cert: None,
+                signature: None, // forged: no valid signature
+            },
+        );
+        let out = run_update(
+            ThreadShard::default(),
+            vec![UpdateData::State(state_of(&forged))],
+        );
+        assert!(
+            out.likes.is_empty(),
+            "forged unsigned like must not be stored"
+        );
+    }
+
+    #[test]
+    fn forged_like_cannot_suppress_genuine_like() {
+        // A genuine like exists; an attacker tries to overwrite it with a forged
+        // higher-seq unlike attributed to the same victim, via full-state merge.
+        let genuine = signed_like([2u8; 32], 1, true);
+        let victim = genuine.signer_pubkey.clone();
+        let base = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Likes(vec![genuine]))],
+        );
+        assert!(base.likes[&victim].liked);
+
+        let mut forged = ThreadShard::default();
+        forged.likes.insert(
+            victim.clone(),
+            LikeRecord {
+                signer_pubkey: victim.clone(),
+                seq: 99,
+                liked: false,
+                writer_cert: None,
+                signature: None, // forged unlike
+            },
+        );
+        let out = run_update(base, vec![UpdateData::State(state_of(&forged))]);
+        // Genuine like survives; forged suppression is dropped.
+        assert!(out.likes[&victim].liked);
+        assert_eq!(out.likes[&victim].seq, 1);
+    }
+
+    #[test]
+    fn validate_rejects_forged_like_state() {
+        // The two halves must agree: a state update_state would never produce
+        // (an unsigned like) must fail validate_state.
+        let victim = vk_hex([2u8; 32]);
+        let mut shard = ThreadShard::default();
+        shard.likes.insert(
+            victim.clone(),
+            LikeRecord {
+                signer_pubkey: victim,
+                seq: 1,
+                liked: true,
+                writer_cert: None,
+                signature: None,
+            },
+        );
+        let res = ThreadShard::validate_state(params(), state_of(&shard), RelatedContracts::new());
+        assert!(!matches!(res, Ok(ValidateResult::Valid)));
     }
 
     #[test]

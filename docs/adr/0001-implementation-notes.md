@@ -255,18 +255,26 @@ Deltas are a tagged `ThreadDelta` enum (`Replies` | `Likes` | `Quotes`).
 `update_state` iterates **every** `UpdateData` item and the `State` /
 `StateAndDelta` arms do a full-`ThreadShard` merge, so a peer syncing state
 reconciles all three surfaces. `summarize_state` returns the per-surface key sets
-(plus each like's `(seq, liked)`), and `get_state_delta` ships a `ThreadStateDelta`
-carrying exactly what the requester lacks: full reply/quote records (re-verified
-on apply) and like *state* tuples (merged by the join rule, unsigned — the same
-trust model as a full-state merge, since the sender already proved the signature
-when it admitted the like). `apply_delta_bytes` decodes `ThreadStateDelta` too, so
-the sync delta round-trips (regression: `get_state_delta_output_is_applyable`).
+(plus each like's `(seq, liked)` for diffing), and `get_state_delta` ships a
+`ThreadStateDelta` carrying exactly what the requester lacks: full self-verifying
+records for **all three** surfaces, including likes. `apply_delta_bytes` decodes
+`ThreadStateDelta` too, so the sync delta round-trips (regression:
+`get_state_delta_output_is_applyable`).
 
-Likes are stored as `(seq, liked)` without retaining the signature, so
-`validate_state` cannot re-prove the like crypto from state alone; it enforces the
-structural invariant (liker key is a valid-length VK) and relies on `update_state`
-having verified the full signature at admission. This is the one place the thread
-shard's validate is weaker than its update — noted deliberately.
+**Likes store the full signed `LikeRecord`, re-verified on every path.** A
+public-write contract must assume adversarial `UpdateData`, so a like is re-checked
+by `merge_like` (→ `LikeRecord::verify`) on *every* write path — `ThreadDelta::Likes`,
+full-state `merge_state`, and the sync `apply_state_delta` — and `validate_state`
+re-proves every stored like's signature. There is no "the sender already verified
+it" shortcut: an earlier draft stored likes as unsigned `(seq, liked)` and trusted
+the full-state / sync paths, which let *any* peer forge, suppress, or overwrite any
+user's like with no private key (review **CRITICAL**, fifth round — a signature
+bypass, the same "every write path must verify, not just the primary one" lesson as
+the convergence rounds). Retaining the signature (~3.3 KB/like) is the price of an
+unforgeable per-liker counter on a public surface. Replies and quotes always worked
+this way; likes were the lone exception and now match. `merge_state` likewise
+re-verifies replies/quotes (it had trusted them) so a full-state sync cannot inject
+anything a delta could not (review M-1).
 
 This adds the `thread_shard_code_hash` build artifact (parameterized, so no single
 instance id — like the user shard). No migration entry (no prior thread-shard

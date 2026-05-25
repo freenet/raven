@@ -338,6 +338,21 @@ If `update_state` guarantees an invariant (e.g. no duplicate ids), then
 halves disagree and a peer can inject state the updater would never produce.
 (review MAJOR-1, #25 re-review)
 
+### Every write path verifies — there is no "trusted" delta (review CRITICAL, #27)
+
+A contract has multiple ways state enters it: `UpdateData::Delta`,
+`UpdateData::State` (a full-state merge), `StateAndDelta`, and any sync delta from
+`get_state_delta`. **All of them carry attacker-controlled bytes** — a peer can
+ship a hand-crafted `State`. So a signed entry must be **re-verified on every one
+of those paths**, never only on the "primary" delta path. Do not store a
+signature-stripped projection of a signed record and trust that an upstream peer
+checked it — that is a forgery primitive on any public-write surface (an unsigned
+`(seq, liked)` like let any peer forge/suppress/overwrite any user's like with no
+key). Route every path through one verify-then-merge helper, retain the signature
+in state, and have `validate_state` re-prove it. If retaining the signature is too
+costly, the surface cannot be a self-verifying CRDT and needs a different design —
+not a trust shortcut.
+
 ### No `unwrap()` / panic in contract WASM
 
 A panic in `update_state` / `validate_state` / `summarize_state` /
