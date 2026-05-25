@@ -184,7 +184,7 @@ fn tombstone_ids(shard: &InboxShard) -> std::collections::HashSet<String> {
 fn notif_is_acceptable(id: &str, notif: &Notification, owner: &str) -> bool {
     !owner.is_empty()
         && id.len() <= MAX_ID_LEN
-        && id == &notif.id(owner)
+        && id == notif.id(owner)
         && notif.verify(owner).is_ok()
         && verify_writer_cert(notif.writer_cert.as_ref())
 }
@@ -733,7 +733,11 @@ mod test {
         assert_eq!(base.notifs.len(), 1);
 
         // PruneIds carries (id, notif_seq) pairs; the owner attests both.
-        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[id.clone()]), 1);
+        let op = prune_op(
+            OpType::PruneIds,
+            encode_prune_ids(std::slice::from_ref(&id)),
+            1,
+        );
         let out = run_update(base, vec![delta_item(&InboxDelta::Prune(op))]);
         assert!(out.notifs.is_empty(), "pruned notif removed");
         assert!(tombstone_ids(&out).contains(&id), "tombstone recorded");
@@ -745,7 +749,11 @@ mod test {
         // notif. The tombstone must keep it out (no resurrection).
         let n = signed_notif([2u8; 32], NotifKind::Reply, "p", 5);
         let id = n.id(&owner_vk());
-        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[id.clone()]), 1);
+        let op = prune_op(
+            OpType::PruneIds,
+            encode_prune_ids(std::slice::from_ref(&id)),
+            1,
+        );
 
         // Prune first, then the (late) re-delivery arrives.
         let pruned = run_update(
@@ -809,7 +817,7 @@ mod test {
         let attacker = MlDsa65::from_seed(&[2u8; 32].into());
         let mut op = SignedOp {
             op_type: OpType::PruneIds,
-            payload: encode_prune_ids(&[id.clone()]),
+            payload: encode_prune_ids(std::slice::from_ref(&id)),
             seq: 1,
             signer_pubkey: hex::encode(attacker.verifying_key().encode()),
             signature: None,
@@ -837,7 +845,7 @@ mod test {
         let sk = MlDsa65::from_seed(&owner_seed().into());
         let mut op = SignedOp {
             op_type: OpType::PruneIds,
-            payload: encode_prune_ids(&[id]),
+            payload: encode_prune_ids(std::slice::from_ref(&id)),
             seq: 1,
             signer_pubkey: owner_vk(),
             signature: None,
@@ -863,8 +871,10 @@ mod test {
         );
 
         // A peer state that holds the owner-signed high-water op (seq 5), no notifs.
-        let mut pruned_peer = InboxShard::default();
-        pruned_peer.prune_before_op = Some(prune_op(OpType::PruneBefore, Vec::new(), 5));
+        let pruned_peer = InboxShard {
+            prune_before_op: Some(prune_op(OpType::PruneBefore, Vec::new(), 5)),
+            ..Default::default()
+        };
 
         let out = run_update(with_notif, vec![UpdateData::State(state_of(&pruned_peer))]);
         assert!(
@@ -888,27 +898,31 @@ mod test {
         );
         assert_eq!(honest.notifs.len(), 1);
 
-        // Forged: a PruneBefore op with seq=u64::MAX but NO valid owner signature.
-        let mut malicious = InboxShard::default();
-        malicious.prune_before_op = Some(SignedOp {
-            op_type: OpType::PruneBefore,
-            payload: Vec::new(),
-            seq: u64::MAX,
-            signer_pubkey: owner_vk(),
-            signature: None, // forged: not signed
-        });
-        // Also a forged tombstone op naming the honest notif's id.
+        // Forged: a PruneBefore op with seq=u64::MAX but NO valid owner signature,
+        // plus a forged tombstone op naming the honest notif's id.
         let id = honest.notifs.keys().next().unwrap().clone();
-        malicious.prune_ids_ops.insert(
+        let mut prune_ids_ops = BTreeMap::new();
+        prune_ids_ops.insert(
             7,
             SignedOp {
                 op_type: OpType::PruneIds,
-                payload: encode_prune_ids(&[id]),
+                payload: encode_prune_ids(std::slice::from_ref(&id)),
                 seq: 7,
                 signer_pubkey: owner_vk(),
                 signature: None, // forged
             },
         );
+        let malicious = InboxShard {
+            prune_before_op: Some(SignedOp {
+                op_type: OpType::PruneBefore,
+                payload: Vec::new(),
+                seq: u64::MAX,
+                signer_pubkey: owner_vk(),
+                signature: None, // forged: not signed
+            }),
+            prune_ids_ops,
+            ..Default::default()
+        };
 
         let out = run_update(honest, vec![UpdateData::State(state_of(&malicious))]);
         assert_eq!(
@@ -928,14 +942,16 @@ mod test {
     fn validate_rejects_forged_prune_before_op() {
         // A state carrying an unsigned/forged PruneBefore op must fail validate —
         // update_state only ever stores verified ops, so the two halves agree.
-        let mut shard = InboxShard::default();
-        shard.prune_before_op = Some(SignedOp {
-            op_type: OpType::PruneBefore,
-            payload: Vec::new(),
-            seq: 99,
-            signer_pubkey: owner_vk(),
-            signature: None,
-        });
+        let shard = InboxShard {
+            prune_before_op: Some(SignedOp {
+                op_type: OpType::PruneBefore,
+                payload: Vec::new(),
+                seq: 99,
+                signer_pubkey: owner_vk(),
+                signature: None,
+            }),
+            ..Default::default()
+        };
         let res = InboxShard::validate_state(params(), state_of(&shard), RelatedContracts::new());
         assert!(!matches!(res, Ok(ValidateResult::Valid)));
     }
@@ -984,7 +1000,11 @@ mod test {
         shard.notifs.insert(id.clone(), n);
         // Genuine owner-signed PruneIds op tombstoning that id (notif_seq 5, at or
         // above the high-water of 0, so the tombstone is live).
-        let op = prune_op(OpType::PruneIds, encode_prune_ids(&[id]), 1);
+        let op = prune_op(
+            OpType::PruneIds,
+            encode_prune_ids(std::slice::from_ref(&id)),
+            1,
+        );
         shard.prune_ids_ops.insert(1, op);
         let res = InboxShard::validate_state(params(), state_of(&shard), RelatedContracts::new());
         assert!(!matches!(res, Ok(ValidateResult::Valid)));
@@ -1065,7 +1085,11 @@ mod test {
         let pruned_id = signed_notif([6u8; 32], NotifKind::Reply, "gone", 9).id(&owner_vk());
         src.prune_ids_ops.insert(
             3,
-            prune_op(OpType::PruneIds, encode_prune_ids(&[pruned_id.clone()]), 3),
+            prune_op(
+                OpType::PruneIds,
+                encode_prune_ids(std::slice::from_ref(&pruned_id)),
+                3,
+            ),
         );
 
         let empty_summary =
@@ -1140,7 +1164,7 @@ mod test {
                 delta_item(&InboxDelta::Notifs(vec![n.clone()])),
                 delta_item(&InboxDelta::Prune(prune_op(
                     OpType::PruneIds,
-                    encode_prune_ids(&[id.clone()]),
+                    encode_prune_ids(std::slice::from_ref(&id)),
                     1,
                 ))),
             ],
@@ -1334,7 +1358,7 @@ mod integration {
             &a_delivered,
             vec![delta(&InboxDelta::Prune(prune_op(
                 OpType::PruneIds,
-                encode_prune_ids(&[id.clone()]),
+                encode_prune_ids(std::slice::from_ref(&id)),
                 1,
             )))],
         );
