@@ -46,6 +46,13 @@ pub enum OpType {
     Follow,
     /// Remove one or more pubkeys from the follow set.
     Unfollow,
+    /// Inbox shard: prune the explicit notification ids carried in `payload`
+    /// (a length-prefixed list of hex notif ids). Owner-only.
+    PruneIds,
+    /// Inbox shard: advance the inbox high-water mark to `seq`, dropping every
+    /// notification whose own `seq` is strictly below it. `payload` is empty.
+    /// Owner-only.
+    PruneBefore,
 }
 
 impl OpType {
@@ -56,6 +63,8 @@ impl OpType {
             OpType::Profile => b"profile",
             OpType::Follow => b"follow",
             OpType::Unfollow => b"unfollow",
+            OpType::PruneIds => b"prune-ids",
+            OpType::PruneBefore => b"prune-before",
         }
     }
 }
@@ -143,6 +152,11 @@ impl SignedOp {
 /// pass its own distinct context, so an op signed for one shard type can never
 /// verify against another.
 pub const USER_SHARD_CONTEXT: &[u8] = b"raven:user-shard:v1";
+
+/// Shard-context tag for the **inbox shard**, mixed into every inbox-shard
+/// owner-prune `SignedOp` signature. Distinct from [`USER_SHARD_CONTEXT`] so an
+/// owner-prune op cannot be replayed into the user shard (or vice versa).
+pub const INBOX_SHARD_CONTEXT: &[u8] = b"raven:inbox-shard:v1";
 
 /// The profile register carried in a [`OpType::Profile`] op's payload. Bounded
 /// so a malicious owner cannot bloat their own shard without limit (the only
