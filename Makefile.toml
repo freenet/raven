@@ -124,7 +124,21 @@ printf '%s' "$hash" > "$ROOT/build/user_shard_code_hash"
 mkdir -p "$ROOT/web/public"
 cp "$WASM_RAW" "$ROOT/web/public/user_shard.wasm"
 printf '%s' "$hash" > "$ROOT/web/user_shard_code_hash.txt"
-echo "wrote build/user_shard_code_hash + web/public/user_shard.wasm + web/user_shard_code_hash.txt: $hash"
+# Load-bearing safety check: the browser derives each owner's contract key as
+# blake3(code_hash || params) and PUTs the raw wasm, which the node re-hashes to
+# the same code hash. If the shipped wasm's blake3 ever stops equalling the
+# injected (base58) code hash — e.g. fdev packaging drift, or copying the
+# packaged container by mistake — every shard key silently mismatches and all
+# GET/PUT no-op. Fail the build here instead. Compare hex(b3sum raw wasm) to the
+# hex of the base58-decoded code hash (bs58 is in web/node_modules).
+wasm_hex=$(b3sum --no-names "$ROOT/web/public/user_shard.wasm" | tr -d '[:space:]')
+hash_hex=$(cd "$ROOT/web" && node -e "import('bs58').then(m=>process.stdout.write(Buffer.from(m.default.decode(process.argv[1])).toString('hex')))" "$hash")
+if [ "$wasm_hex" != "$hash_hex" ]; then
+    echo "ERROR: shipped user_shard.wasm blake3 ($wasm_hex) != injected code hash ($hash_hex / $hash)" >&2
+    echo "       Did you ship the packaged build/freenet container instead of the raw target wasm?" >&2
+    exit 1
+fi
+echo "wrote build/user_shard_code_hash + web/public/user_shard.wasm + web/user_shard_code_hash.txt: $hash (verified blake3 match)"
 '''
 
 [tasks.build-thread-shard]

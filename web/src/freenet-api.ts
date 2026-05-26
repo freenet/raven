@@ -144,8 +144,20 @@ export class FreenetConnection {
   private userShardKey: ContractKey | null = null;
   /** Base58 instance id of {@link userShardKey}, for response key matching. */
   private userShardInstanceId: string | null = null;
-  /** Guards against re-running user-shard init for the same owner. */
-  private userShardInit = false;
+  /** Guards against concurrent user-shard init for the SAME owner. Reset when
+   * the owner VK changes (identity switch) so the new shard re-initialises. */
+  private userShardInitOwner: string | null = null;
+  /**
+   * Resolves once {@link startup} (migration loop + legacy load/subscribe) has
+   * finished. The stdlib resolves GET responses from a single FIFO queue with
+   * no request correlation, so issuing the shard's probe/load GETs while the
+   * migration loop is still awaiting its own GETs lets the two steal each
+   * other's responses (a shard NotFound could reject a migration GET, and a
+   * legacy response could resolve the shard probe → a spurious "exists" → the
+   * shard is never PUT). Serialise shard init behind this barrier.
+   */
+  private startupDone: Promise<void> = Promise.resolve();
+  private resolveStartupDone: () => void = () => {};
 
   constructor(callbacks: FreenetCallbacks) {
     this.callbacks = callbacks;
@@ -221,9 +233,17 @@ export class FreenetConnection {
 
   /** Run the migration loop, then load + subscribe to the current contract. */
   private async startup(): Promise<void> {
-    await this.runStartupMigrations();
-    this.loadState();
-    this.subscribeToUpdates();
+    this.startupDone = new Promise((resolve) => {
+      this.resolveStartupDone = resolve;
+    });
+    try {
+      await this.runStartupMigrations();
+      this.loadState();
+      this.subscribeToUpdates();
+    } finally {
+      // Unblock any user-shard init that arrived (via setUser) mid-startup.
+      this.resolveStartupDone();
+    }
   }
 
   /**
@@ -320,8 +340,12 @@ export class FreenetConnection {
   }
 
   loadState(): void {
-    if (!this.api || !this.contractKey) return;
-    const req = new GetRequest(this.contractKey, true);
+    // Once the user shard is active it is the sole feed source; otherwise read
+    // the legacy global contract. (index.ts refreshes via loadState after a
+    // publish, so this must follow the same target writes go to.)
+    const target = this.userShardKey ?? this.contractKey;
+    if (!this.api || !target) return;
+    const req = new GetRequest(target, true);
     this.api.get(req).catch((e) =>
       console.error("[freenet] Get request failed:", e)
     );
@@ -351,15 +375,18 @@ export class FreenetConnection {
     // state never lands in the live feed.
     if (this.migrating) return;
     try {
+      const respId = this.responseInstanceId(response.key);
+      const isShard =
+        this.userShardInstanceId !== null &&
+        respId === this.userShardInstanceId;
+      // Once the shard is active it is the sole feed source — drop any straggler
+      // legacy-contract GET response so the two feeds never mix.
+      if (this.usingUserShard && !isShard) return;
       const decoder = new TextDecoder("utf8");
       const stateJson = decoder.decode(Uint8Array.from(response.state));
       // Route by the response's key: user-shard state is a `UserShard`
       // (`{posts, profile, follows}`); the legacy global feed is a
       // `PostsFeedState` (`{posts}`).
-      const respId = this.responseInstanceId(response.key);
-      const isShard =
-        this.userShardInstanceId !== null &&
-        respId === this.userShardInstanceId;
       const rawPosts = isShard
         ? (JSON.parse(stateJson) as UserShardState).posts ?? []
         : (JSON.parse(stateJson) as PostsFeedState).posts;
@@ -374,6 +401,14 @@ export class FreenetConnection {
 
   private handleUpdateNotification(notification: UpdateNotification): void {
     try {
+      // Once the shard is active, only its update notifications drive the feed;
+      // ignore notifications from the still-subscribed legacy contract (the
+      // stdlib has no unsubscribe), so writes-to-shard / reads-from-shard stay
+      // consistent.
+      if (this.usingUserShard) {
+        const notifId = this.responseInstanceId(notification.key);
+        if (notifId !== this.userShardInstanceId) return;
+      }
       const updateData = notification.update as UpdateData;
       if (!updateData || updateData.updateDataType !== UpdateDataType.DeltaUpdate) return;
       const delta = updateData.updateData as { delta: number[] } | null;
@@ -413,7 +448,10 @@ export class FreenetConnection {
    * load + subscribe so the feed reflects the owner's shard. ADR-0001 Phase 4.
    */
   private async initUserShard(): Promise<void> {
-    if (!this.api || !this.ownerVkHex || this.userShardInit) return;
+    const owner = this.ownerVkHex;
+    // Re-entry guard keyed by owner: a duplicate Identity for the same owner is
+    // a no-op, but a new owner (identity switch) must re-initialise.
+    if (!this.api || !owner || this.userShardInitOwner === owner) return;
     const codeHash =
       typeof __USER_SHARD_CODE_HASH__ !== "undefined"
         ? __USER_SHARD_CODE_HASH__
@@ -422,13 +460,21 @@ export class FreenetConnection {
       console.warn("[user-shard] No code hash injected — staying on legacy feed");
       return;
     }
-    this.userShardInit = true;
+    this.userShardInitOwner = owner;
     try {
-      const vkBytes = hexToBytes(this.ownerVkHex);
+      // Wait until the startup migration loop + legacy load/subscribe have
+      // finished before issuing any shard GET. The stdlib's GET response queue
+      // is an uncorrelated FIFO; overlapping the two flows lets them steal each
+      // other's responses (see startupDone).
+      await this.startupDone;
+      // A newer identity may have arrived while we awaited — bail if so.
+      if (this.ownerVkHex !== owner) return;
+
+      const vkBytes = hexToBytes(owner);
       this.userShardKey = deriveShardContractKey(codeHash, vkBytes);
       this.userShardInstanceId = this.userShardKey.encode();
       console.log(
-        `[user-shard] derived key ${this.userShardInstanceId} for owner ${this.ownerVkHex.slice(0, 8)}…`,
+        `[user-shard] derived key ${this.userShardInstanceId} for owner ${owner.slice(0, 8)}…`,
       );
 
       // Probe for an existing instance. A brand-new owner has none, so PUT the
@@ -446,10 +492,19 @@ export class FreenetConnection {
       // Fall back to the legacy feed already wired via this.contractKey.
       this.userShardKey = null;
       this.userShardInstanceId = null;
+      this.userShardInitOwner = null;
     }
   }
 
-  /** GET the user shard to check whether the node already has this instance. */
+  /**
+   * GET the user shard to check whether the node already has this instance.
+   * A genuine not-found AND a transient timeout both return false → we PUT. A
+   * spurious PUT over an already-existing shard is safe: Freenet PUT-of-existing
+   * runs the contract's CRDT merge (`update_state` → `merge_state`), not an
+   * overwrite, so PUTting the empty `{"posts":[]}` initial state merges to a
+   * no-op (posts union / profile LWW / follows set-union). The only cost is
+   * re-sending the WASM on a slow GET.
+   */
   private async userShardExists(): Promise<boolean> {
     if (!this.api || !this.userShardKey) return false;
     try {
@@ -459,7 +514,6 @@ export class FreenetConnection {
       );
       return true;
     } catch {
-      // A not-found / timeout means we should PUT to instantiate.
       return false;
     }
   }

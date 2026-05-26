@@ -435,8 +435,10 @@ packaged `build/freenet/…` file has extra framing and hashes differently. On P
 the node re-hashes the `data` bytes to derive the key, so shipping the packaged
 file would derive a key that never matches the GET key. `Makefile.toml`
 `build-user-shard` copies the **raw** wasm to `web/public/user_shard.wasm` and
-injects its base58 code hash as `__USER_SHARD_CODE_HASH__`; a build-time check is
-that `b3sum web/public/user_shard.wasm` equals the injected code hash.
+injects its base58 code hash as `__USER_SHARD_CODE_HASH__`. The task then fails
+the build unless `b3sum web/public/user_shard.wasm` (hex) equals the
+base58-decoded injected code hash (hex) — the one assertion that catches a
+raw-vs-packaged mix-up, which would otherwise be a silent network-wide no-op.
 
 ### Delta form differs from the legacy feed
 
