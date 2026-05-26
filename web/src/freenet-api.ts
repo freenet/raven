@@ -203,6 +203,8 @@ export class FreenetConnection {
   private threadInstanceToRoot = new Map<string, string>();
   /** Likes awaiting a delegate `SignedLike`, keyed by nonce. */
   private pendingLikes: PendingLike[] = [];
+  /** Per-thread debounce timers coalescing like-refresh GETs (root id → timer). */
+  private likeRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(callbacks: FreenetCallbacks) {
     this.callbacks = callbacks;
@@ -700,10 +702,6 @@ export class FreenetConnection {
     } catch {
       // not found / timeout → PUT below (a spurious re-PUT merges to a no-op)
     }
-    const codeHash =
-      typeof __THREAD_SHARD_CODE_HASH__ !== "undefined"
-        ? __THREAD_SHARD_CODE_HASH__
-        : "";
     const wasm = await this.fetchThreadWasm();
     const codeHashBytes = key.codePart();
     const code = new ContractCodeT(
@@ -720,7 +718,6 @@ export class FreenetConnection {
     const initialState = new TextEncoder().encode(
       JSON.stringify({ replies: {}, likes: {}, quotes: {} }),
     );
-    void codeHash;
     await this.api.put(
       new PutRequest(container, Array.from(initialState), undefined, false, false),
     );
@@ -796,8 +793,9 @@ export class FreenetConnection {
         new DeltaUpdate(Array.from(deltaBytes)),
       );
       await this.api.update(new UpdateRequest(key, update));
-      // Read back the authoritative aggregate once the update lands.
-      this.refreshLikes(signed.root_post_id);
+      // Read back the authoritative aggregate once our own update lands — do it
+      // immediately (not debounced) for snappy feedback on the user's own like.
+      this.refreshLikesNow(signed.root_post_id);
       return true;
     } catch (e) {
       console.error("[thread] failed to send like:", e);
@@ -805,14 +803,31 @@ export class FreenetConnection {
     }
   }
 
-  /** GET a post's thread shard to recompute its like aggregate. */
-  private refreshLikes(rootPostId: string): void {
+  /** GET a post's thread shard now to recompute its like aggregate. */
+  private refreshLikesNow(rootPostId: string): void {
     if (!this.api) return;
     const key = this.threadKeyFor(rootPostId);
     if (!key) return;
     this.api
       .get(new GetRequest(key, true))
       .catch((e) => console.error("[thread] like refresh GET failed:", e));
+  }
+
+  /**
+   * Debounced like-refresh: coalesce a burst of thread update notifications
+   * (e.g. a viral post drawing many remote likes) into one GET per thread per
+   * window, instead of one full-state GET per notification.
+   */
+  private refreshLikes(rootPostId: string): void {
+    const existing = this.likeRefreshTimers.get(rootPostId);
+    if (existing) clearTimeout(existing);
+    this.likeRefreshTimers.set(
+      rootPostId,
+      setTimeout(() => {
+        this.likeRefreshTimers.delete(rootPostId);
+        this.refreshLikesNow(rootPostId);
+      }, 500),
+    );
   }
 
   private subscribeThread(key: ContractKey): void {
@@ -822,10 +837,16 @@ export class FreenetConnection {
       .catch((e) => console.error("[thread] subscribe failed:", e));
   }
 
-  /** Drop a pending like by nonce (delegate returned an Error for it). */
-  dropPendingLike(nonce: string): void {
+  /**
+   * Drop a pending like by nonce (delegate returned an Error for it). Returns
+   * true if a pending like was actually dropped, so the caller can revert the
+   * optimistic UI toggle for that like.
+   */
+  dropPendingLike(nonce: string): boolean {
     const idx = this.pendingLikes.findIndex((p) => p.nonce === nonce);
-    if (idx !== -1) this.pendingLikes.splice(idx, 1);
+    if (idx === -1) return false;
+    this.pendingLikes.splice(idx, 1);
+    return true;
   }
 
   /**

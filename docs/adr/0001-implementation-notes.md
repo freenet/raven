@@ -504,7 +504,31 @@ the same post.
 
 The user-shard's raw-wasm mirror + `b3sum == code_hash` build check (slice 1) is
 now `scripts/mirror-shard-wasm.sh`, called by both `build-user-shard` and
-`build-thread-shard`, so the load-bearing safety check is defined once.
+`build-thread-shard`, so the load-bearing safety check is defined once. Note this
+*adds* behavior to `build-thread-shard` (it previously only wrote the code hash;
+it now also mirrors the raw wasm to `web/public/` and runs the b3sum check).
+
+### Known limitations / follow-ups (slice 2)
+
+- **`seq = Date.now()` is not robust to clock regressions.** The contract resolves
+  a liker's concurrent like/unlike by higher `seq` (unlike wins an equal-seq tie).
+  A backward clock step (NTP correction, VM resume) can give a later toggle a
+  lower seq, so the older action wins until the next action with a higher clock.
+  Per-device and self-correcting; a persisted monotonic per-liker counter would
+  remove it. Acceptable for a slice-2 proof.
+- **Optimistic-toggle revert.** The like button toggles locally first; if the like
+  cannot be sent (no delegate / no thread code hash / delegate `Error` for the
+  nonce) the UI re-renders from `localPosts` to discard the toggle, rather than
+  leaving a stuck heart.
+- **Like-refresh is debounced** (500 ms per thread) so a burst of remote-like
+  notifications on a hot post collapses to one full-state GET per window; the
+  user's own like still refreshes immediately.
+- **Unverified without a live node (WASM-in-node tier):** `ensureThreadShard`
+  treats a successful GET as "already instantiated" and PUTs only on
+  reject/timeout. This assumes a GET against a never-instantiated parameterized
+  contract *rejects* (→ we PUT). If instead it resolves with empty state we would
+  skip the PUT and the first like's UPDATE would no-op. This is the key thing the
+  deferred real-node test must confirm.
 
 ## Testing tiers
 

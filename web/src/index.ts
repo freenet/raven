@@ -78,7 +78,12 @@ function renderApp(identity: Identity): void {
     },
     (postId: string, liked: boolean) => {
       connection.likePost(postId, liked).then((ok) => {
-        if (!ok) console.warn("[freenet] Like not sent (no delegate / thread shard)");
+        if (!ok) {
+          console.warn("[freenet] Like not sent (no delegate / thread shard)");
+          // Revert the optimistic toggle: re-render rebuilds the card from
+          // localPosts (the last authoritative state), discarding the toggle.
+          refreshFeed();
+        }
       });
     },
   );
@@ -259,7 +264,9 @@ const connection = new FreenetConnection({
         // a nonce (GetIdentity, Export, …) leave the queues untouched.
         if (p.nonce) {
           connection.dropPendingPost(p.nonce);
-          connection.dropPendingLike(p.nonce);
+          // A dropped pending like leaves an un-acked optimistic toggle on its
+          // card — re-render from localPosts to revert it.
+          if (connection.dropPendingLike(p.nonce)) refreshFeed();
         }
         if (p.message?.includes("no identity")) {
           console.log("[identity] No identity in delegate — show onboarding");
