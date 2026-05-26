@@ -1,8 +1,12 @@
 import {
   FreenetWsApi,
   ContractKey,
+  ContractContainer,
+  ContractType as WasmContractType,
+  WasmContractV1,
   GetRequest,
   GetResponse,
+  PutRequest,
   UpdateRequest,
   UpdateResponse,
   UpdateNotification,
@@ -15,7 +19,11 @@ import {
   HostError,
   ResponseHandler,
 } from "@freenetorg/freenet-stdlib";
+// ContractCodeT is the constructable flatbuffer code table (with .pack()). It
+// is not re-exported from the package root, only the /common subpath.
+import { ContractCodeT } from "@freenetorg/freenet-stdlib/common";
 import { Post } from "./types";
+import { deriveShardContractKey, hexToBytes } from "./shard-key";
 import { signPost } from "./identity";
 import { runMigrations, type MigrationRunnerDeps } from "./migrations/run";
 import {
@@ -52,6 +60,14 @@ interface PendingPostDraft {
 
 interface PostsFeedState {
   posts: ContractPost[];
+}
+
+// User-shard state (matches Rust `UserShard`). Only `posts` is consumed by the
+// feed today; profile/follows are deserialized-tolerant (present-or-absent).
+interface UserShardState {
+  posts?: ContractPost[];
+  profile?: unknown;
+  follows?: Record<string, unknown>;
 }
 
 // Convert contract format → UI format
@@ -115,6 +131,21 @@ export class FreenetConnection {
   private migrating = false;
   /** Drafts awaiting a delegate `Signed` response, FIFO. See publishPost. */
   private pendingPosts: PendingPostDraft[] = [];
+  /**
+   * The owner's ML-DSA-65 verifying key (hex) once the delegate reports the
+   * identity. Used to derive this owner's user-shard key. Null until known.
+   */
+  private ownerVkHex: string | null = null;
+  /**
+   * The per-owner user-shard contract key, derived from the owner VK and the
+   * build-injected shard code hash (ADR-0001 Phase 4). Once set, the feed reads
+   * and writes the user shard instead of the legacy global posts contract.
+   */
+  private userShardKey: ContractKey | null = null;
+  /** Base58 instance id of {@link userShardKey}, for response key matching. */
+  private userShardInstanceId: string | null = null;
+  /** Guards against re-running user-shard init for the same owner. */
+  private userShardInit = false;
 
   constructor(callbacks: FreenetCallbacks) {
     this.callbacks = callbacks;
@@ -304,6 +335,15 @@ export class FreenetConnection {
     );
   }
 
+  /** Base58 instance id of a response's key, for matching against our keys. */
+  private responseInstanceId(key: ContractKey | null | undefined): string | null {
+    try {
+      return key ? key.encode() : null;
+    } catch {
+      return null;
+    }
+  }
+
   private handleGetResponse(response: GetResponse): void {
     // The startup migration loop issues GETs against old contract keys and
     // consumes those responses via the awaited Promise returned by api.get().
@@ -313,8 +353,17 @@ export class FreenetConnection {
     try {
       const decoder = new TextDecoder("utf8");
       const stateJson = decoder.decode(Uint8Array.from(response.state));
-      const state: PostsFeedState = JSON.parse(stateJson);
-      const posts = state.posts.map(contractPostToUiPost);
+      // Route by the response's key: user-shard state is a `UserShard`
+      // (`{posts, profile, follows}`); the legacy global feed is a
+      // `PostsFeedState` (`{posts}`).
+      const respId = this.responseInstanceId(response.key);
+      const isShard =
+        this.userShardInstanceId !== null &&
+        respId === this.userShardInstanceId;
+      const rawPosts = isShard
+        ? (JSON.parse(stateJson) as UserShardState).posts ?? []
+        : (JSON.parse(stateJson) as PostsFeedState).posts;
+      const posts = rawPosts.map(contractPostToUiPost);
       // Sort by timestamp descending (newest first)
       posts.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
       this.callbacks.onPostsLoaded(posts);
@@ -331,9 +380,15 @@ export class FreenetConnection {
       if (!delta) return;
       const decoder = new TextDecoder("utf8");
       const deltaJson = decoder.decode(Uint8Array.from(delta.delta));
-      const newPosts: ContractPost[] = JSON.parse(
-        deltaJson.replace("\x00", "")
-      );
+      const parsed = JSON.parse(deltaJson.replace("\x00", "")) as
+        | ContractPost[]
+        | { Posts?: ContractPost[]; Op?: unknown };
+      // User-shard deltas are the externally-tagged `ShardDelta` enum
+      // (`{"Posts":[…]}` / `{"Op":…}`); the legacy feed sends a bare post array.
+      // Op deltas (profile/follow) carry no feed posts — ignore them here.
+      const newPosts: ContractPost[] = Array.isArray(parsed)
+        ? parsed
+        : parsed.Posts ?? [];
       for (const cp of newPosts) {
         this.callbacks.onNewPost(contractPostToUiPost(cp));
       }
@@ -344,6 +399,140 @@ export class FreenetConnection {
 
   setUser(pubkey: string, name: string, handle: string): void {
     this.currentUser = { pubkey, name, handle };
+    // A real ML-DSA-65 VK is 1952 bytes → 3904 hex chars. The offline fallback
+    // identity uses a 32-byte fake (64 hex chars), which is not a shard owner.
+    if (pubkey && pubkey.length === 3904 && pubkey !== this.ownerVkHex) {
+      this.ownerVkHex = pubkey;
+      void this.initUserShard();
+    }
+  }
+
+  /**
+   * Derive this owner's user-shard key, ensure the contract is instantiated on
+   * the node (PUT the parameterized container if it is not yet present), then
+   * load + subscribe so the feed reflects the owner's shard. ADR-0001 Phase 4.
+   */
+  private async initUserShard(): Promise<void> {
+    if (!this.api || !this.ownerVkHex || this.userShardInit) return;
+    const codeHash =
+      typeof __USER_SHARD_CODE_HASH__ !== "undefined"
+        ? __USER_SHARD_CODE_HASH__
+        : null;
+    if (!codeHash || codeHash === "DEV_MODE_NO_CONTRACT_HASH") {
+      console.warn("[user-shard] No code hash injected — staying on legacy feed");
+      return;
+    }
+    this.userShardInit = true;
+    try {
+      const vkBytes = hexToBytes(this.ownerVkHex);
+      this.userShardKey = deriveShardContractKey(codeHash, vkBytes);
+      this.userShardInstanceId = this.userShardKey.encode();
+      console.log(
+        `[user-shard] derived key ${this.userShardInstanceId} for owner ${this.ownerVkHex.slice(0, 8)}…`,
+      );
+
+      // Probe for an existing instance. A brand-new owner has none, so PUT the
+      // parameterized container (raw WASM + owner VK params + empty initial
+      // state) to instantiate it before subscribing.
+      const exists = await this.userShardExists();
+      if (!exists) {
+        await this.putUserShard(vkBytes, codeHash);
+      }
+
+      this.loadUserShard();
+      this.subscribeUserShard();
+    } catch (e) {
+      console.error("[user-shard] init failed:", e);
+      // Fall back to the legacy feed already wired via this.contractKey.
+      this.userShardKey = null;
+      this.userShardInstanceId = null;
+    }
+  }
+
+  /** GET the user shard to check whether the node already has this instance. */
+  private async userShardExists(): Promise<boolean> {
+    if (!this.api || !this.userShardKey) return false;
+    try {
+      await this.withTimeout(
+        this.api.get(new GetRequest(this.userShardKey, false)),
+        8000,
+      );
+      return true;
+    } catch {
+      // A not-found / timeout means we should PUT to instantiate.
+      return false;
+    }
+  }
+
+  /** Fetch the bundled raw shard WASM bytes (served at the dist root). */
+  private async fetchShardWasm(): Promise<Uint8Array> {
+    const resp = await fetch("./user_shard.wasm");
+    if (!resp.ok) {
+      throw new Error(`failed to fetch user_shard.wasm: ${resp.status}`);
+    }
+    return new Uint8Array(await resp.arrayBuffer());
+  }
+
+  /**
+   * PUT the parameterized user-shard container to instantiate this owner's
+   * shard. The node re-hashes the `data` bytes to derive the key, so the
+   * shipped WASM must be the raw compiled artifact whose blake3 equals the
+   * injected code hash (see Makefile.toml build-user-shard).
+   */
+  private async putUserShard(
+    vkBytes: Uint8Array,
+    codeHashBase58: string,
+  ): Promise<void> {
+    if (!this.api || !this.userShardKey) return;
+    const wasm = await this.fetchShardWasm();
+    const codeHashBytes = this.userShardKey.codePart();
+    const code = new ContractCodeT(
+      Array.from(wasm),
+      codeHashBytes ? Array.from(codeHashBytes) : [],
+    );
+    const contract = new WasmContractV1(
+      code,
+      Array.from(vkBytes),
+      this.userShardKey,
+    );
+    const container = new ContractContainer(
+      WasmContractType.WasmContractV1,
+      contract,
+    );
+    // Empty initial state; `UserShard` defaults fill the rest (posts: []).
+    const initialState = new TextEncoder().encode(
+      JSON.stringify({ posts: [] }),
+    );
+    const req = new PutRequest(
+      container,
+      Array.from(initialState),
+      undefined,
+      false,
+      false,
+    );
+    console.log(
+      `[user-shard] PUT instantiating shard (${codeHashBase58.slice(0, 8)}…)`,
+    );
+    await this.api.put(req);
+  }
+
+  private loadUserShard(): void {
+    if (!this.api || !this.userShardKey) return;
+    this.api
+      .get(new GetRequest(this.userShardKey, true))
+      .catch((e) => console.error("[user-shard] get failed:", e));
+  }
+
+  private subscribeUserShard(): void {
+    if (!this.api || !this.userShardKey) return;
+    this.api
+      .subscribe(new SubscribeRequest(this.userShardKey, []))
+      .catch((e) => console.error("[user-shard] subscribe failed:", e));
+  }
+
+  /** True once the feed is sourced from the owner's user shard. */
+  private get usingUserShard(): boolean {
+    return this.userShardKey !== null;
   }
 
   /**
@@ -355,7 +544,10 @@ export class FreenetConnection {
    * per-request, so we hold the draft until the signature returns.)
    */
   async publishPost(content: string): Promise<boolean> {
-    if (!this.api || !this.contractKey || !this.currentUser) {
+    // A target key is either the user shard (preferred once known) or the
+    // legacy global contract.
+    const target = this.userShardKey ?? this.contractKey;
+    if (!this.api || !target || !this.currentUser) {
       return false;
     }
     const timestamp = Date.now();
@@ -399,7 +591,8 @@ export class FreenetConnection {
     signature: string;
     public_key: string;
   }): Promise<boolean> {
-    if (!this.api || !this.contractKey) return false;
+    const target = this.userShardKey ?? this.contractKey;
+    if (!this.api || !target) return false;
 
     // Match the draft by its unique nonce, not position or timestamp — robust
     // to a dropped/errored sign request and to same-millisecond posts.
@@ -425,10 +618,13 @@ export class FreenetConnection {
 
     try {
       const encoder = new TextEncoder();
-      const deltaBytes = encoder.encode(JSON.stringify([post]));
+      // The user shard expects the externally-tagged `ShardDelta::Posts` form;
+      // the legacy global contract takes a bare post array.
+      const payload = this.usingUserShard ? { Posts: [post] } : [post];
+      const deltaBytes = encoder.encode(JSON.stringify(payload));
       const delta = new DeltaUpdate(Array.from(deltaBytes));
       const update = new UpdateData(UpdateDataType.DeltaUpdate, delta);
-      const req = new UpdateRequest(this.contractKey, update);
+      const req = new UpdateRequest(target, update);
       await this.api.update(req);
       return true;
     } catch (e) {

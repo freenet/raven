@@ -393,6 +393,68 @@ instance id — like the user and thread shards). No migration entry (no prior
 inbox-shard state). With this slice **all three shard types now exist**, so the
 migration + UI wiring (Phase 4) is unblocked.
 
+## Phase 4 decisions (UI cutover — user shard, slice 1)
+
+Phase 4 cuts the web app from the legacy global posts contract to the per-user
+shards. It is sliced: this first slice wires only the **user shard**
+(posts/profile/follows surface) for read + write; thread/inbox UI and migration
+of legacy global-feed data into shards are later slices.
+
+### Client-side key derivation must match the node byte-for-byte
+
+A parameterized shard's contract instance id is
+`blake3(code_hash_bytes || parameters_bytes)` — the raw 32-byte code hash
+concatenated with the raw parameter blob, **no length prefix, no separator, no
+domain tag**, taking the 32-byte digest (freenet-stdlib
+`ContractKey::generate_id` / `from_params`). The web app reproduces this in
+`web/src/shard-key.ts` with `@noble/hashes/blake3` + `bs58`. If the JS derivation
+drifts from the node, every GET/PUT/subscribe silently addresses a different
+(empty) contract, so the match is pinned by a **ground-truth vector** in
+`shard-key.test.ts` taken from `fdev get-contract-id --code … --parameters …`
+(code hash `7iSNUfGW…`, 32×`0x01` params → instance id `2q69AnoP…`). The vector
+depends only on the algorithm (code hash + params), so it survives rebuilds.
+
+The shard parameters are the **raw owner ML-DSA-65 VK bytes** (1952 B), matching
+the contract's `owner_vk_hex(params) = hex(params)`. (Note: freenet-email
+JSON-encodes its inbox params; raven does not — the contract dictates the wire
+form, and raven's expects raw VK bytes.)
+
+### The browser PUTs the parameterized container itself
+
+The node has no pre-published per-owner instance, so the app instantiates each
+owner's shard by PUTting a `ContractContainer` (raw WASM `data` + owner-VK
+`parameters` + derived key) with an empty initial state `{"posts":[]}`, then
+GET/subscribes by the derived key. `setUser` (fired when the delegate reports the
+identity) is the trigger; `initUserShard` derives the key, GETs to check for an
+existing instance, PUTs to instantiate if absent, then loads + subscribes. A real
+VK is 3904 hex chars — the 64-char offline fake is not treated as a shard owner.
+
+**The shipped WASM must be the raw compiled artifact, not the packaged
+container.** `fdev`'s code hash is `blake3` of the raw `target/…/*.wasm`; the
+packaged `build/freenet/…` file has extra framing and hashes differently. On PUT
+the node re-hashes the `data` bytes to derive the key, so shipping the packaged
+file would derive a key that never matches the GET key. `Makefile.toml`
+`build-user-shard` copies the **raw** wasm to `web/public/user_shard.wasm` and
+injects its base58 code hash as `__USER_SHARD_CODE_HASH__`; a build-time check is
+that `b3sum web/public/user_shard.wasm` equals the injected code hash.
+
+### Delta form differs from the legacy feed
+
+The user shard takes the externally-tagged `ShardDelta` enum, so a post is
+written as `{"Posts":[post]}` (vs. the legacy global feed's bare `[post]` array),
+and an incoming shard delta is parsed by the `Posts` tag (an `Op` delta carries
+profile/follow changes, no feed posts). State reads route by the response key:
+the shard returns a `UserShard` (`{posts,profile,follows}`), the legacy feed a
+`{posts}`. Until a real VK is known the app stays on the legacy contract, so the
+slice is additive and reversible.
+
+### Not exercised by per-PR CI
+
+The PUT-container / GET-by-derived-key round-trip is only exercised against a live
+node (deferred WASM-in-node tier), not vitest. The load-bearing invariant that
+*is* unit-tested is the key derivation match — the one thing that, if wrong,
+makes everything silently no-op.
+
 ## Testing tiers
 
 - **Unit** — per-function `#[test]`s inside each contract crate's `test` module:

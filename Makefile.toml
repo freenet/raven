@@ -99,8 +99,15 @@ set -euo pipefail
 ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
 cd "$ROOT/contracts/user-shard"
 CARGO_TARGET_DIR="$ROOT/target" fdev build
+# Two artifacts exist: the packaged container at build/freenet/… (what `fdev
+# inspect` reads, with extra framing) and the raw compiled .wasm under target/.
+# The node's code hash is blake3 of the RAW wasm, and on PUT the node re-hashes
+# the `data` bytes we send to derive the key — so the browser must ship the RAW
+# wasm, not the packaged container, or the derived instance id won't match.
+WASM_PKG="$ROOT/contracts/user-shard/build/freenet/freenet_microblogging_user_shard"
+WASM_RAW="$ROOT/target/wasm32-unknown-unknown/release/freenet_microblogging_user_shard.wasm"
 hash=$(CARGO_TARGET_DIR="$ROOT/target" fdev inspect \
-    "$ROOT/contracts/user-shard/build/freenet/freenet_microblogging_user_shard" code | \
+    "$WASM_PKG" code | \
     grep 'code hash:' | cut -d' ' -f3)
 mkdir -p "$ROOT/build"
 # User shards are PARAMETERIZED (parameters = owner ML-DSA-65 VK), so there is
@@ -108,7 +115,16 @@ mkdir -p "$ROOT/build"
 # code_hash + their VK. Only the code_hash is build-stable; instance ids are
 # computed per owner at runtime (ADR-0001 → "Shard key derivation").
 printf '%s' "$hash" > "$ROOT/build/user_shard_code_hash"
-echo "wrote build/user_shard_code_hash: $hash"
+# The web UI PUTs the parameterized container itself (code + owner VK params)
+# to instantiate each user's shard, so it needs the contract WASM bytes at
+# runtime. Mirror the built artifact + code hash into web/ for bundling:
+# vite serves web/public/* verbatim at the dist root, so the app fetches
+# ./user_shard.wasm at runtime; __USER_SHARD_CODE_HASH__ is injected from
+# user_shard_code_hash.txt.
+mkdir -p "$ROOT/web/public"
+cp "$WASM_RAW" "$ROOT/web/public/user_shard.wasm"
+printf '%s' "$hash" > "$ROOT/web/user_shard_code_hash.txt"
+echo "wrote build/user_shard_code_hash + web/public/user_shard.wasm + web/user_shard_code_hash.txt: $hash"
 '''
 
 [tasks.build-thread-shard]

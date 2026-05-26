@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 
 declare const __MODEL_CONTRACT__: string;
+declare const __USER_SHARD_CODE_HASH__: string;
 declare const __FOLLOWS_CONTRACT__: string;
 declare const __LIKES_CONTRACT__: string;
 declare const __DELEGATE_KEY__: string;
