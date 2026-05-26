@@ -175,6 +175,14 @@ export class FreenetConnection {
 
     this.callbacks.onStatusChange("connecting");
 
+    // Arm the startup barrier synchronously, before the socket opens — a
+    // delegate identity (→ setUser → initUserShard) can never beat startup() to
+    // assigning it, so shard init always awaits the real barrier, not the
+    // default-resolved field.
+    this.startupDone = new Promise((resolve) => {
+      this.resolveStartupDone = resolve;
+    });
+
     try {
       // Build ContractKey with both instance and code parts.
       // fromInstanceId only sets instance — we need both for the node.
@@ -233,9 +241,8 @@ export class FreenetConnection {
 
   /** Run the migration loop, then load + subscribe to the current contract. */
   private async startup(): Promise<void> {
-    this.startupDone = new Promise((resolve) => {
-      this.resolveStartupDone = resolve;
-    });
+    // The barrier promise is armed synchronously in connect() so a delegate
+    // identity cannot beat us to it; here we only resolve it once done.
     try {
       await this.runStartupMigrations();
       this.loadState();
