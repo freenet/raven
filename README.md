@@ -84,10 +84,9 @@ signing.
 # Rebuild just the web app
 cargo make build-ui publish-webapp-test
 
-# Rebuild a single contract
-cargo make publish-posts
-cargo make publish-follows
-cargo make publish-likes
+# Build the shard contracts (parameterized — instantiated per owner/thread at
+# runtime by the web app, not published globally)
+cargo make build-contracts
 
 # Rebuild identity delegate
 cargo make publish-identity
@@ -109,10 +108,10 @@ cd web && npm run dev
 
 ### Project Structure
 
-- [contracts/posts](contracts/posts/): Posts feed contract (store, validate, merge)
-- [contracts/follows](contracts/follows/): Follow graph contract
-- [contracts/likes](contracts/likes/): Like graph contract
-- [delegates/identity](delegates/identity/): Ed25519 identity delegate
+- [contracts/user-shard](contracts/user-shard/): per-owner shard — posts, profile, follows (owner-writes)
+- [contracts/thread-shard](contracts/thread-shard/): per-root-post shard — replies, likes, quotes (anyone-writes)
+- [contracts/inbox-shard](contracts/inbox-shard/): per-owner shard — notifications (anyone-writes, owner-prunes)
+- [delegates/identity](delegates/identity/): ML-DSA-65 identity delegate (keygen, post/like signing)
 - [web](web/): TypeScript + Vite web application
 
 ### Architecture
@@ -123,37 +122,19 @@ The system is built using:
 - **Freenet Delegates**: Client-side WASM modules for identity and cryptographic operations
 - **freenet-stdlib**: TypeScript SDK for WebSocket communication with the Freenet node
 - **Vite**: Fast build toolchain for the web app, served as a webapp contract
-- **Ed25519**: Elliptic curve cryptography for identity and post signing
-- **BLAKE3**: Content-addressable hashing for post deduplication and delegate key computation
+- **ML-DSA-65** (FIPS 204): post-quantum signatures for identity and all signed records
+- **BLAKE3**: content-addressable post ids, contract key derivation, delegate key computation
 
-### Contract Architecture
+### Contract Architecture (ADR-0001 sharding)
 
-Posts are stored in a commutative contract that merges updates from multiple users deterministically.
-The core state structure is defined in [contracts/posts/src/lib.rs](contracts/posts/src/lib.rs):
+State is split into per-owner / per-thread **shards** instead of global contracts. Each
+shard is a commutative (CRDT) Rust/WASM contract parameterized by an owner key or root
+post id, so its contract key is `blake3(code_hash || parameters)` and it is instantiated
+on demand by the web app (no global publish). See [docs/adr/0001-implementation-notes.md](docs/adr/0001-implementation-notes.md).
 
-```rust
-#[derive(Serialize, Deserialize)]
-struct PostsFeed {
-    posts: Vec<Post>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Post {
-    pub id: String,                    // "{author_pubkey}-{timestamp_ms}"
-    pub author_pubkey: String,         // hex-encoded public key
-    pub author_name: String,           // display name
-    pub author_handle: String,         // @handle
-    pub content: String,               // post text (max 280 chars)
-    pub timestamp: u64,                // unix timestamp milliseconds
-    pub signature: Option<Box<[u8]>>,  // Ed25519 signature over content
-}
-```
-
-Each contract handles its own state merging:
-
-- [Posts](contracts/posts/src/lib.rs): Append-only feed, deduplication by BLAKE3 content hash
-- [Follows](contracts/follows/src/lib.rs): Set-based merge (union of follow relationships)
-- [Likes](contracts/likes/src/lib.rs): Set-based merge (union of likes per post)
+- [user-shard](contracts/user-shard/src/lib.rs): owner-writes — posts (windowed, content-addressed, ML-DSA-signed), profile (LWW), follows (per-key seq merge). Parameter: owner VK bytes.
+- [thread-shard](contracts/thread-shard/src/lib.rs): anyone-writes — replies, likes, quotes; each record self-verifying. Parameter: root post id (UTF-8).
+- [inbox-shard](contracts/inbox-shard/src/lib.rs): anyone-writes notifications, owner-prunes via signed ops. Parameter: owner VK bytes.
 
 ### Identity Delegate
 

@@ -3,8 +3,9 @@
 ## Overview
 
 Decentralized Twitter/X-like microblogging application built on Freenet. Uses a
-TypeScript web UI with Vite, Rust WASM contracts for post storage and social
-graph, an Ed25519 identity delegate for signing, and the `@freenetorg/freenet-stdlib`
+TypeScript web UI with Vite, parameterized Rust WASM shard contracts (per-owner /
+per-thread) for posts/profile/follows/likes/notifications, an ML-DSA-65 identity
+delegate for signing, and the `@freenetorg/freenet-stdlib`
 TypeScript SDK for WebSocket communication with a Freenet node.
 
 ## Quick Reference
@@ -14,18 +15,17 @@ TypeScript SDK for WebSocket communication with a Freenet node.
 ```bash
 # Build
 cargo make build                # Full build: contracts + UI + web container
-cargo make build-contracts      # Posts + follows + likes + identity (WASM + code hashes)
+cargo make build-contracts      # user/thread/inbox shards + identity (WASM + code hashes)
 cargo make build-ui             # Vite/TypeScript build (depends on build-contracts)
 cargo make build-web-container  # web/container Rust → WASM
 cargo make build-ui-offline     # Vite build with mock data (no Freenet node) — for CI
 
-# Publish (local node)
-cargo make publish-posts        # Publish posts contract
-cargo make publish-follows      # Publish follows contract
-cargo make publish-likes        # Publish likes contract
+# Publish (local node). Shards are PARAMETERIZED (per owner / per thread) and are
+# instantiated on demand by the web app, so there is nothing to publish globally —
+# only the identity delegate + the webapp are published.
 cargo make publish-identity     # Publish identity delegate
 cargo make publish-webapp-test  # Publish test-signed webapp from published-contract/
-cargo make publish-all          # End-to-end: build → sign-test → snapshot → publish all
+cargo make publish-all          # End-to-end: build → sign-test → snapshot → publish delegate + webapp
 
 # Publish (PRODUCTION — use scripts/release.sh, not directly)
 cargo make publish-production   # Build → sign with prod key → snapshot → publish to live network
@@ -55,20 +55,13 @@ cargo make run-node             # Local Freenet node
 
 ```
 freenet-microblogging/
-├── contracts/
-│   ├── posts/                  # Posts contract (Rust → WASM)
-│   │   ├── src/lib.rs          # PostsFeed: store, validate, merge posts
-│   │   ├── Cargo.toml
-│   │   ├── freenet.toml
-│   │   └── initial_state.json  # {"posts": []}
-│   └── follows/                # Follows contract (Rust → WASM)
-│       ├── src/lib.rs          # FollowGraph: follow/unfollow actions
-│       ├── Cargo.toml
-│       ├── freenet.toml
-│       └── initial_state.json  # {"follows": {}}
+├── contracts/                  # Parameterized shard contracts (ADR-0001)
+│   ├── user-shard/             # Per-owner: posts, profile, follows (owner-writes)
+│   ├── thread-shard/           # Per-root-post: replies, likes, quotes (anyone-writes)
+│   └── inbox-shard/            # Per-owner: notifications (anyone-writes, owner-prunes)
 ├── delegates/
 │   └── identity/               # Identity delegate (Rust → WASM)
-│       ├── src/lib.rs          # Ed25519 keypair, signing
+│       ├── src/lib.rs          # ML-DSA-65 keypair, post/like signing
 │       ├── Cargo.toml
 │       └── freenet.toml
 ├── web/                        # TypeScript web frontend
@@ -122,24 +115,24 @@ freenet-microblogging/
 | `typescript` | Language |
 | `sass` | SCSS compilation |
 | `freenet-stdlib` (Rust) | Contract/delegate traits, WASM macros |
-| `ed25519-dalek` (Rust) | Ed25519 signing for identity delegate |
+| `ml-dsa` (Rust) | ML-DSA-65 (FIPS 204) signing for identity delegate + records |
 | `freenet` (cargo) | Freenet node binary |
 | `fdev` (cargo) | Freenet developer tools (build, publish, inspect) |
 
 ### Architecture
 
-- **Posts Contract** (`contracts/posts/`): Rust WASM contract storing microblog
-  posts as JSON. Each post has id, author_pubkey, author_name, author_handle,
-  content (max 280 chars), timestamp, and optional signature. Merge is
-  commutative: dedup by post hash (Blake3 of id).
-
-- **Follows Contract** (`contracts/follows/`): Rust WASM contract storing the
-  social graph as `HashMap<pubkey, HashSet<pubkey>>`. Supports Follow/Unfollow
-  actions. Merge is commutative for follows (set union).
+- **Shard contracts** (`contracts/{user,thread,inbox}-shard/`): Rust WASM CRDTs,
+  each parameterized (owner VK or root post id) so its key is
+  `blake3(code_hash || parameters)` and it is instantiated on demand by the web
+  app. user-shard = owner-writes posts/profile/follows; thread-shard =
+  anyone-writes replies/likes/quotes (self-verifying records); inbox-shard =
+  anyone-writes notifications, owner-prunes. All merges commutative. See
+  ADR-0001.
 
 - **Identity Delegate** (`delegates/identity/`): Runs locally on user's device.
-  Generates/stores Ed25519 keypairs via Freenet's encrypted secret storage.
-  Signs post content on request. Communicates with web UI via ApplicationMessage.
+  Generates/stores an ML-DSA-65 keypair via Freenet's encrypted secret storage.
+  Signs posts and likes on request (canonical payloads built by the `common`
+  crate). Communicates with web UI via ApplicationMessage.
 
 - **Web Container** (`web/container/`): Minimal Rust WASM contract serving the
   compiled web app as a Freenet webapp.
@@ -153,10 +146,13 @@ freenet-microblogging/
 ### Build Flow
 
 ```
-contracts/{posts,follows,likes}/src/lib.rs
+contracts/{user,thread,inbox}-shard/src/lib.rs
     → fdev build → WASM
-    → fdev inspect → code hash → build/<name>_code_hash
-    (posts hash also mirrored to web/model_code_hash.txt for vite.config.ts)
+    → fdev inspect → code hash → build/<name>_shard_code_hash
+    (user + thread shards: raw WASM mirrored to web/public/<name>.wasm + code hash
+     to web/<name>_shard_code_hash.txt, via scripts/mirror-shard-wasm.sh, which
+     also asserts b3sum(raw wasm) == code hash. The app PUTs these to instantiate
+     per-owner/per-thread instances and injects the hashes via vite.config.ts.)
 
 delegates/identity/src/lib.rs
     → fdev build --package-type delegate → WASM
@@ -191,10 +187,11 @@ against, not freshly built artifacts.
 ### Testing
 
 ```bash
-cargo make test                                # All tests
-cargo test -p freenet-microblogging-posts       # Posts contract (5 tests)
-cargo test -p freenet-microblogging-follows     # Follows contract (4 tests)
-cd web && npm test                              # Web app (Vitest)
+cargo make test                                    # All tests
+cargo test -p freenet-microblogging-user-shard     # User shard contract
+cargo test -p freenet-microblogging-thread-shard   # Thread shard contract
+cargo test -p freenet-microblogging-inbox-shard    # Inbox shard contract
+cd web && npm test                                 # Web app (Vitest)
 ```
 
 ### Environment Requirements
@@ -221,9 +218,11 @@ for non-`Option` fields) so older wire shapes still decode under newer code.
 Never put `#[serde(deny_unknown_fields)]` on contract state — unknown
 forward-compat fields must be ignored, not rejected.
 
-- Audited structs: `PostsFeed` / `Post` (`contracts/posts/src/lib.rs`),
-  `FollowGraph` (`contracts/follows/src/lib.rs`), `LikeGraph`
-  (`contracts/likes/src/lib.rs`). Each has a `decodes_old_shape_state` test.
+- Audited structs: `UserShard` (`contracts/user-shard/src/lib.rs`),
+  `ThreadShard` (`contracts/thread-shard/src/lib.rs`), `InboxShard`
+  (`contracts/inbox-shard/src/lib.rs`), and the shared records in `common`
+  (`Post`, `LikeRecord`, `QuoteRef`, `Notification`). Each shard has a
+  `decodes_old_shape_state` test.
 - A schema change that CANNOT be expressed as an additive serde-default field
   (renames, type changes, restructures) is **not** byte-compatible: it needs a
   dedicated re-shape pass in the migration writer and cannot ride a plain hash
