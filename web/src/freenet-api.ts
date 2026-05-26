@@ -24,7 +24,7 @@ import {
 import { ContractCodeT } from "@freenetorg/freenet-stdlib/common";
 import { Post } from "./types";
 import { deriveShardContractKey, hexToBytes } from "./shard-key";
-import { signPost } from "./identity";
+import { signPost, signLike } from "./identity";
 import { runMigrations, type MigrationRunnerDeps } from "./migrations/run";
 import {
   LocalStorageMigrationStateStore,
@@ -68,6 +68,39 @@ interface UserShardState {
   posts?: ContractPost[];
   profile?: unknown;
   follows?: Record<string, unknown>;
+}
+
+// A like record (matches Rust `common::thread::LikeRecord`). signer_pubkey is
+// the liker's VK hex; `liked` true=like / false=unlike (tombstone); signature
+// is over the canonical payload the delegate built.
+interface LikeRecord {
+  signer_pubkey: string;
+  seq: number;
+  liked: boolean;
+  writer_cert?: unknown;
+  signature: string | null;
+}
+
+// Thread-shard state (matches Rust `ThreadShard`). Only `likes` is consumed in
+// this slice; replies/quotes land in later slices.
+interface ThreadShardState {
+  replies?: Record<string, ContractPost>;
+  likes?: Record<string, LikeRecord>;
+  quotes?: Record<string, unknown>;
+}
+
+/** A pending like awaiting the delegate's `SignedLike`, keyed by nonce. */
+interface PendingLike {
+  nonce: string;
+  rootPostId: string;
+  liked: boolean;
+}
+
+/** Aggregate like state for one post, derived from its thread shard. */
+export interface LikeState {
+  postId: string;
+  count: number;
+  likedByMe: boolean;
 }
 
 // Convert contract format → UI format
@@ -114,6 +147,8 @@ export interface FreenetCallbacks {
   onDelegateResponse?: (response: DelegateResponse) => void;
   /** Optional: one-line progress messages from the startup migration loop. */
   onMigration?: (message: string) => void;
+  /** Optional: live like count / liked-by-me for a post, from its thread shard. */
+  onLikeUpdated?: (like: LikeState) => void;
 }
 
 export class FreenetConnection {
@@ -158,6 +193,16 @@ export class FreenetConnection {
    */
   private startupDone: Promise<void> = Promise.resolve();
   private resolveStartupDone: () => void = () => {};
+  /**
+   * Per-thread shard keys, lazily derived the first time a post is liked. Keyed
+   * by root post id (the thread-shard parameter). A thread shard is parameterized
+   * by its root post id, so its key = blake3(thread_code_hash || utf8(post_id)).
+   */
+  private threadKeys = new Map<string, ContractKey>();
+  /** Reverse map: thread instance id (base58) → root post id, for GET routing. */
+  private threadInstanceToRoot = new Map<string, string>();
+  /** Likes awaiting a delegate `SignedLike`, keyed by nonce. */
+  private pendingLikes: PendingLike[] = [];
 
   constructor(callbacks: FreenetCallbacks) {
     this.callbacks = callbacks;
@@ -383,6 +428,15 @@ export class FreenetConnection {
     if (this.migrating) return;
     try {
       const respId = this.responseInstanceId(response.key);
+      // Thread-shard GET (a like refresh / subscription): recompute the post's
+      // like aggregate and emit it, independent of the feed routing below.
+      const threadRoot = respId ? this.threadInstanceToRoot.get(respId) : undefined;
+      if (threadRoot) {
+        const json = new TextDecoder("utf8").decode(Uint8Array.from(response.state));
+        const thread = JSON.parse(json) as ThreadShardState;
+        this.emitLikeState(threadRoot, thread.likes ?? {});
+        return;
+      }
       const isShard =
         this.userShardInstanceId !== null &&
         respId === this.userShardInstanceId;
@@ -408,14 +462,19 @@ export class FreenetConnection {
 
   private handleUpdateNotification(notification: UpdateNotification): void {
     try {
+      // Thread-shard update (a like landed): re-GET for the authoritative
+      // aggregate rather than reconciling the delta by hand.
+      const notifId = this.responseInstanceId(notification.key);
+      const threadRoot = notifId ? this.threadInstanceToRoot.get(notifId) : undefined;
+      if (threadRoot) {
+        this.refreshLikes(threadRoot);
+        return;
+      }
       // Once the shard is active, only its update notifications drive the feed;
       // ignore notifications from the still-subscribed legacy contract (the
       // stdlib has no unsubscribe), so writes-to-shard / reads-from-shard stay
       // consistent.
-      if (this.usingUserShard) {
-        const notifId = this.responseInstanceId(notification.key);
-        if (notifId !== this.userShardInstanceId) return;
-      }
+      if (this.usingUserShard && notifId !== this.userShardInstanceId) return;
       const updateData = notification.update as UpdateData;
       if (!updateData || updateData.updateDataType !== UpdateDataType.DeltaUpdate) return;
       const delta = updateData.updateData as { delta: number[] } | null;
@@ -594,6 +653,197 @@ export class FreenetConnection {
   /** True once the feed is sourced from the owner's user shard. */
   private get usingUserShard(): boolean {
     return this.userShardKey !== null;
+  }
+
+  // --- Thread shard: likes (ADR-0001 Phase 4 slice 2) ----------------------
+
+  /**
+   * Derive (and cache) the thread-shard key for a post. A thread shard is
+   * parameterized by its root post id, so the key is
+   * blake3(thread_code_hash || utf8(post_id)) — note the parameter is the UTF-8
+   * bytes of the id string, matching the contract's
+   * `String::from_utf8_lossy(parameters)`, NOT raw/hex-decoded bytes.
+   */
+  private threadKeyFor(rootPostId: string): ContractKey | null {
+    const cached = this.threadKeys.get(rootPostId);
+    if (cached) return cached;
+    const codeHash =
+      typeof __THREAD_SHARD_CODE_HASH__ !== "undefined"
+        ? __THREAD_SHARD_CODE_HASH__
+        : null;
+    if (!codeHash || codeHash === "DEV_MODE_NO_CONTRACT_HASH") return null;
+    const params = new TextEncoder().encode(rootPostId);
+    const key = deriveShardContractKey(codeHash, params);
+    this.threadKeys.set(rootPostId, key);
+    this.threadInstanceToRoot.set(key.encode(), rootPostId);
+    return key;
+  }
+
+  /** Fetch the bundled raw thread-shard WASM bytes (served at the dist root). */
+  private async fetchThreadWasm(): Promise<Uint8Array> {
+    const resp = await fetch("./thread_shard.wasm");
+    if (!resp.ok) {
+      throw new Error(`failed to fetch thread_shard.wasm: ${resp.status}`);
+    }
+    return new Uint8Array(await resp.arrayBuffer());
+  }
+
+  /** PUT the parameterized thread-shard container if the node lacks it. */
+  private async ensureThreadShard(
+    key: ContractKey,
+    rootPostId: string,
+  ): Promise<void> {
+    if (!this.api) return;
+    try {
+      await this.withTimeout(this.api.get(new GetRequest(key, false)), 8000);
+      return; // already instantiated
+    } catch {
+      // not found / timeout → PUT below (a spurious re-PUT merges to a no-op)
+    }
+    const codeHash =
+      typeof __THREAD_SHARD_CODE_HASH__ !== "undefined"
+        ? __THREAD_SHARD_CODE_HASH__
+        : "";
+    const wasm = await this.fetchThreadWasm();
+    const codeHashBytes = key.codePart();
+    const code = new ContractCodeT(
+      Array.from(wasm),
+      codeHashBytes ? Array.from(codeHashBytes) : [],
+    );
+    // Parameter = UTF-8 bytes of the root post id (matches the contract).
+    const params = Array.from(new TextEncoder().encode(rootPostId));
+    const contract = new WasmContractV1(code, params, key);
+    const container = new ContractContainer(
+      WasmContractType.WasmContractV1,
+      contract,
+    );
+    const initialState = new TextEncoder().encode(
+      JSON.stringify({ replies: {}, likes: {}, quotes: {} }),
+    );
+    void codeHash;
+    await this.api.put(
+      new PutRequest(container, Array.from(initialState), undefined, false, false),
+    );
+  }
+
+  /**
+   * Like or unlike a post. Derives/instantiates the post's thread shard, then
+   * asks the delegate to sign a `LikeRecord`; the matching `SignedLike` is
+   * routed to {@link completeLike}, which folds it into the thread shard via
+   * `ThreadDelta::Likes`. Returns false if it cannot proceed (no delegate /
+   * thread code hash). Optimistic UI is the caller's concern; the authoritative
+   * count comes back via {@link refreshLikes} after the update lands.
+   */
+  async likePost(rootPostId: string, liked: boolean): Promise<boolean> {
+    if (!this.api) return false;
+    const key = this.threadKeyFor(rootPostId);
+    if (!key) {
+      console.warn("[thread] no thread-shard code hash — cannot like");
+      return false;
+    }
+    try {
+      await this.ensureThreadShard(key, rootPostId);
+      this.subscribeThread(key);
+    } catch (e) {
+      console.error("[thread] ensure/subscribe failed:", e);
+      return false;
+    }
+    const nonce = crypto.randomUUID();
+    this.pendingLikes.push({ nonce, rootPostId, liked });
+    // seq is the liker's monotonic counter; ms-precision time is monotonic
+    // enough for a single user's like/unlike toggles (the contract resolves
+    // concurrent same-key records by higher seq).
+    const requested = signLike(nonce, rootPostId, Date.now(), liked);
+    if (!requested) {
+      this.pendingLikes.pop();
+      console.warn("[thread] cannot like: delegate not connected to sign");
+      return false;
+    }
+    return true;
+  }
+
+  /** Complete a like once the delegate returns a `SignedLike`. */
+  async completeLike(signed: {
+    nonce: string;
+    root_post_id: string;
+    signer_pubkey: string;
+    seq: number;
+    liked: boolean;
+    signature: string;
+  }): Promise<boolean> {
+    if (!this.api) return false;
+    const idx = this.pendingLikes.findIndex((p) => p.nonce === signed.nonce);
+    if (idx === -1) {
+      console.warn("[thread] SignedLike with no matching pending like", signed.nonce);
+      return false;
+    }
+    this.pendingLikes.splice(idx, 1);
+    const key = this.threadKeyFor(signed.root_post_id);
+    if (!key) return false;
+
+    const record: LikeRecord = {
+      signer_pubkey: signed.signer_pubkey,
+      seq: signed.seq,
+      liked: signed.liked,
+      signature: signed.signature,
+    };
+    try {
+      const deltaBytes = new TextEncoder().encode(
+        JSON.stringify({ Likes: [record] }),
+      );
+      const update = new UpdateData(
+        UpdateDataType.DeltaUpdate,
+        new DeltaUpdate(Array.from(deltaBytes)),
+      );
+      await this.api.update(new UpdateRequest(key, update));
+      // Read back the authoritative aggregate once the update lands.
+      this.refreshLikes(signed.root_post_id);
+      return true;
+    } catch (e) {
+      console.error("[thread] failed to send like:", e);
+      return false;
+    }
+  }
+
+  /** GET a post's thread shard to recompute its like aggregate. */
+  private refreshLikes(rootPostId: string): void {
+    if (!this.api) return;
+    const key = this.threadKeyFor(rootPostId);
+    if (!key) return;
+    this.api
+      .get(new GetRequest(key, true))
+      .catch((e) => console.error("[thread] like refresh GET failed:", e));
+  }
+
+  private subscribeThread(key: ContractKey): void {
+    if (!this.api) return;
+    this.api
+      .subscribe(new SubscribeRequest(key, []))
+      .catch((e) => console.error("[thread] subscribe failed:", e));
+  }
+
+  /** Drop a pending like by nonce (delegate returned an Error for it). */
+  dropPendingLike(nonce: string): void {
+    const idx = this.pendingLikes.findIndex((p) => p.nonce === nonce);
+    if (idx !== -1) this.pendingLikes.splice(idx, 1);
+  }
+
+  /**
+   * Reduce a thread shard's `likes` map to an aggregate for the UI: count of
+   * records with `liked == true`, and whether the current owner is among them.
+   */
+  private emitLikeState(rootPostId: string, likes: Record<string, LikeRecord>): void {
+    let count = 0;
+    let likedByMe = false;
+    for (const rec of Object.values(likes)) {
+      if (rec.liked) {
+        count++;
+        if (this.ownerVkHex && rec.signer_pubkey === this.ownerVkHex) {
+          likedByMe = true;
+        }
+      }
+    }
+    this.callbacks.onLikeUpdated?.({ postId: rootPostId, count, likedByMe });
   }
 
   /**

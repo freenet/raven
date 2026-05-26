@@ -104,6 +104,29 @@ export function signPost(
   return true;
 }
 
+/**
+ * Ask the delegate to sign a like/unlike for a thread. The delegate builds the
+ * canonical `LikeRecord` payload (common::thread, the single trusted encoder)
+ * and replies with a `SignedLike` routed through onDelegateResponse →
+ * freenet-api completeLike. Returns false if no delegate (cannot sign offline).
+ */
+export function signLike(
+  nonce: string,
+  rootPostId: string,
+  seq: number,
+  liked: boolean
+): boolean {
+  if (!isDelegateConnected()) return false;
+  sendIdentityMessage(delegateApi!, delegateKeyBytes!, delegateCodeHashBytes!, {
+    type: "SignLike",
+    nonce,
+    root_post_id: rootPostId,
+    seq,
+    liked,
+  }).catch((e) => console.warn("[identity] SignLike failed:", e));
+  return true;
+}
+
 export function exportIdentity(): void {
   if (!isDelegateConnected()) {
     // Offline / no delegate: synthesize a placeholder so the modal still appears

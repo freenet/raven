@@ -457,6 +457,55 @@ node (deferred WASM-in-node tier), not vitest. The load-bearing invariant that
 *is* unit-tested is the key derivation match — the one thing that, if wrong,
 makes everything silently no-op.
 
+## Phase 4 decisions (thread shard — likes, slice 2)
+
+Slice 2 wires the **thread shard** for one operation end-to-end — **likes** —
+to prove the delegate→sign→thread-shard→UI loop for a non-post record. Replies,
+quotes, the inbox shard, the notifications UI, and the legacy global-contract
+teardown are each their own later slice.
+
+### Delegate signs non-post records via the same single trusted encoder
+
+The identity delegate gained a `SignLike{nonce, root_post_id, seq, liked}` →
+`SignedLike{…, signature}` message. Like `SignPost`, it builds the canonical
+payload in Rust with the common crate's encoder
+(`common::thread::LikeRecord::signing_payload(root_post_id)`) and signs *that*
+— the exact bytes the thread shard verifies. The byte layout never leaves the
+one audited place; the browser only assembles the returned fields into a
+`LikeRecord` and sends it. (The rejected alternative — a generic
+`SignPayload{bytes}` with the payload built in TS — would have moved a subtle,
+unaudited correctness surface into JavaScript.) Quotes/replies/notifications/
+prunes follow this same per-record-message pattern in later slices.
+
+### Thread-shard key derivation: parameter is the UTF-8 id string
+
+A thread shard is parameterized by its **root post id**, and the contract reads
+that parameter as `String::from_utf8_lossy(parameters)`. So the browser derives
+the key as `blake3(thread_code_hash || utf8(post_id))` — the parameter bytes are
+the UTF-8 encoding of the hex id *string*, NOT the hex-*decoded* bytes (contrast
+the user shard, whose parameter is the raw VK bytes). Getting this wrong is the
+familiar silent-no-op. Thread shards are lazy: a per-thread key is derived (and
+the contract PUT-instantiated) only the first time a post is liked, not eagerly
+for every feed post.
+
+### Likes are optimistic, then reconciled from authoritative state
+
+The like button toggles locally for instant feedback, then the signed
+`LikeRecord` is folded into the thread shard via `ThreadDelta::Likes`
+(`{"Likes":[record]}`). After the update lands — and on any thread update
+notification — the app re-GETs the thread shard and recomputes the aggregate
+(count of `liked==true` records; `liked-by-me` if the owner's VK is among them)
+rather than reconciling deltas by hand, then emits it via `onLikeUpdated` so the
+feed re-renders with the real count. `seq` is the liker's monotonic counter
+(ms-precision time), which the contract uses to resolve concurrent like/unlike of
+the same post.
+
+### Build wiring factored to a shared helper
+
+The user-shard's raw-wasm mirror + `b3sum == code_hash` build check (slice 1) is
+now `scripts/mirror-shard-wasm.sh`, called by both `build-user-shard` and
+`build-thread-shard`, so the load-bearing safety check is defined once.
+
 ## Testing tiers
 
 - **Unit** — per-function `#[test]`s inside each contract crate's `test` module:

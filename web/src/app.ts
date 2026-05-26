@@ -5,7 +5,10 @@ import { createRightPanel } from "./components/right-panel";
 import { getIdentity } from "./identity";
 import { Post } from "./types";
 
-export function createApp(publishFn?: (content: string) => Promise<boolean>): HTMLElement {
+export function createApp(
+  publishFn?: (content: string) => Promise<boolean>,
+  likeFn?: (postId: string, liked: boolean) => void,
+): HTMLElement {
   const posts: Post[] = [];
   const followedPubkeys = new Set<string>();
 
@@ -29,7 +32,8 @@ export function createApp(publishFn?: (content: string) => Promise<boolean>): HT
         );
       }
     },
-    followedPubkeys
+    followedPubkeys,
+    likeFn
   );
 
   mainArea.appendChild(feed);
