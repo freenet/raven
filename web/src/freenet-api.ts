@@ -25,17 +25,6 @@ import { ContractCodeT } from "@freenetorg/freenet-stdlib/common";
 import { Post } from "./types";
 import { deriveShardContractKey, hexToBytes } from "./shard-key";
 import { signPost, signLike } from "./identity";
-import { runMigrations, type MigrationRunnerDeps } from "./migrations/run";
-import {
-  LocalStorageMigrationStateStore,
-  type MigrationStateStore,
-} from "./migrations/state-store";
-import {
-  CURRENT_POSTS_CODE_HASH,
-  LEGACY_POSTS_CODE_HASHES,
-  type ContractType,
-  type MigratableContract,
-} from "./migrations/legacy-hashes";
 
 // Contract post format (matches Rust `common::post::Post`). Signature and
 // author_pubkey are hex strings (ML-DSA-65 sig 3309 B, VK 1952 B); the id is
@@ -56,10 +45,6 @@ interface PendingPostDraft {
   author_handle: string;
   content: string;
   timestamp: number;
-}
-
-interface PostsFeedState {
-  posts: ContractPost[];
 }
 
 // User-shard state (matches Rust `UserShard`). Only `posts` is consumed by the
@@ -145,25 +130,18 @@ export interface FreenetCallbacks {
   onStatusChange: (status: ConnectionStatus) => void;
   /** Optional: receives delegate responses forwarded from the node. */
   onDelegateResponse?: (response: DelegateResponse) => void;
-  /** Optional: one-line progress messages from the startup migration loop. */
-  onMigration?: (message: string) => void;
   /** Optional: live like count / liked-by-me for a post, from its thread shard. */
   onLikeUpdated?: (like: LikeState) => void;
 }
 
 export class FreenetConnection {
   private api: FreenetWsApi | null = null;
-  private contractKey: ContractKey | null = null;
   private callbacks: FreenetCallbacks;
   private currentUser: {
     pubkey: string;
     name: string;
     handle: string;
   } | null = null;
-  private migrationStore: MigrationStateStore =
-    new LocalStorageMigrationStateStore();
-  /** True while the startup migration loop probes old contract keys. */
-  private migrating = false;
   /** Drafts awaiting a delegate `Signed` response, FIFO. See publishPost. */
   private pendingPosts: PendingPostDraft[] = [];
   /**
@@ -211,15 +189,10 @@ export class FreenetConnection {
   }
 
   connect(): void {
-    const modelContract =
-      typeof __MODEL_CONTRACT__ !== "undefined" ? __MODEL_CONTRACT__ : null;
-
-    if (!modelContract || modelContract === "DEV_MODE_NO_CONTRACT_HASH") {
-      console.log("[freenet] No contract hash — running in mock mode");
-      this.callbacks.onStatusChange("disconnected");
-      return;
-    }
-
+    // The app talks only to per-owner/per-thread shards + the identity delegate
+    // (no global contract). Whether to connect at all is gated upstream by
+    // __OFFLINE_MODE__ in index.ts (offline skips connect and renders mock
+    // data), so connect() always opens the socket when called.
     this.callbacks.onStatusChange("connecting");
 
     // Arm the startup barrier synchronously, before the socket opens — a
@@ -231,11 +204,6 @@ export class FreenetConnection {
     });
 
     try {
-      // Build ContractKey with both instance and code parts.
-      // fromInstanceId only sets instance — we need both for the node.
-      // The published contract key (base58) decodes to 32 bytes that serve
-      // as both instance ID and code hash (when no parameters are used).
-      this.contractKey = this.deriveContractKey(modelContract);
       const wsUrl = new URL(`ws://${location.host}/v1/contract/command`);
 
       const handler: ResponseHandler = {
@@ -248,11 +216,9 @@ export class FreenetConnection {
           this.handleUpdateNotification(notification);
         },
         onContractNotFound: (_instanceId: Uint8Array) => {
-          // A migration probe against an old key that no longer exists is
-          // expected — the awaited get() rejects and is handled there.
-          if (this.migrating) return;
+          // A shard probe against a not-yet-instantiated key rejects the
+          // awaited get() (handled there); the live feed need not error.
           console.warn("[freenet] Contract not found");
-          this.callbacks.onStatusChange("error");
         },
         onDelegateResponse: (response: DelegateResponse) => {
           this.callbacks.onDelegateResponse?.(response);
@@ -276,105 +242,13 @@ export class FreenetConnection {
   }
 
   /**
-   * Derive the node ContractKey from a base58 instance id. The published key
-   * decodes to 32 bytes that serve as both instance id and code hash when the
-   * contract uses no parameters.
+   * Resolve the startup barrier. There is no global contract to load/subscribe
+   * here — the feed comes from the owner's user shard, instantiated by
+   * `initUserShard` once the delegate reports the identity (setUser). This only
+   * unblocks any shard init that arrived mid-startup.
    */
-  private deriveContractKey(instanceId: string): ContractKey {
-    const keyFromId = ContractKey.fromInstanceId(instanceId);
-    const bytes = keyFromId.bytes();
-    return new ContractKey(bytes, bytes);
-  }
-
-  /** Run the migration loop, then load + subscribe to the current contract. */
   private async startup(): Promise<void> {
-    // The barrier promise is armed synchronously in connect() so a delegate
-    // identity cannot beat us to it; here we only resolve it once done.
-    try {
-      await this.runStartupMigrations();
-      this.loadState();
-      this.subscribeToUpdates();
-    } finally {
-      // Unblock any user-shard init that arrived (via setUser) mid-startup.
-      this.resolveStartupDone();
-    }
-  }
-
-  /**
-   * Detect a contract-hash bump since the last session and pull any state
-   * stranded under the old key into the current contract. Runs before
-   * subscribeToUpdates so the live feed reflects migrated state.
-   */
-  private async runStartupMigrations(): Promise<void> {
-    if (!this.api || !this.contractKey) return;
-
-    const log = (message: string) => {
-      console.log(message);
-      this.callbacks.onMigration?.(message);
-    };
-
-    const contracts: MigratableContract[] = [
-      {
-        type: "posts",
-        currentHash: CURRENT_POSTS_CODE_HASH,
-        legacyHashes: LEGACY_POSTS_CODE_HASHES,
-      },
-    ];
-
-    const deps: MigrationRunnerDeps = {
-      store: this.migrationStore,
-      getState: (type, candidateHash) =>
-        this.migrationGetState(type, candidateHash),
-      reinject: (type, state) => this.migrationReinject(type, state),
-      log,
-    };
-
-    this.migrating = true;
-    try {
-      await runMigrations(contracts, deps);
-    } catch (e) {
-      console.error("[migration] startup migration failed:", e);
-    } finally {
-      this.migrating = false;
-    }
-  }
-
-  /** GET the state stored under an old contract key; null if unavailable. */
-  private async migrationGetState(
-    _type: ContractType,
-    candidateHash: string,
-  ): Promise<unknown | null> {
-    if (!this.api) return null;
-    const key = this.deriveContractKey(candidateHash);
-    try {
-      const resp = await this.withTimeout(
-        this.api.get(new GetRequest(key, false)),
-        8000,
-      );
-      const json = new TextDecoder("utf8").decode(Uint8Array.from(resp.state));
-      return JSON.parse(json);
-    } catch (e) {
-      console.warn(`[migration] GET candidate ${candidateHash} failed:`, e);
-      return null;
-    }
-  }
-
-  /** Merge migrated state into the current contract via a delta update. */
-  private async migrationReinject(
-    type: ContractType,
-    state: unknown,
-  ): Promise<void> {
-    if (!this.api || !this.contractKey) return;
-    // Only posts is wired into the UI today; follows/likes land with #11/#13.
-    if (type !== "posts") return;
-    const posts = (state as PostsFeedState | null)?.posts;
-    if (!Array.isArray(posts) || posts.length === 0) return;
-    const deltaBytes = new TextEncoder().encode(JSON.stringify(posts));
-    const update = new UpdateData(
-      UpdateDataType.DeltaUpdate,
-      new DeltaUpdate(Array.from(deltaBytes)),
-    );
-    await this.api.update(new UpdateRequest(this.contractKey, update));
+    this.resolveStartupDone();
   }
 
   private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -394,22 +268,12 @@ export class FreenetConnection {
   }
 
   loadState(): void {
-    // Once the user shard is active it is the sole feed source; otherwise read
-    // the legacy global contract. (index.ts refreshes via loadState after a
-    // publish, so this must follow the same target writes go to.)
-    const target = this.userShardKey ?? this.contractKey;
-    if (!this.api || !target) return;
-    const req = new GetRequest(target, true);
+    // The feed is sourced solely from the owner's user shard. index.ts refreshes
+    // via loadState after a publish, so this targets the same key writes go to.
+    if (!this.api || !this.userShardKey) return;
+    const req = new GetRequest(this.userShardKey, true);
     this.api.get(req).catch((e) =>
       console.error("[freenet] Get request failed:", e)
-    );
-  }
-
-  private subscribeToUpdates(): void {
-    if (!this.api || !this.contractKey) return;
-    const req = new SubscribeRequest(this.contractKey, []);
-    this.api.subscribe(req).catch((e) =>
-      console.error("[freenet] Subscribe request failed:", e)
     );
   }
 
@@ -423,15 +287,10 @@ export class FreenetConnection {
   }
 
   private handleGetResponse(response: GetResponse): void {
-    // The startup migration loop issues GETs against old contract keys and
-    // consumes those responses via the awaited Promise returned by api.get().
-    // The same responses also reach this handler — skip them so old-version
-    // state never lands in the live feed.
-    if (this.migrating) return;
     try {
       const respId = this.responseInstanceId(response.key);
       // Thread-shard GET (a like refresh / subscription): recompute the post's
-      // like aggregate and emit it, independent of the feed routing below.
+      // like aggregate and emit it, independent of the user-shard feed below.
       const threadRoot = respId ? this.threadInstanceToRoot.get(respId) : undefined;
       if (threadRoot) {
         const json = new TextDecoder("utf8").decode(Uint8Array.from(response.state));
@@ -439,20 +298,14 @@ export class FreenetConnection {
         this.emitLikeState(threadRoot, thread.likes ?? {});
         return;
       }
-      const isShard =
-        this.userShardInstanceId !== null &&
-        respId === this.userShardInstanceId;
-      // Once the shard is active it is the sole feed source — drop any straggler
-      // legacy-contract GET response so the two feeds never mix.
-      if (this.usingUserShard && !isShard) return;
-      const decoder = new TextDecoder("utf8");
-      const stateJson = decoder.decode(Uint8Array.from(response.state));
-      // Route by the response's key: user-shard state is a `UserShard`
-      // (`{posts, profile, follows}`); the legacy global feed is a
-      // `PostsFeedState` (`{posts}`).
-      const rawPosts = isShard
-        ? (JSON.parse(stateJson) as UserShardState).posts ?? []
-        : (JSON.parse(stateJson) as PostsFeedState).posts;
+      // The only other GET source is the owner's user shard. Drop anything else.
+      if (this.userShardInstanceId === null || respId !== this.userShardInstanceId) {
+        return;
+      }
+      const stateJson = new TextDecoder("utf8").decode(
+        Uint8Array.from(response.state),
+      );
+      const rawPosts = (JSON.parse(stateJson) as UserShardState).posts ?? [];
       const posts = rawPosts.map(contractPostToUiPost);
       // Sort by timestamp descending (newest first)
       posts.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
@@ -464,35 +317,32 @@ export class FreenetConnection {
 
   private handleUpdateNotification(notification: UpdateNotification): void {
     try {
+      const notifId = this.responseInstanceId(notification.key);
       // Thread-shard update (a like landed): re-GET for the authoritative
       // aggregate rather than reconciling the delta by hand.
-      const notifId = this.responseInstanceId(notification.key);
       const threadRoot = notifId ? this.threadInstanceToRoot.get(notifId) : undefined;
       if (threadRoot) {
         this.refreshLikes(threadRoot);
         return;
       }
-      // Once the shard is active, only its update notifications drive the feed;
-      // ignore notifications from the still-subscribed legacy contract (the
-      // stdlib has no unsubscribe), so writes-to-shard / reads-from-shard stay
-      // consistent.
-      if (this.usingUserShard && notifId !== this.userShardInstanceId) return;
+      // The only other update source is the owner's user shard.
+      if (this.userShardInstanceId === null || notifId !== this.userShardInstanceId) {
+        return;
+      }
       const updateData = notification.update as UpdateData;
       if (!updateData || updateData.updateDataType !== UpdateDataType.DeltaUpdate) return;
       const delta = updateData.updateData as { delta: number[] } | null;
       if (!delta) return;
       const decoder = new TextDecoder("utf8");
       const deltaJson = decoder.decode(Uint8Array.from(delta.delta));
-      const parsed = JSON.parse(deltaJson.replace("\x00", "")) as
-        | ContractPost[]
-        | { Posts?: ContractPost[]; Op?: unknown };
       // User-shard deltas are the externally-tagged `ShardDelta` enum
-      // (`{"Posts":[…]}` / `{"Op":…}`); the legacy feed sends a bare post array.
-      // Op deltas (profile/follow) carry no feed posts — ignore them here.
-      const newPosts: ContractPost[] = Array.isArray(parsed)
-        ? parsed
-        : parsed.Posts ?? [];
-      for (const cp of newPosts) {
+      // (`{"Posts":[…]}` / `{"Op":…}`). Op deltas (profile/follow) carry no feed
+      // posts — ignore them here.
+      const parsed = JSON.parse(deltaJson.replace("\x00", "")) as {
+        Posts?: ContractPost[];
+        Op?: unknown;
+      };
+      for (const cp of parsed.Posts ?? []) {
         this.callbacks.onNewPost(contractPostToUiPost(cp));
       }
     } catch (e) {
@@ -525,15 +375,15 @@ export class FreenetConnection {
         ? __USER_SHARD_CODE_HASH__
         : null;
     if (!codeHash || codeHash === "DEV_MODE_NO_CONTRACT_HASH") {
-      console.warn("[user-shard] No code hash injected — staying on legacy feed");
+      console.warn("[user-shard] No code hash injected — feed unavailable");
       return;
     }
     this.userShardInitOwner = owner;
     try {
-      // Wait until the startup migration loop + legacy load/subscribe have
-      // finished before issuing any shard GET. The stdlib's GET response queue
-      // is an uncorrelated FIFO; overlapping the two flows lets them steal each
-      // other's responses (see startupDone).
+      // Wait for startup() to resolve the barrier before issuing any shard GET.
+      // (The barrier is armed in connect() before the socket opens; it exists so
+      // that any future startup-time contract traffic can't race shard init on
+      // the stdlib's uncorrelated GET response queue — see startupDone.)
       await this.startupDone;
       // A newer identity may have arrived while we awaited — bail if so.
       if (this.ownerVkHex !== owner) return;
@@ -557,7 +407,7 @@ export class FreenetConnection {
       this.subscribeUserShard();
     } catch (e) {
       console.error("[user-shard] init failed:", e);
-      // Fall back to the legacy feed already wired via this.contractKey.
+      // No fallback contract — clear so a later setUser can retry.
       this.userShardKey = null;
       this.userShardInstanceId = null;
       this.userShardInitOwner = null;
@@ -650,11 +500,6 @@ export class FreenetConnection {
     this.api
       .subscribe(new SubscribeRequest(this.userShardKey, []))
       .catch((e) => console.error("[user-shard] subscribe failed:", e));
-  }
-
-  /** True once the feed is sourced from the owner's user shard. */
-  private get usingUserShard(): boolean {
-    return this.userShardKey !== null;
   }
 
   // --- Thread shard: likes (ADR-0001 Phase 4 slice 2) ----------------------
@@ -876,10 +721,9 @@ export class FreenetConnection {
    * per-request, so we hold the draft until the signature returns.)
    */
   async publishPost(content: string): Promise<boolean> {
-    // A target key is either the user shard (preferred once known) or the
-    // legacy global contract.
-    const target = this.userShardKey ?? this.contractKey;
-    if (!this.api || !target || !this.currentUser) {
+    // Posts go to the owner's user shard, instantiated once the identity is
+    // known. No shard → cannot publish.
+    if (!this.api || !this.userShardKey || !this.currentUser) {
       return false;
     }
     const timestamp = Date.now();
@@ -923,8 +767,7 @@ export class FreenetConnection {
     signature: string;
     public_key: string;
   }): Promise<boolean> {
-    const target = this.userShardKey ?? this.contractKey;
-    if (!this.api || !target) return false;
+    if (!this.api || !this.userShardKey) return false;
 
     // Match the draft by its unique nonce, not position or timestamp — robust
     // to a dropped/errored sign request and to same-millisecond posts.
@@ -950,13 +793,11 @@ export class FreenetConnection {
 
     try {
       const encoder = new TextEncoder();
-      // The user shard expects the externally-tagged `ShardDelta::Posts` form;
-      // the legacy global contract takes a bare post array.
-      const payload = this.usingUserShard ? { Posts: [post] } : [post];
-      const deltaBytes = encoder.encode(JSON.stringify(payload));
+      // The user shard expects the externally-tagged `ShardDelta::Posts` form.
+      const deltaBytes = encoder.encode(JSON.stringify({ Posts: [post] }));
       const delta = new DeltaUpdate(Array.from(deltaBytes));
       const update = new UpdateData(UpdateDataType.DeltaUpdate, delta);
-      const req = new UpdateRequest(target, update);
+      const req = new UpdateRequest(this.userShardKey, update);
       await this.api.update(req);
       return true;
     } catch (e) {

@@ -1,3 +1,0 @@
-[contract]
-lang = "rust"
-files = ["initial_state.json"]
