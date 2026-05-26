@@ -14,82 +14,14 @@ set -euo pipefail
 ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
 cargo clean
 rm -rf "$ROOT/web/dist" "$ROOT/web/build" "$ROOT/build" "$ROOT/target/webapp"
-rm -f "$ROOT/web/model_code_hash.txt" "$ROOT/web/follows_contract_id.txt" \
-      "$ROOT/web/likes_contract_id.txt" "$ROOT/web/delegate_key.txt" \
+rm -f "$ROOT/web/user_shard_code_hash.txt" "$ROOT/web/thread_shard_code_hash.txt" \
+      "$ROOT/web/public/user_shard.wasm" "$ROOT/web/public/thread_shard.wasm" \
+      "$ROOT/web/delegate_key.txt" \
       "$ROOT/web/delegate_key_bytes.json" "$ROOT/web/delegate_code_hash_bytes.json"
 '''
 
 [tasks.default]
 alias = "build"
-
-[tasks.build-posts]
-description = "Build posts contract WASM + write code_hash + contract instance id"
-script_runner = "bash"
-script = '''
-set -euo pipefail
-ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
-cd "$ROOT/contracts/posts"
-CARGO_TARGET_DIR="$ROOT/target" fdev build
-WASM="$ROOT/target/wasm32-unknown-unknown/release/freenet_microblogging_posts.wasm"
-hash=$(CARGO_TARGET_DIR="$ROOT/target" fdev inspect \
-    "$ROOT/contracts/posts/build/freenet/freenet_microblogging_posts" code | \
-    grep 'code hash:' | cut -d' ' -f3)
-# Contract instance id = blake3(code_hash || parameters). publish-posts uses
-# empty parameters, so compute the same id here for the UI to GET/UPDATE.
-instance_id=$(CARGO_TARGET_DIR="$ROOT/target" fdev get-contract-id --code "$WASM")
-mkdir -p "$ROOT/build"
-printf '%s' "$hash" > "$ROOT/build/posts_code_hash"
-printf '%s' "$instance_id" > "$ROOT/build/posts_contract_id"
-# vite.config.ts reads web/model_code_hash.txt as __MODEL_CONTRACT__.
-# Web client treats it as instance id (used in ContractKey.fromInstanceId).
-printf '%s' "$instance_id" > "$ROOT/web/model_code_hash.txt"
-echo "wrote build/posts_code_hash:   $hash"
-echo "wrote build/posts_contract_id + web/model_code_hash.txt: $instance_id"
-'''
-
-[tasks.build-follows]
-description = "Build follows contract WASM + code_hash"
-script_runner = "bash"
-script = '''
-set -euo pipefail
-ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
-cd "$ROOT/contracts/follows"
-CARGO_TARGET_DIR="$ROOT/target" fdev build
-WASM="$ROOT/target/wasm32-unknown-unknown/release/freenet_microblogging_follows.wasm"
-hash=$(CARGO_TARGET_DIR="$ROOT/target" fdev inspect \
-    "$ROOT/contracts/follows/build/freenet/freenet_microblogging_follows" code | \
-    grep 'code hash:' | cut -d' ' -f3)
-# Contract instance id (empty parameters) — the migration system records this
-# as CURRENT_FOLLOWS_CODE_HASH via web/vite.config.ts.
-instance_id=$(CARGO_TARGET_DIR="$ROOT/target" fdev get-contract-id --code "$WASM")
-mkdir -p "$ROOT/build"
-printf '%s' "$hash" > "$ROOT/build/follows_code_hash"
-printf '%s' "$instance_id" > "$ROOT/web/follows_contract_id.txt"
-echo "wrote build/follows_code_hash: $hash"
-echo "wrote web/follows_contract_id.txt: $instance_id"
-'''
-
-[tasks.build-likes]
-description = "Build likes contract WASM + code_hash"
-script_runner = "bash"
-script = '''
-set -euo pipefail
-ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
-cd "$ROOT/contracts/likes"
-CARGO_TARGET_DIR="$ROOT/target" fdev build
-WASM="$ROOT/target/wasm32-unknown-unknown/release/freenet_microblogging_likes.wasm"
-hash=$(CARGO_TARGET_DIR="$ROOT/target" fdev inspect \
-    "$ROOT/contracts/likes/build/freenet/freenet_microblogging_likes" code | \
-    grep 'code hash:' | cut -d' ' -f3)
-# Contract instance id (empty parameters) — the migration system records this
-# as CURRENT_LIKES_CODE_HASH via web/vite.config.ts.
-instance_id=$(CARGO_TARGET_DIR="$ROOT/target" fdev get-contract-id --code "$WASM")
-mkdir -p "$ROOT/build"
-printf '%s' "$hash" > "$ROOT/build/likes_code_hash"
-printf '%s' "$instance_id" > "$ROOT/web/likes_contract_id.txt"
-echo "wrote build/likes_code_hash: $hash"
-echo "wrote web/likes_contract_id.txt: $instance_id"
-'''
 
 [tasks.build-user-shard]
 description = "Build user-shard contract WASM + code_hash"
@@ -169,7 +101,7 @@ echo "identity hash=$hash key=$key_hex"
 
 [tasks.build-contracts]
 description = "Build all contracts + delegates (WASM + code_hash files)"
-dependencies = ["build-posts", "build-follows", "build-likes", "build-user-shard", "build-thread-shard", "build-inbox-shard", "build-identity"]
+dependencies = ["build-user-shard", "build-thread-shard", "build-inbox-shard", "build-identity"]
 
 [tasks.build-web-container]
 description = "Build web/container Rust crate (WASM)"
@@ -269,21 +201,6 @@ script_runner = "bash"
 script = '''
 cd "${CARGO_MAKE_WORKING_DIRECTORY}/web" && npm run dev:offline
 '''
-
-[tasks.test-posts]
-description = "Run posts contract tests"
-command = "cargo"
-args = ["test", "-p", "freenet-microblogging-posts"]
-
-[tasks.test-follows]
-description = "Run follows contract tests"
-command = "cargo"
-args = ["test", "-p", "freenet-microblogging-follows"]
-
-[tasks.test-likes]
-description = "Run likes contract tests"
-command = "cargo"
-args = ["test", "-p", "freenet-microblogging-likes"]
 
 [tasks.test-identity]
 description = "Run identity delegate tests"
@@ -448,45 +365,6 @@ echo "published-contract/ updated (PRODUCTION):"
 echo "  contract-id.txt              = $contract_id"
 '''
 
-[tasks.publish-posts]
-description = "Publish posts contract to local node"
-dependencies = ["build-posts"]
-script_runner = "bash"
-script = '''
-set -euo pipefail
-ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
-fdev publish \
-    --code "$ROOT/target/wasm32-unknown-unknown/release/freenet_microblogging_posts.wasm" \
-    contract \
-    --state "$ROOT/contracts/posts/initial_state.json"
-'''
-
-[tasks.publish-follows]
-description = "Publish follows contract to local node"
-dependencies = ["build-follows"]
-script_runner = "bash"
-script = '''
-set -euo pipefail
-ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
-fdev publish \
-    --code "$ROOT/target/wasm32-unknown-unknown/release/freenet_microblogging_follows.wasm" \
-    contract \
-    --state "$ROOT/contracts/follows/initial_state.json"
-'''
-
-[tasks.publish-likes]
-description = "Publish likes contract to local node"
-dependencies = ["build-likes"]
-script_runner = "bash"
-script = '''
-set -euo pipefail
-ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
-fdev publish \
-    --code "$ROOT/target/wasm32-unknown-unknown/release/freenet_microblogging_likes.wasm" \
-    contract \
-    --state "$ROOT/contracts/likes/initial_state.json"
-'''
-
 [tasks.publish-identity]
 description = "Publish identity delegate to local node"
 dependencies = ["build-identity"]
@@ -544,9 +422,6 @@ description = "End-to-end test publish: build → sign → snapshot → publish-
 dependencies = [
     "build",
     "update-published-contract",
-    "publish-posts",
-    "publish-follows",
-    "publish-likes",
     "publish-identity",
     "publish-webapp-test",
 ]

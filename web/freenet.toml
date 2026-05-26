@@ -5,5 +5,5 @@ lang = "rust"
 [webapp.state-sources]
 source_dirs = ["dist"]
 
-[webapp.dependencies]
-posts = { path = "../contracts/posts" }
+# No build-time contract dependency: the app instantiates parameterized shards
+# (user/thread/inbox) at runtime by PUTting their bundled WASM. See ADR-0001.
