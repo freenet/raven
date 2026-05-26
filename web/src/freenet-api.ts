@@ -375,15 +375,15 @@ export class FreenetConnection {
         ? __USER_SHARD_CODE_HASH__
         : null;
     if (!codeHash || codeHash === "DEV_MODE_NO_CONTRACT_HASH") {
-      console.warn("[user-shard] No code hash injected — staying on legacy feed");
+      console.warn("[user-shard] No code hash injected — feed unavailable");
       return;
     }
     this.userShardInitOwner = owner;
     try {
-      // Wait until the startup migration loop + legacy load/subscribe have
-      // finished before issuing any shard GET. The stdlib's GET response queue
-      // is an uncorrelated FIFO; overlapping the two flows lets them steal each
-      // other's responses (see startupDone).
+      // Wait for startup() to resolve the barrier before issuing any shard GET.
+      // (The barrier is armed in connect() before the socket opens; it exists so
+      // that any future startup-time contract traffic can't race shard init on
+      // the stdlib's uncorrelated GET response queue — see startupDone.)
       await this.startupDone;
       // A newer identity may have arrived while we awaited — bail if so.
       if (this.ownerVkHex !== owner) return;
