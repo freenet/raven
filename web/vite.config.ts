@@ -11,6 +11,7 @@ function readFileOrDefault(filename: string, fallback: string): string {
 export default defineConfig({
   define: {
     __MODEL_CONTRACT__: JSON.stringify(readFileOrDefault("model_code_hash.txt", "DEV_MODE_NO_CONTRACT_HASH")),
+    __USER_SHARD_CODE_HASH__: JSON.stringify(readFileOrDefault("user_shard_code_hash.txt", "DEV_MODE_NO_CONTRACT_HASH")),
     __FOLLOWS_CONTRACT__: JSON.stringify(readFileOrDefault("follows_contract_id.txt", "DEV_MODE_NO_CONTRACT_HASH")),
     __LIKES_CONTRACT__: JSON.stringify(readFileOrDefault("likes_contract_id.txt", "DEV_MODE_NO_CONTRACT_HASH")),
     __DELEGATE_KEY__: JSON.stringify(readFileOrDefault("delegate_key.txt", "")),
