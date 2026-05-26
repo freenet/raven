@@ -457,6 +457,79 @@ node (deferred WASM-in-node tier), not vitest. The load-bearing invariant that
 *is* unit-tested is the key derivation match — the one thing that, if wrong,
 makes everything silently no-op.
 
+## Phase 4 decisions (thread shard — likes, slice 2)
+
+Slice 2 wires the **thread shard** for one operation end-to-end — **likes** —
+to prove the delegate→sign→thread-shard→UI loop for a non-post record. Replies,
+quotes, the inbox shard, the notifications UI, and the legacy global-contract
+teardown are each their own later slice.
+
+### Delegate signs non-post records via the same single trusted encoder
+
+The identity delegate gained a `SignLike{nonce, root_post_id, seq, liked}` →
+`SignedLike{…, signature}` message. Like `SignPost`, it builds the canonical
+payload in Rust with the common crate's encoder
+(`common::thread::LikeRecord::signing_payload(root_post_id)`) and signs *that*
+— the exact bytes the thread shard verifies. The byte layout never leaves the
+one audited place; the browser only assembles the returned fields into a
+`LikeRecord` and sends it. (The rejected alternative — a generic
+`SignPayload{bytes}` with the payload built in TS — would have moved a subtle,
+unaudited correctness surface into JavaScript.) Quotes/replies/notifications/
+prunes follow this same per-record-message pattern in later slices.
+
+### Thread-shard key derivation: parameter is the UTF-8 id string
+
+A thread shard is parameterized by its **root post id**, and the contract reads
+that parameter as `String::from_utf8_lossy(parameters)`. So the browser derives
+the key as `blake3(thread_code_hash || utf8(post_id))` — the parameter bytes are
+the UTF-8 encoding of the hex id *string*, NOT the hex-*decoded* bytes (contrast
+the user shard, whose parameter is the raw VK bytes). Getting this wrong is the
+familiar silent-no-op. Thread shards are lazy: a per-thread key is derived (and
+the contract PUT-instantiated) only the first time a post is liked, not eagerly
+for every feed post.
+
+### Likes are optimistic, then reconciled from authoritative state
+
+The like button toggles locally for instant feedback, then the signed
+`LikeRecord` is folded into the thread shard via `ThreadDelta::Likes`
+(`{"Likes":[record]}`). After the update lands — and on any thread update
+notification — the app re-GETs the thread shard and recomputes the aggregate
+(count of `liked==true` records; `liked-by-me` if the owner's VK is among them)
+rather than reconciling deltas by hand, then emits it via `onLikeUpdated` so the
+feed re-renders with the real count. `seq` is the liker's monotonic counter
+(ms-precision time), which the contract uses to resolve concurrent like/unlike of
+the same post.
+
+### Build wiring factored to a shared helper
+
+The user-shard's raw-wasm mirror + `b3sum == code_hash` build check (slice 1) is
+now `scripts/mirror-shard-wasm.sh`, called by both `build-user-shard` and
+`build-thread-shard`, so the load-bearing safety check is defined once. Note this
+*adds* behavior to `build-thread-shard` (it previously only wrote the code hash;
+it now also mirrors the raw wasm to `web/public/` and runs the b3sum check).
+
+### Known limitations / follow-ups (slice 2)
+
+- **`seq = Date.now()` is not robust to clock regressions.** The contract resolves
+  a liker's concurrent like/unlike by higher `seq` (unlike wins an equal-seq tie).
+  A backward clock step (NTP correction, VM resume) can give a later toggle a
+  lower seq, so the older action wins until the next action with a higher clock.
+  Per-device and self-correcting; a persisted monotonic per-liker counter would
+  remove it. Acceptable for a slice-2 proof.
+- **Optimistic-toggle revert.** The like button toggles locally first; if the like
+  cannot be sent (no delegate / no thread code hash / delegate `Error` for the
+  nonce) the UI re-renders from `localPosts` to discard the toggle, rather than
+  leaving a stuck heart.
+- **Like-refresh is debounced** (500 ms per thread) so a burst of remote-like
+  notifications on a hot post collapses to one full-state GET per window; the
+  user's own like still refreshes immediately.
+- **Unverified without a live node (WASM-in-node tier):** `ensureThreadShard`
+  treats a successful GET as "already instantiated" and PUTs only on
+  reject/timeout. This assumes a GET against a never-instantiated parameterized
+  contract *rejects* (→ we PUT). If instead it resolves with empty state we would
+  skip the PUT and the first like's UPDATE would no-op. This is the key thing the
+  deferred real-node test must confirm.
+
 ## Testing tiers
 
 - **Unit** — per-function `#[test]`s inside each contract crate's `test` module:

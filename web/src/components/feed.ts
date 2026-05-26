@@ -5,7 +5,8 @@ import { createPostCard } from "./post-card";
 export function createFeed(
   posts: Post[],
   onPost: (content: string) => void,
-  followedPubkeys: Set<string> = new Set()
+  followedPubkeys: Set<string> = new Set(),
+  onLike?: (postId: string, liked: boolean) => void
 ): HTMLElement {
   const feed = document.createElement("main");
   feed.className = "feed-column";
@@ -59,7 +60,7 @@ export function createFeed(
       postList.appendChild(empty);
     } else {
       for (const post of filtered) {
-        postList.appendChild(createPostCard(post));
+        postList.appendChild(createPostCard(post, { onLike }));
       }
     }
   }

@@ -36,7 +36,15 @@ const ICON_SHARE = `<svg width="18" height="18" viewBox="0 0 18 18" fill="none" 
   <line x1="9" y1="3" x2="9" y2="12"/>
 </svg>`;
 
-export function createPostCard(post: Post): HTMLElement {
+export interface PostCardCallbacks {
+  /** Fired on a like toggle. `liked` is the new desired state. */
+  onLike?: (postId: string, liked: boolean) => void;
+}
+
+export function createPostCard(
+  post: Post,
+  callbacks: PostCardCallbacks = {},
+): HTMLElement {
   const article = document.createElement("article");
   article.className = "post-card";
 
@@ -196,12 +204,14 @@ export function createPostCard(post: Post): HTMLElement {
   if (liked) likeEl.btn.classList.add("is-active");
   likeEl.btn.addEventListener("click", (e) => {
     e.stopPropagation();
+    // Optimistic toggle; the thread shard's authoritative count comes back via
+    // onLikeUpdated and is reconciled by the feed (setPostLikeState).
     liked = !liked;
     likeCount += liked ? 1 : -1;
     likeEl.countEl.textContent = likeCount > 0 ? String(likeCount) : "";
     likeEl.btn.classList.toggle("is-active", liked);
     likeEl.iconWrap.innerHTML = liked ? ICON_LIKE_FILLED : ICON_LIKE;
-    // TODO: wire to likes contract
+    callbacks.onLike?.(post.id, liked);
   });
 
   // Share (no action)

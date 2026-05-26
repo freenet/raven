@@ -1,5 +1,6 @@
 #![allow(unexpected_cfgs)]
 use freenet_microblogging_common::post::Post;
+use freenet_microblogging_common::thread::LikeRecord;
 use freenet_stdlib::prelude::*;
 use ml_dsa::signature::{Keypair, Signer};
 use ml_dsa::{KeyGen, MlDsa65, SigningKey as MlDsaSigningKey};
@@ -34,6 +35,18 @@ enum Request {
         author_handle: String,
         timestamp: u64,
     },
+    /// Sign a like (or unlike) for a thread. The delegate builds the canonical
+    /// `LikeRecord` payload via the single trusted encoder (`common::thread`)
+    /// and signs it, returning the assembled signed record. `root_post_id` is
+    /// the thread root (the thread-shard parameter); `seq` is the liker's
+    /// monotonic counter; `liked` is true to like, false to unlike (tombstone).
+    /// `nonce` is echoed so the UI can match the response to its pending action.
+    SignLike {
+        nonce: String,
+        root_post_id: String,
+        seq: u64,
+        liked: bool,
+    },
     /// Export the secret seed for backup/migration.
     ExportIdentity,
     /// Import a secret seed + identity from another device.
@@ -57,6 +70,17 @@ enum Response {
         post_id: String,    // content-addressed id = blake3(signing payload)
         signature: String,  // hex-encoded ML-DSA-65 signature (3309 bytes)
         public_key: String, // hex-encoded VK
+    },
+    /// A signed `LikeRecord` ready to fold into a thread shard via
+    /// `ThreadDelta::Likes`. `nonce` is echoed so the UI matches its pending
+    /// action; the other fields reconstruct the exact signed record.
+    SignedLike {
+        nonce: String,
+        root_post_id: String,
+        signer_pubkey: String, // hex-encoded VK
+        seq: u64,
+        liked: bool,
+        signature: String, // hex-encoded ML-DSA-65 signature
     },
     ExportedIdentity {
         secret_key: String, // hex-encoded 32-byte secret seed
@@ -140,6 +164,12 @@ impl DelegateInterface for IdentityDelegate {
                         &author_handle,
                         timestamp,
                     ),
+                    Request::SignLike {
+                        nonce,
+                        root_post_id,
+                        seq,
+                        liked,
+                    } => sign_like(ctx, &nonce, &root_post_id, seq, liked),
                     Request::ExportIdentity => export_identity(ctx),
                     Request::ImportIdentity {
                         secret_key,
@@ -270,6 +300,49 @@ fn sign_post(
         post_id: post.id,
         signature: hex::encode(signature.encode()),
         public_key,
+    }
+}
+
+fn sign_like(
+    ctx: &DelegateCtx,
+    nonce: &str,
+    root_post_id: &str,
+    seq: u64,
+    liked: bool,
+) -> Response {
+    let signing_key = match load_signing_key(ctx) {
+        Ok(k) => k,
+        // Re-tag the load error with this request's nonce so the UI can drop
+        // exactly the stranded pending action.
+        Err(Response::Error { message, .. }) => {
+            return Response::Error {
+                message,
+                nonce: Some(nonce.to_string()),
+            };
+        }
+        Err(resp) => return resp,
+    };
+    let signer_pubkey = vk_hex(&signing_key);
+
+    // Build the canonical record and sign its payload with the single trusted
+    // encoder (`common::thread`) — the same bytes the thread shard verifies.
+    let record = LikeRecord {
+        signer_pubkey: signer_pubkey.clone(),
+        seq,
+        liked,
+        writer_cert: None,
+        signature: None,
+    };
+    let signature: ml_dsa::Signature<MlDsa65> =
+        signing_key.sign(&record.signing_payload(root_post_id));
+
+    Response::SignedLike {
+        nonce: nonce.to_string(),
+        root_post_id: root_post_id.to_string(),
+        signer_pubkey,
+        seq,
+        liked,
+        signature: hex::encode(signature.encode()),
     }
 }
 

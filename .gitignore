@@ -17,6 +17,8 @@ web/delegate_key_bytes.json
 web/delegate_code_hash_bytes.json
 web/user_shard_code_hash.txt
 web/public/user_shard.wasm
+web/thread_shard_code_hash.txt
+web/public/thread_shard.wasm
 
 # Playwright
 web/tests/node_modules/

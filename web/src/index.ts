@@ -2,7 +2,7 @@ import "./scss/styles.scss";
 import { APP_NAME, APP_LOGO_URL } from "./branding";
 import { initTheme } from "./theme";
 import { createApp } from "./app";
-import { FreenetConnection } from "./freenet-api";
+import { FreenetConnection, type LikeState } from "./freenet-api";
 import { Post } from "./types";
 import { createOnboarding } from "./components/onboarding";
 import {
@@ -66,15 +66,27 @@ function renderApp(identity: Identity): void {
 
   connection.setUser(identity.publicKey, identity.displayName, identity.handle);
 
-  appElement = createApp((content: string) => {
-    connection.publishPost(content).then((ok) => {
-      if (ok) {
-        console.log("[freenet] Post published");
-        setTimeout(() => connection.loadState(), 300);
-      }
-    });
-    return Promise.resolve(true);
-  });
+  appElement = createApp(
+    (content: string) => {
+      connection.publishPost(content).then((ok) => {
+        if (ok) {
+          console.log("[freenet] Post published");
+          setTimeout(() => connection.loadState(), 300);
+        }
+      });
+      return Promise.resolve(true);
+    },
+    (postId: string, liked: boolean) => {
+      connection.likePost(postId, liked).then((ok) => {
+        if (!ok) {
+          console.warn("[freenet] Like not sent (no delegate / thread shard)");
+          // Revert the optimistic toggle: re-render rebuilds the card from
+          // localPosts (the last authoritative state), discarding the toggle.
+          refreshFeed();
+        }
+      });
+    },
+  );
   appRoot.appendChild(appElement);
 
   // Load posts now that app is rendered
@@ -162,6 +174,15 @@ const connection = new FreenetConnection({
   onMigration: (message: string) => {
     showMigrationToast(message);
   },
+  onLikeUpdated: (like: LikeState) => {
+    // Authoritative like aggregate from the post's thread shard — reconcile the
+    // optimistic UI with real state and re-render.
+    const post = localPosts.find((p) => p.id === like.postId);
+    if (!post) return;
+    post.likes = like.count;
+    post.liked = like.likedByMe;
+    refreshFeed();
+  },
   onDelegateResponse: (response: DelegateResponse) => {
     const payloads = parseDelegateResponse(response);
     for (const payload of payloads) {
@@ -203,13 +224,50 @@ const connection = new FreenetConnection({
         return;
       }
 
+      // A signed like came back — fold it into the post's thread shard.
+      const signedLike = payload as {
+        type?: string;
+        nonce?: string;
+        root_post_id?: string;
+        signer_pubkey?: string;
+        seq?: number;
+        liked?: boolean;
+        signature?: string;
+      };
+      if (
+        signedLike.type === "SignedLike" &&
+        signedLike.nonce &&
+        signedLike.root_post_id &&
+        signedLike.signer_pubkey &&
+        typeof signedLike.seq === "number" &&
+        typeof signedLike.liked === "boolean" &&
+        signedLike.signature
+      ) {
+        connection
+          .completeLike({
+            nonce: signedLike.nonce,
+            root_post_id: signedLike.root_post_id,
+            signer_pubkey: signedLike.signer_pubkey,
+            seq: signedLike.seq,
+            liked: signedLike.liked,
+            signature: signedLike.signature,
+          })
+          .catch((e) => console.error("[delegate] completeLike failed:", e));
+        return;
+      }
+
       // Check for an error from the delegate.
       const p = payload as { type?: string; message?: string; nonce?: string };
       if (p.type === "Error") {
-        // If the error carries a nonce it came from a failed SignPost — drop
-        // exactly that stranded draft. Errors without a nonce (GetIdentity,
-        // Export, …) leave the pending queue untouched.
-        if (p.nonce) connection.dropPendingPost(p.nonce);
+        // If the error carries a nonce it came from a failed SignPost or
+        // SignLike — drop exactly that stranded pending action. Errors without
+        // a nonce (GetIdentity, Export, …) leave the queues untouched.
+        if (p.nonce) {
+          connection.dropPendingPost(p.nonce);
+          // A dropped pending like leaves an un-acked optimistic toggle on its
+          // card — re-render from localPosts to revert it.
+          if (connection.dropPendingLike(p.nonce)) refreshFeed();
+        }
         if (p.message?.includes("no identity")) {
           console.log("[identity] No identity in delegate — show onboarding");
           if (!appRendered) {

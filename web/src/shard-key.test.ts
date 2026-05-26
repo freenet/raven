@@ -56,6 +56,27 @@ describe("shard-key derivation", () => {
     expect(codePart!.length).toBe(32);
   });
 
+  // Thread shards are parameterized by the root post id, which the contract
+  // reads as String::from_utf8_lossy(parameters) — so the parameter is the
+  // UTF-8 bytes of the hex id STRING (64 bytes), NOT the hex-decoded bytes (32).
+  // This is a DIFFERENT param encoding from the user/inbox shards (raw VK bytes),
+  // and getting it wrong silently addresses an empty contract. Pin it to a
+  // node-derived ground truth so the utf8-vs-decoded distinction can't regress:
+  //   $ fdev get-contract-id \
+  //       --code …/freenet_microblogging_thread_shard.wasm \
+  //       --parameters <64 ASCII bytes of the id string>
+  //   => 2r1ziXxHbV5Rdce3iEZj8MFso8qrDxYs5pVgYPTewyoW
+  it("derives thread-shard key from the UTF-8 id string (node ground truth)", () => {
+    const THREAD_CODE_HASH = "CEFQvEyBGkXzMxWuyi3rDrKrQ9E9VYq1dwofJPntSbnB";
+    const rootPostId =
+      "e1f5a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0";
+    const params = new TextEncoder().encode(rootPostId); // UTF-8 string bytes
+    expect(params.length).toBe(64); // 64 ASCII chars, NOT 32 hex-decoded bytes
+    expect(deriveInstanceId(THREAD_CODE_HASH, params).base58).toBe(
+      "2r1ziXxHbV5Rdce3iEZj8MFso8qrDxYs5pVgYPTewyoW",
+    );
+  });
+
   it("rejects a code hash that does not decode to 32 bytes", () => {
     expect(() => deriveInstanceId("abc", new Uint8Array(0))).toThrow(
       /32 bytes/,
