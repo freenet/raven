@@ -248,6 +248,28 @@ mod test {
     }
 
     #[test]
+    fn golden_notif_signing_payload() {
+        // GOLDEN VECTOR — a change here means the signing format changed and ALL
+        // deployed notification signatures (and their content-addressed ids)
+        // break. Do not "fix" by updating the literal unless that break is
+        // intended and versioned (bump NOTIF_DOMAIN_TAG). Injectivity tests do
+        // not catch a consistent sign+verify format shift.
+        let n = Notification {
+            kind: NotifKind::Reply,
+            sender_pubkey: "aabbcc".into(),
+            ref_id: "post1".into(),
+            seq: 9,
+            writer_cert: None,
+            signature: None,
+        };
+        let expected = "14000000726176656e3a696e626f782d6e6f7469663a763109000000726563697069\
+            656e74050000007265706c790600000061616262636305000000706f737431080000000900000000\
+            000000";
+        let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(hex::encode(n.signing_payload("recipient")), expected);
+    }
+
+    #[test]
     fn decodes_old_shape_records() {
         // Missing ref_id/signature/writer_cert + an unknown forward field must decode.
         let n: Notification =

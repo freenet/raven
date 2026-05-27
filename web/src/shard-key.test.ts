@@ -77,6 +77,45 @@ describe("shard-key derivation", () => {
     );
   });
 
+  // Inbox shards are parameterized by the OWNER VK bytes — the SAME raw-VK-bytes
+  // param encoding as the user shard (NOT the user-shard's utf8-id encoding the
+  // thread shard uses). The risk this pins: a future change accidentally feeds
+  // the inbox a hex STRING (3904 ASCII bytes) instead of the raw 1952 VK bytes,
+  // silently addressing an empty contract — exactly the bug the thread-shard
+  // vector guards against in the opposite direction.
+  //
+  // SELF-DERIVED, NOT NODE GROUND TRUTH. Unlike the user and thread vectors
+  // above (pinned from `fdev get-contract-id` against a built .wasm), the inbox
+  // shard is currently UNWIRED in this worktree: there is no built inbox .wasm,
+  // no build/inbox_shard_code_hash, and no __INBOX_SHARD_CODE_HASH__ injected by
+  // vite. So no real node-derived instance id exists to pin against yet. This
+  // vector instead cross-checks the raw-VK-bytes ENCODING through the exact same
+  // deriveInstanceId path the user shard uses, with a PLACEHOLDER code hash.
+  //
+  // TODO(inbox-wire): once the inbox shard is built (Makefile.toml
+  // `build-inbox-shard` writes build/inbox_shard_code_hash, and vite injects
+  // __INBOX_SHARD_CODE_HASH__), replace INBOX_CODE_HASH_PLACEHOLDER with the real
+  // code hash and re-pin the expected base58 against:
+  //   $ fdev get-contract-id \
+  //       --code …/freenet_microblogging_inbox_shard.wasm \
+  //       --parameters <1952 raw VK bytes>
+  // so this becomes a real node ground-truth vector like the others.
+  it("derives inbox-shard key from raw VK bytes (self-derived, not node truth)", () => {
+    // Reuse the verified user-shard code hash purely as a stand-in: it proves the
+    // raw-VK-bytes derivation path is exercised, while the value above is the only
+    // node-verified one. The assertion is self-consistent (JS derivation pinned
+    // against itself), not a node cross-check — see the TODO above.
+    const INBOX_CODE_HASH_PLACEHOLDER =
+      "7iSNUfGW4WiJMuQ3ryxsD7KNPDAi31MpNoQ2nhPJRDXm";
+    // Fixed deterministic owner VK: 1952 raw bytes (NOT the 3904-char hex string).
+    const ownerVk = hexToBytes("ab".repeat(1952));
+    expect(ownerVk.length).toBe(1952); // raw VK bytes, NOT 3904 hex chars
+    // Pinned self-derived output: blake3(code_hash_bytes || raw_vk_bytes), base58.
+    expect(deriveInstanceId(INBOX_CODE_HASH_PLACEHOLDER, ownerVk).base58).toBe(
+      "76Afq1mAEsiEQRQxNckj9PuAgc3Z9e2uPfXrdCz6JYNB",
+    );
+  });
+
   it("rejects a code hash that does not decode to 32 bytes", () => {
     expect(() => deriveInstanceId("abc", new Uint8Array(0))).toThrow(
       /32 bytes/,

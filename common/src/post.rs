@@ -317,6 +317,54 @@ mod test {
     }
 
     #[test]
+    fn golden_signing_payload_top_level() {
+        // GOLDEN VECTOR — a change here means the signing format changed and ALL
+        // deployed signatures/records break. Do not "fix" by updating the literal
+        // unless that break is intended and versioned (bump POST_DOMAIN_TAG).
+        //
+        // Existing tests only prove injectivity (length-prefix unambiguity); a
+        // serde/encoding change that shifts the payload CONSISTENTLY across
+        // sign+verify passes them yet silently invalidates already-deployed
+        // signatures. This pins the exact bytes as a tripwire.
+        let p = Post {
+            id: String::new(),
+            author_pubkey: "00112233".into(),
+            author_name: "Alice".into(),
+            author_handle: "@alice".into(),
+            content: "hello".into(),
+            timestamp: 1_700_000_000_000,
+            reply_to: String::new(),
+            signature: None,
+        };
+        let expected = "0d000000726176656e3a706f73743a763108000000303031313232333305000000\
+            416c6963650600000040616c6963650500000068656c6c6f080000000068e5cf8b010000";
+        let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(hex::encode(p.signing_payload()), expected);
+    }
+
+    #[test]
+    fn golden_signing_payload_reply() {
+        // GOLDEN VECTOR — see golden_signing_payload_top_level. This pins the
+        // reply variant (non-empty reply_to appended). Do not update the literal
+        // unless the format break is intended and POST_DOMAIN_TAG is bumped.
+        let p = Post {
+            id: String::new(),
+            author_pubkey: "00112233".into(),
+            author_name: "Alice".into(),
+            author_handle: "@alice".into(),
+            content: "hello".into(),
+            timestamp: 1_700_000_000_000,
+            reply_to: "rootid".into(),
+            signature: None,
+        };
+        let expected = "0d000000726176656e3a706f73743a763108000000303031313232333305000000\
+            416c6963650600000040616c6963650500000068656c6c6f080000000068e5cf8b010000\
+            06000000726f6f746964";
+        let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(hex::encode(p.signing_payload()), expected);
+    }
+
+    #[test]
     fn decodes_old_shape_without_signature() {
         // A post missing `signature` (older shape) and carrying an unknown
         // forward-compat field must decode.

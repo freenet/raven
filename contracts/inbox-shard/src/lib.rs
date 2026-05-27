@@ -1196,6 +1196,43 @@ mod test {
     }
 
     #[test]
+    fn state_and_delta_merges_both() {
+        // The StateAndDelta update arm: one update item carrying a full state AND
+        // a delta. update_state must merge_state the state THEN apply the delta,
+        // so a record from each is present and post-merge invariants hold.
+        // Full state: a notif (seq 5) + a genuine owner-signed PruneBefore (seq 2).
+        let from_state = signed_notif([2u8; 32], NotifKind::Reply, "from-state", 5);
+        let mut src = InboxShard::default();
+        src.notifs
+            .insert(from_state.id(&owner_vk()), from_state.clone());
+        src.prune_before_op = Some(prune_op(OpType::PruneBefore, Vec::new(), 2));
+        // Delta: a second notif (seq 6, above the high-water) on the notif surface.
+        let from_delta = signed_notif([3u8; 32], NotifKind::Quote, "from-delta", 6);
+        let delta = serde_json::to_vec(&InboxDelta::Notifs(vec![from_delta.clone()])).unwrap();
+
+        let out = run_update(
+            InboxShard::default(),
+            vec![UpdateData::StateAndDelta {
+                state: state_of(&src),
+                delta: StateDelta::from(delta),
+            }],
+        );
+        // Both notifs present (state's + delta's), each above the high-water.
+        assert_eq!(out.notifs.len(), 2, "state notif + delta notif both merged");
+        assert!(out.notifs.contains_key(&from_state.id(&owner_vk())));
+        assert!(out.notifs.contains_key(&from_delta.id(&owner_vk())));
+        // State's owner-signed high-water survived the merge.
+        assert_eq!(pruned_before(&out), 2);
+        // Invariants: every notif keyed under its own content address and at or
+        // above the high-water (the admission rule normalize enforces post-merge).
+        let hw = pruned_before(&out);
+        for (id, n) in &out.notifs {
+            assert_eq!(id, &n.id(&owner_vk()));
+            assert!(n.seq >= hw);
+        }
+    }
+
+    #[test]
     fn prune_ids_payload_round_trips() {
         let ids = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
         let encoded = encode_prune_ids(&ids);

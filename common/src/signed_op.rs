@@ -304,6 +304,33 @@ mod test {
     }
 
     #[test]
+    fn golden_signing_payload() {
+        // GOLDEN VECTOR — a change here means the signing format changed and ALL
+        // deployed SignedOp signatures break. Do not "fix" by updating the literal
+        // unless that break is intended and versioned (bump SIGNED_OP_DOMAIN_TAG
+        // and/or the affected shard context tag).
+        //
+        // Pins the exact bytes for a fixed op (Profile, payload "hi", seq 7,
+        // signer "aabbcc") under USER_SHARD_CONTEXT — the injectivity tests do
+        // not catch a consistent format shift across sign+verify.
+        let op = SignedOp {
+            op_type: OpType::Profile,
+            payload: b"hi".to_vec(),
+            seq: 7,
+            signer_pubkey: "aabbcc".into(),
+            signature: None,
+        };
+        let expected = "12000000726176656e3a7369676e65642d6f703a763113000000726176656e3a7573\
+            65722d73686172643a76310700000070726f66696c65020000006869080000000700000000000000\
+            06000000616162626363";
+        let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            hex::encode(op.signing_payload(USER_SHARD_CONTEXT)),
+            expected
+        );
+    }
+
+    #[test]
     fn decodes_old_shape_op() {
         // Missing signature + unknown forward field must decode.
         let json = r#"{

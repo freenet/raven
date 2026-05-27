@@ -161,16 +161,23 @@ export class FreenetConnection {
    * the owner VK changes (identity switch) so the new shard re-initialises. */
   private userShardInitOwner: string | null = null;
   /**
-   * Resolves once {@link startup} (migration loop + legacy load/subscribe) has
-   * finished. The stdlib resolves GET responses from a single FIFO queue with
-   * no request correlation, so issuing the shard's probe/load GETs while the
-   * migration loop is still awaiting its own GETs lets the two steal each
-   * other's responses (a shard NotFound could reject a migration GET, and a
-   * legacy response could resolve the shard probe → a spurious "exists" → the
-   * shard is never PUT). Serialise shard init behind this barrier.
+   * Serialises every `api.get()` so at most one GET is in flight at a time.
+   *
+   * The stdlib resolves GET promises from a single FIFO queue with NO request
+   * correlation: the Nth `GetResponse`/`NotFound` to arrive settles the Nth
+   * pending `get()` promise, regardless of which contract it was for. With
+   * multiple concurrent shard flows live (user-shard probe/load, per-thread
+   * probe/like-refresh) two in-flight GETs can have their responses swapped —
+   * a thread GET resolving the user-shard probe (→ feed never instantiates) or
+   * a like-refresh popping a thread probe (→ that thread never PUT, the like is
+   * silently lost). Routing-by-key in `handleGetResponse` fixes WHICH handler
+   * runs, but not WHICH awaited promise settles. The only robust fix without
+   * stdlib request-ids is to never have two GETs outstanding: each `api.get()`
+   * awaits the previous one's settle. (The prior `startupDone` barrier only
+   * covered startup-time traffic, which #33 removed — it serialised nothing
+   * against the real post-init concurrency.)
    */
-  private startupDone: Promise<void> = Promise.resolve();
-  private resolveStartupDone: () => void = () => {};
+  private getChain: Promise<unknown> = Promise.resolve();
   /**
    * Per-thread shard keys, lazily derived the first time a post is liked. Keyed
    * by root post id (the thread-shard parameter). A thread shard is parameterized
@@ -194,14 +201,6 @@ export class FreenetConnection {
     // __OFFLINE_MODE__ in index.ts (offline skips connect and renders mock
     // data), so connect() always opens the socket when called.
     this.callbacks.onStatusChange("connecting");
-
-    // Arm the startup barrier synchronously, before the socket opens — a
-    // delegate identity (→ setUser → initUserShard) can never beat startup() to
-    // assigning it, so shard init always awaits the real barrier, not the
-    // default-resolved field.
-    this.startupDone = new Promise((resolve) => {
-      this.resolveStartupDone = resolve;
-    });
 
     try {
       const wsUrl = new URL(`ws://${location.host}/v1/contract/command`);
@@ -230,7 +229,6 @@ export class FreenetConnection {
         onOpen: () => {
           console.log("[freenet] Connected to Freenet node");
           this.callbacks.onStatusChange("connected");
-          void this.startup();
         },
       };
       // Pass empty string as authToken to skip cookie reading (sandbox blocks it)
@@ -242,13 +240,27 @@ export class FreenetConnection {
   }
 
   /**
-   * Resolve the startup barrier. There is no global contract to load/subscribe
-   * here — the feed comes from the owner's user shard, instantiated by
-   * `initUserShard` once the delegate reports the identity (setUser). This only
-   * unblocks any shard init that arrived mid-startup.
+   * Issue a GET serialised behind {@link getChain}, so it is the only GET in
+   * flight when its response arrives — defeating the stdlib's uncorrelated FIFO
+   * response queue. The returned promise resolves/rejects exactly with THIS
+   * GET's response (since no other GET overlaps it), and the chain advances on
+   * settle (success or failure) so one rejected/timed-out GET cannot wedge the
+   * rest. A per-GET timeout bounds head-of-line blocking.
    */
-  private async startup(): Promise<void> {
-    this.resolveStartupDone();
+  private serializedGet(req: GetRequest, ms = 8000): Promise<GetResponse> {
+    if (!this.api) return Promise.reject(new Error("no api"));
+    const api = this.api;
+    const run = this.getChain.then(
+      () => this.withTimeout(api.get(req), ms),
+      () => this.withTimeout(api.get(req), ms),
+    );
+    // Advance the chain on settle without propagating this GET's result/error
+    // to the next link (each caller still sees its own outcome via `run`).
+    this.getChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -271,8 +283,7 @@ export class FreenetConnection {
     // The feed is sourced solely from the owner's user shard. index.ts refreshes
     // via loadState after a publish, so this targets the same key writes go to.
     if (!this.api || !this.userShardKey) return;
-    const req = new GetRequest(this.userShardKey, true);
-    this.api.get(req).catch((e) =>
+    this.serializedGet(new GetRequest(this.userShardKey, true)).catch((e) =>
       console.error("[freenet] Get request failed:", e)
     );
   }
@@ -338,7 +349,7 @@ export class FreenetConnection {
       // User-shard deltas are the externally-tagged `ShardDelta` enum
       // (`{"Posts":[…]}` / `{"Op":…}`). Op deltas (profile/follow) carry no feed
       // posts — ignore them here.
-      const parsed = JSON.parse(deltaJson.replace("\x00", "")) as {
+      const parsed = JSON.parse(deltaJson.replace(/\x00/g, "")) as {
         Posts?: ContractPost[];
         Op?: unknown;
       };
@@ -380,14 +391,10 @@ export class FreenetConnection {
     }
     this.userShardInitOwner = owner;
     try {
-      // Wait for startup() to resolve the barrier before issuing any shard GET.
-      // (The barrier is armed in connect() before the socket opens; it exists so
-      // that any future startup-time contract traffic can't race shard init on
-      // the stdlib's uncorrelated GET response queue — see startupDone.)
-      await this.startupDone;
-      // A newer identity may have arrived while we awaited — bail if so.
-      if (this.ownerVkHex !== owner) return;
-
+      // GET-response ordering is handled by serializedGet (one GET in flight at
+      // a time), so shard init no longer needs a startup barrier — it can issue
+      // its probe/load GETs concurrently with any other flow and the chain
+      // keeps each GET's response matched to its own promise.
       const vkBytes = hexToBytes(owner);
       this.userShardKey = deriveShardContractKey(codeHash, vkBytes);
       this.userShardInstanceId = this.userShardKey.encode();
@@ -426,10 +433,7 @@ export class FreenetConnection {
   private async userShardExists(): Promise<boolean> {
     if (!this.api || !this.userShardKey) return false;
     try {
-      await this.withTimeout(
-        this.api.get(new GetRequest(this.userShardKey, false)),
-        8000,
-      );
+      await this.serializedGet(new GetRequest(this.userShardKey, false));
       return true;
     } catch {
       return false;
@@ -490,9 +494,9 @@ export class FreenetConnection {
 
   private loadUserShard(): void {
     if (!this.api || !this.userShardKey) return;
-    this.api
-      .get(new GetRequest(this.userShardKey, true))
-      .catch((e) => console.error("[user-shard] get failed:", e));
+    this.serializedGet(new GetRequest(this.userShardKey, true)).catch((e) =>
+      console.error("[user-shard] get failed:", e),
+    );
   }
 
   private subscribeUserShard(): void {
@@ -535,14 +539,20 @@ export class FreenetConnection {
     return new Uint8Array(await resp.arrayBuffer());
   }
 
-  /** PUT the parameterized thread-shard container if the node lacks it. */
+  /**
+   * Ensure the post's thread shard is instantiated on the node: GET-probe, and
+   * PUT the parameterized container if absent. Awaits the PUT before returning,
+   * so the caller knows the shard exists before sending a like UpdateRequest
+   * (an update to a never-instantiated contract is silently dropped by the
+   * node — see M-3). Throws if the PUT itself fails.
+   */
   private async ensureThreadShard(
     key: ContractKey,
     rootPostId: string,
   ): Promise<void> {
-    if (!this.api) return;
+    if (!this.api) throw new Error("no api");
     try {
-      await this.withTimeout(this.api.get(new GetRequest(key, false)), 8000);
+      await this.serializedGet(new GetRequest(key, false));
       return; // already instantiated
     } catch {
       // not found / timeout → PUT below (a spurious re-PUT merges to a no-op)
@@ -644,6 +654,9 @@ export class FreenetConnection {
       return true;
     } catch (e) {
       console.error("[thread] failed to send like:", e);
+      // The update did not land — re-GET the authoritative aggregate so the
+      // optimistic toggle is reconciled away (onLikeUpdated reverts the UI).
+      this.refreshLikesNow(signed.root_post_id);
       return false;
     }
   }
@@ -653,9 +666,9 @@ export class FreenetConnection {
     if (!this.api) return;
     const key = this.threadKeyFor(rootPostId);
     if (!key) return;
-    this.api
-      .get(new GetRequest(key, true))
-      .catch((e) => console.error("[thread] like refresh GET failed:", e));
+    this.serializedGet(new GetRequest(key, true)).catch((e) =>
+      console.error("[thread] like refresh GET failed:", e),
+    );
   }
 
   /**
