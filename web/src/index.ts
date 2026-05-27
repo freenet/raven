@@ -224,6 +224,15 @@ const connection = new FreenetConnection({
             liked: signedLike.liked,
             signature: signedLike.signature,
           })
+          .then((ok) => {
+            // completeLike already fires a best-effort re-GET to reconcile, but
+            // that depends on a second round-trip succeeding (and the network
+            // condition that failed the UPDATE likely fails the GET too). On a
+            // hard false, revert the optimistic toggle from localPosts directly
+            // so the like never sticks on the card. Mirrors the likePost(false)
+            // and dropPendingLike paths.
+            if (!ok) refreshFeed();
+          })
           .catch((e) => console.error("[delegate] completeLike failed:", e));
         return;
       }
