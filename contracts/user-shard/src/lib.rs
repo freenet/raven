@@ -954,6 +954,56 @@ mod test {
     }
 
     #[test]
+    fn state_and_delta_merges_both() {
+        // The StateAndDelta update arm: a peer ships a full state AND a delta in
+        // one item. update_state must merge_state the state THEN apply the delta,
+        // so a record from each is present and post-merge invariants hold.
+        let owner = [1u8; 32];
+        let a = vk_hex([10u8; 32]);
+        // Full state: a post + a profile (seq 1) the peer already holds.
+        let src = apply(
+            owner,
+            empty_state(),
+            vec![
+                ShardDelta::Posts(vec![signed_post(owner, "from-state", 1)]),
+                ShardDelta::Op(profile_op(owner, &sample_profile(), 1)),
+            ],
+        );
+        // Delta: a follow op (a distinct second record on a distinct surface).
+        let delta = serde_json::to_vec(&ShardDelta::Op(follow_op(owner, &[&a], true, 1))).unwrap();
+
+        let res = UserShard::update_state(
+            params_of(owner),
+            State::from(empty_state()),
+            vec![UpdateData::StateAndDelta {
+                state: State::from(src),
+                delta: StateDelta::from(delta),
+            }],
+        )
+        .unwrap()
+        .unwrap_valid();
+        let shard: UserShard = serde_json::from_slice(res.as_ref()).unwrap();
+        // State's post merged in.
+        assert_eq!(shard.posts.len(), 1, "state post merged");
+        assert_eq!(shard.posts[0].content, "from-state");
+        // State's profile merged in.
+        assert_eq!(shard.profile.unwrap().profile.display_name, "Alice");
+        // Delta's follow merged in.
+        assert!(
+            shard.follows.get(&a).unwrap().following,
+            "delta follow merged"
+        );
+        // Canonical post order invariant: stored sorted by post_hash.
+        let mut sorted = shard.posts.clone();
+        sorted.sort_by_cached_key(post_hash);
+        assert_eq!(
+            shard.posts.iter().map(post_hash).collect::<Vec<_>>(),
+            sorted.iter().map(post_hash).collect::<Vec<_>>(),
+            "posts remain in canonical merge order"
+        );
+    }
+
+    #[test]
     fn validate_rejects_duplicate_ids() {
         let owner = [1u8; 32];
         let p = signed_post(owner, "dup", 1);

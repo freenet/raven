@@ -125,6 +125,68 @@ fn vk_hex(signing_key: &MlDsaSigningKey<MlDsa65>) -> String {
     hex::encode(signing_key.verifying_key().encode())
 }
 
+/// Assemble the canonical [`Post`] and sign it with `signing_key`.
+///
+/// This is the trusted producer of the signatures the user-shard contract
+/// verifies via [`Post::verify`]: it populates `author_pubkey` with the hex VK,
+/// derives the content-addressed id with the single trusted encoder
+/// (`common::post`), then signs that exact payload. A top-level post keeps
+/// `reply_to` empty so the signing payload is byte-identical to the
+/// pre-`reply_to` shape. Pure (no `ctx` / secret store) so it is unit-testable
+/// on the host target, where the secret store is unavailable.
+fn build_signed_post(
+    signing_key: &MlDsaSigningKey<MlDsa65>,
+    content: &str,
+    author_name: &str,
+    author_handle: &str,
+    timestamp: u64,
+) -> Post {
+    let public_key = vk_hex(signing_key);
+    let mut post = Post {
+        id: String::new(),
+        author_pubkey: public_key,
+        author_name: author_name.to_string(),
+        author_handle: author_handle.to_string(),
+        content: content.to_string(),
+        timestamp,
+        // Top-level post: empty reply_to keeps the signing payload byte-identical
+        // to the pre-reply_to shape. Reply signing (non-empty reply_to) arrives
+        // with thread-shard UI wiring (ADR-0001 Phase 4).
+        reply_to: String::new(),
+        signature: None,
+    };
+    post.id = post.compute_id();
+    let signature: ml_dsa::Signature<MlDsa65> = signing_key.sign(&post.signing_payload());
+    post.signature = Some(hex::encode(signature.encode()));
+    post
+}
+
+/// Assemble the canonical [`LikeRecord`] and sign it for `root_post_id`.
+///
+/// The thread shard verifies these via [`LikeRecord::verify`]. The signing
+/// payload (built by the single trusted encoder, `common::thread`) binds the
+/// **thread root id**, so a like signed for one thread can never be replayed
+/// into another. Pure (no `ctx` / secret store) so it is unit-testable on the
+/// host target. Returns the record and its hex-encoded signature.
+fn build_signed_like(
+    signing_key: &MlDsaSigningKey<MlDsa65>,
+    root_post_id: &str,
+    seq: u64,
+    liked: bool,
+) -> (LikeRecord, String) {
+    let signer_pubkey = vk_hex(signing_key);
+    let record = LikeRecord {
+        signer_pubkey,
+        seq,
+        liked,
+        writer_cert: None,
+        signature: None,
+    };
+    let signature: ml_dsa::Signature<MlDsa65> =
+        signing_key.sign(&record.signing_payload(root_post_id));
+    (record, hex::encode(signature.encode()))
+}
+
 #[delegate]
 impl DelegateInterface for IdentityDelegate {
     fn process(
@@ -275,31 +337,16 @@ fn sign_post(
         }
         Err(resp) => return resp,
     };
-    let public_key = vk_hex(&signing_key);
 
-    // Build the canonical record and derive its content-addressed id with the
-    // single trusted encoder (`common::post`), then sign that exact payload.
-    let mut post = Post {
-        id: String::new(),
-        author_pubkey: public_key.clone(),
-        author_name: author_name.to_string(),
-        author_handle: author_handle.to_string(),
-        content: content.to_string(),
-        timestamp,
-        // Top-level post: empty reply_to keeps the signing payload byte-identical
-        // to the pre-reply_to shape. Reply signing (non-empty reply_to) arrives
-        // with thread-shard UI wiring (ADR-0001 Phase 4).
-        reply_to: String::new(),
-        signature: None,
-    };
-    post.id = post.compute_id();
-    let signature: ml_dsa::Signature<MlDsa65> = signing_key.sign(&post.signing_payload());
+    // Build + sign the canonical record with the single trusted encoder
+    // (`common::post`) — the exact bytes the user-shard contract verifies.
+    let post = build_signed_post(&signing_key, content, author_name, author_handle, timestamp);
 
     Response::Signed {
         nonce: nonce.to_string(),
         post_id: post.id,
-        signature: hex::encode(signature.encode()),
-        public_key,
+        signature: post.signature.unwrap_or_default(),
+        public_key: post.author_pubkey,
     }
 }
 
@@ -322,27 +369,19 @@ fn sign_like(
         }
         Err(resp) => return resp,
     };
-    let signer_pubkey = vk_hex(&signing_key);
 
-    // Build the canonical record and sign its payload with the single trusted
-    // encoder (`common::thread`) — the same bytes the thread shard verifies.
-    let record = LikeRecord {
-        signer_pubkey: signer_pubkey.clone(),
-        seq,
-        liked,
-        writer_cert: None,
-        signature: None,
-    };
-    let signature: ml_dsa::Signature<MlDsa65> =
-        signing_key.sign(&record.signing_payload(root_post_id));
+    // Build + sign the canonical record with the single trusted encoder
+    // (`common::thread`) — the same bytes the thread shard verifies, bound to
+    // the thread root id.
+    let (record, signature) = build_signed_like(&signing_key, root_post_id, seq, liked);
 
     Response::SignedLike {
         nonce: nonce.to_string(),
         root_post_id: root_post_id.to_string(),
-        signer_pubkey,
+        signer_pubkey: record.signer_pubkey,
         seq,
         liked,
-        signature: hex::encode(signature.encode()),
+        signature,
     }
 }
 
@@ -402,5 +441,234 @@ fn import_identity(ctx: &mut DelegateCtx, secret_key_hex: &str, display_name: &s
         public_key,
         handle,
         display_name: display_name.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    //! Why these tests live here and not against `process()`:
+    //!
+    //! `process()` — and therefore the public `sign_post` / `sign_like` /
+    //! `export_identity` / `import_identity` entry points — reads and writes the
+    //! signer's seed through `DelegateCtx::{get_secret, set_secret}`. Those are
+    //! WASM host imports; on the host test target the stdlib stubs them to return
+    //! `None` / `false` (see `freenet_stdlib::delegate_host`). So a host-driven
+    //! `process()` call can never load a key and always returns the "no identity
+    //! found" error — it is genuinely undrivable off-WASM.
+    //!
+    //! What matters for on-network correctness is that the bytes the delegate
+    //! signs are the *same* bytes the contracts verify. That logic — payload
+    //! assembly, field population, id derivation, signature encoding — lives in
+    //! the pure `build_signed_post` / `build_signed_like` / `signing_key_from_seed`
+    //! / `vk_hex` helpers, which `sign_post` / `sign_like` / `export` / `import`
+    //! call verbatim. These tests exercise those exact helpers and then verify the
+    //! result with the SAME `common` verify code the contracts run, so a
+    //! divergence between signer and verifier fails here rather than on-network.
+    use super::*;
+    use freenet_microblogging_common::post::VerifyError as PostVerifyError;
+    use freenet_microblogging_common::thread::VerifyError as ThreadVerifyError;
+
+    const SEED_A: [u8; MLDSA_SEED_LEN] = [7u8; MLDSA_SEED_LEN];
+    const SEED_B: [u8; MLDSA_SEED_LEN] = [42u8; MLDSA_SEED_LEN];
+
+    // 1. export → import round-trip of the 64-hex secret seed yields the same
+    //    signing key / VK. Mirrors `export_identity` (hex::encode(seed)) feeding
+    //    `import_identity` (hex::decode → try_into → signing_key_from_seed).
+    #[test]
+    fn export_import_seed_roundtrip_preserves_key() {
+        let original = signing_key_from_seed(&SEED_A);
+        let exported_hex = hex::encode(SEED_A); // what export_identity emits
+
+        // 32-byte seed → 64 hex chars (the documented ImportIdentity contract).
+        assert_eq!(exported_hex.len(), MLDSA_SEED_LEN * 2);
+
+        // what import_identity does with the hex string.
+        let decoded = hex::decode(&exported_hex).expect("valid hex");
+        let reimported_seed: [u8; MLDSA_SEED_LEN] =
+            decoded.as_slice().try_into().expect("32 bytes");
+        let reimported = signing_key_from_seed(&reimported_seed);
+
+        assert_eq!(reimported_seed, SEED_A);
+        // Same VK after the full export→import cycle.
+        assert_eq!(vk_hex(&reimported), vk_hex(&original));
+    }
+
+    // 2. sign_post: the delegate's assembled Post + signature VERIFIES under
+    //    common's `Post::verify` — the same code the user-shard contract runs.
+    //    Confirms field population (author_pubkey casing, empty reply_to) matches
+    //    what the verifier reconstructs.
+    #[test]
+    fn signed_post_verifies_under_common() {
+        let sk = signing_key_from_seed(&SEED_A);
+        let post = build_signed_post(&sk, "hello raven", "Alice", "@alice", 1_700_000_000_000);
+
+        // The contract's acceptance check passes on the delegate's output.
+        assert_eq!(post.verify(), Ok(()));
+
+        // Field population the verifier depends on.
+        assert_eq!(post.author_pubkey, vk_hex(&sk)); // exact hex VK, lowercase
+        assert!(post.reply_to.is_empty()); // top-level post
+        assert_eq!(post.author_name, "Alice");
+        assert_eq!(post.author_handle, "@alice");
+        assert_eq!(post.content, "hello raven");
+        assert_eq!(post.timestamp, 1_700_000_000_000);
+        // id is the content address of the signed payload.
+        assert!(post.id_is_valid());
+        assert!(post.signature.is_some());
+    }
+
+    // 2b. A post signed by one key must NOT verify if the author_pubkey is
+    //     swapped to a different key — guards against the delegate emitting a VK
+    //     that does not match the signing key.
+    #[test]
+    fn signed_post_rejects_mismatched_author_key() {
+        let sk = signing_key_from_seed(&SEED_A);
+        let mut post = build_signed_post(&sk, "hello", "Alice", "@alice", 1);
+        // Swap in a different author key (recompute id so we isolate the
+        // signature check rather than tripping the id-mismatch guard first).
+        post.author_pubkey = vk_hex(&signing_key_from_seed(&SEED_B));
+        post.id = post.compute_id();
+        assert_eq!(post.verify(), Err(PostVerifyError::SignatureInvalid));
+    }
+
+    // 3. sign_like: the delegate's LikeRecord signature verifies under common's
+    //    thread verify, and is bound to the THREAD root_post_id. A cross-context
+    //    mix-up (verifying against a different root) MUST fail.
+    #[test]
+    fn signed_like_verifies_and_is_thread_bound() {
+        let sk = signing_key_from_seed(&SEED_A);
+        let root = "root_post_content_address_abc";
+        let (record, sig_hex) = build_signed_like(&sk, root, 1, true);
+
+        // Reassemble the on-wire record exactly as the UI folds it into the
+        // thread shard (signer_pubkey + seq + liked + the hex signature), then
+        // run the contract's verify.
+        let wire = LikeRecord {
+            signer_pubkey: record.signer_pubkey.clone(),
+            seq: record.seq,
+            liked: record.liked,
+            writer_cert: None,
+            signature: Some(sig_hex),
+        };
+        assert_eq!(wire.verify(root), Ok(()));
+
+        // Field population.
+        assert_eq!(wire.signer_pubkey, vk_hex(&sk));
+        assert_eq!(wire.seq, 1);
+        assert!(wire.liked);
+
+        // Thread binding: the same signed like must NOT verify under a different
+        // root id (cross-thread replay defense).
+        assert_eq!(
+            wire.verify("a_completely_different_root"),
+            Err(ThreadVerifyError::SignatureInvalid)
+        );
+    }
+
+    // 3b. Cross-CONTEXT mix-up: a like is bound to the thread root id via the
+    //     LIKE_DOMAIN_TAG'd payload. Signing for the thread root then trying to
+    //     verify with the *inbox* identifier (a foreign context value) in the
+    //     root slot must fail — the signature does not transplant between the
+    //     thread context and any other context that reuses the verify call.
+    #[test]
+    fn signed_like_does_not_verify_in_foreign_context() {
+        let sk = signing_key_from_seed(&SEED_A);
+        let thread_root = "thread:root_post_id_123";
+        let inbox_context = "inbox:recipient_pubkey_456"; // a non-thread identifier
+        let (record, sig_hex) = build_signed_like(&sk, thread_root, 5, true);
+
+        let wire = LikeRecord {
+            signer_pubkey: record.signer_pubkey,
+            seq: record.seq,
+            liked: record.liked,
+            writer_cert: None,
+            signature: Some(sig_hex),
+        };
+        // Verifies in its own thread context...
+        assert_eq!(wire.verify(thread_root), Ok(()));
+        // ...but a like signed for the thread cannot be replayed against any
+        // other context value occupying the root slot.
+        assert_eq!(
+            wire.verify(inbox_context),
+            Err(ThreadVerifyError::SignatureInvalid)
+        );
+    }
+
+    // 3c. seq / liked are signed: flipping either after signing breaks verify
+    //     (the delegate must sign exactly what it returns to the UI).
+    #[test]
+    fn signed_like_seq_and_flag_are_bound() {
+        let sk = signing_key_from_seed(&SEED_A);
+        let root = "root_xyz";
+        let (record, sig_hex) = build_signed_like(&sk, root, 3, true);
+
+        let tampered_seq = LikeRecord {
+            signer_pubkey: record.signer_pubkey.clone(),
+            seq: 4, // bumped
+            liked: record.liked,
+            writer_cert: None,
+            signature: Some(sig_hex.clone()),
+        };
+        assert_eq!(
+            tampered_seq.verify(root),
+            Err(ThreadVerifyError::SignatureInvalid)
+        );
+
+        let tampered_flag = LikeRecord {
+            signer_pubkey: record.signer_pubkey,
+            seq: 3,
+            liked: false, // flipped like→unlike
+            writer_cert: None,
+            signature: Some(sig_hex),
+        };
+        assert_eq!(
+            tampered_flag.verify(root),
+            Err(ThreadVerifyError::SignatureInvalid)
+        );
+    }
+
+    // 4. vk_hex encoding equals what the shard owner-param match expects: the
+    //    lowercase hex of the raw VK bytes, and it round-trips back to the same
+    //    VK bytes the verifier decodes.
+    #[test]
+    fn vk_hex_is_hex_of_raw_vk_bytes() {
+        let sk = signing_key_from_seed(&SEED_A);
+        let encoded = sk.verifying_key().encode();
+        let expected = hex::encode(encoded.as_slice());
+
+        let got = vk_hex(&sk);
+        assert_eq!(got, expected);
+        // ML-DSA-65 VK is 1952 bytes → 3904 hex chars (per the Response docs).
+        assert_eq!(got.len(), 1952 * 2);
+        // Lowercase hex (owner-param matching is byte-for-byte string equality).
+        assert_eq!(got, got.to_lowercase());
+        // Round-trips back to the same raw bytes the verifier decodes.
+        assert_eq!(hex::decode(&got).expect("valid hex"), encoded.as_slice());
+    }
+
+    // 5. seed → key determinism: the same seed always yields the same VK, and
+    //    two distinct seeds yield distinct VKs. This is the property `export` /
+    //    `import` and cross-device restore rely on.
+    #[test]
+    fn seed_to_key_is_deterministic() {
+        let a1 = vk_hex(&signing_key_from_seed(&SEED_A));
+        let a2 = vk_hex(&signing_key_from_seed(&SEED_A));
+        let b = vk_hex(&signing_key_from_seed(&SEED_B));
+
+        assert_eq!(a1, a2, "same seed must yield the same VK");
+        assert_ne!(a1, b, "distinct seeds must yield distinct VKs");
+    }
+
+    // Cross-check: a post and a like signed by the SAME key are domain-separated,
+    // so neither signature can be replayed as the other structure. (Guards the
+    // delegate's two signing paths against payload collision.)
+    #[test]
+    fn post_and_like_payloads_are_domain_separated() {
+        let sk = signing_key_from_seed(&SEED_A);
+        let post = build_signed_post(&sk, "x", "n", "h", 0);
+        let (like, _) = build_signed_like(&sk, "root", 0, true);
+        // Distinct domain tags (raven:post:v1 vs raven:thread-like:v1) guarantee
+        // the byte payloads differ.
+        assert_ne!(post.signing_payload(), like.signing_payload("root"));
     }
 }

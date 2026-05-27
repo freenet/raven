@@ -280,6 +280,42 @@ mod test {
     }
 
     #[test]
+    fn golden_like_signing_payload() {
+        // GOLDEN VECTOR — a change here means the signing format changed and ALL
+        // deployed like signatures break. Do not "fix" by updating the literal
+        // unless that break is intended and versioned (bump LIKE_DOMAIN_TAG).
+        // Injectivity tests do not catch a consistent sign+verify format shift.
+        let r = LikeRecord {
+            signer_pubkey: "aabbcc".into(),
+            seq: 3,
+            liked: true,
+            writer_cert: None,
+            signature: None,
+        };
+        let expected = "14000000726176656e3a7468726561642d6c696b653a76310b000000726f6f745f74\
+            6872656164060000006161626263630800000003000000000000000100000001";
+        let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(hex::encode(r.signing_payload("root_thread")), expected);
+    }
+
+    #[test]
+    fn golden_quote_signing_payload() {
+        // GOLDEN VECTOR — a change here means the signing format changed and ALL
+        // deployed quote-ref signatures break. Do not "fix" by updating the literal
+        // unless that break is intended and versioned (bump QUOTE_DOMAIN_TAG).
+        let q = QuoteRef {
+            signer_pubkey: "aabbcc".into(),
+            quote_post_id: "qid".into(),
+            writer_cert: None,
+            signature: None,
+        };
+        let expected = "15000000726176656e3a7468726561642d71756f74653a76310b000000726f6f745f\
+            7468726561640600000061616262636303000000716964";
+        let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(hex::encode(q.signing_payload("root_thread")), expected);
+    }
+
+    #[test]
     fn decodes_old_shape_records() {
         // Missing signature/writer_cert + unknown forward field must decode.
         let like: LikeRecord =

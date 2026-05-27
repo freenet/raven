@@ -700,6 +700,41 @@ mod test {
     }
 
     #[test]
+    fn state_and_delta_merges_both() {
+        // The StateAndDelta update arm: one update item carrying a full state AND
+        // a delta. update_state must merge_state the state THEN apply the delta,
+        // so a record from each is present and post-merge invariants hold.
+        // Full state: a reply + a like the peer already holds.
+        let mut src = ThreadShard::default();
+        let r = signed_reply([1u8; 32], "from-state", 100);
+        src.replies.insert(r.id.clone(), r.clone());
+        let lk = signed_like([2u8; 32], 1, true);
+        src.likes.insert(lk.signer_pubkey.clone(), lk);
+        // Delta: a quote (a distinct second record on a distinct surface).
+        let q = signed_quote([3u8; 32], "from-delta");
+        let delta = serde_json::to_vec(&ThreadDelta::Quotes(vec![q.clone()])).unwrap();
+
+        let out = run_update(
+            ThreadShard::default(),
+            vec![UpdateData::StateAndDelta {
+                state: state_of(&src),
+                delta: StateDelta::from(delta),
+            }],
+        );
+        // State's reply + like merged in.
+        assert_eq!(out.replies.len(), 1, "state reply merged");
+        assert!(out.replies.contains_key(&r.id));
+        assert_eq!(out.likes.len(), 1, "state like merged");
+        // Delta's quote merged in.
+        assert_eq!(out.quotes.len(), 1, "delta quote merged");
+        assert!(out.quotes.contains_key("from-delta"));
+        // Invariant: every reply still keyed under its own content address.
+        for (id, reply) in &out.replies {
+            assert_eq!(id, &reply.id);
+        }
+    }
+
+    #[test]
     fn validate_rejects_misfiled_reply_id() {
         let mut shard = ThreadShard::default();
         let r = signed_reply([1u8; 32], "x", 100);

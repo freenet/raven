@@ -203,12 +203,21 @@ cd web && npm test                                 # Web app (Vitest)
 
 ## Contract migration
 
+> **Status: removed.** The migration system (issue #20, the `web/src/migrations/`
+> scaffold + the global posts/follows/likes contracts) was torn down in #33 when
+> the app cut over to shards-only. Nothing was deployed, so there was no state to
+> migrate. There is currently **no** migration loop and **no** `web/src/migrations/`
+> directory — do not look for those files. A per-identity migration flow (GET old
+> derived key → decode → re-inject under the new key) is expected to return once
+> shard contracts are versioned; track it under a future issue, not #20/#23.
+>
+> The schema-tolerance and build-isolation policies below STILL APPLY to the shard
+> contracts — they keep a future hash rotation migratable.
+
 A contract's WASM hash changes whenever its source or any WASM-affecting
 dependency changes, and the contract key is derived from that hash. So a bump
 moves every user's state to a new key — stranding the old state unless we
-migrate it. The migration system (issue #20) detects a bump on startup and
-pulls stranded state into the new key. It runs in `FreenetConnection.connect`
-(`web/src/freenet-api.ts`) before subscribing.
+migrate it.
 
 ### Schema-tolerance policy (MANDATORY)
 
@@ -244,33 +253,25 @@ hash — a rotation is always a deliberate edit.
 2. Keep the schema byte-compatible — additive serde-default fields only. A
    JSON-schema change in the same release would fail `validate_state` per user;
    split it out with a dedicated re-shape pass.
-3. `cargo make build-contracts` to regenerate the WASM + hashes.
-4. Append the **prior** hash (the previous current-hash value) to that
-   contract's legacy list in `web/src/migrations/legacy-hashes.ts`
-   (`LEGACY_POSTS_CODE_HASHES` / `LEGACY_FOLLOWS_CODE_HASHES` /
-   `LEGACY_LIKES_CODE_HASHES`). Append-only, oldest → newest — never reorder or
-   delete. The new current hash MUST NOT appear in the legacy list (enforced by
-   `legacy-hashes.test.ts`).
-5. Ship. On next load the migration loop GETs the old key, decodes its state,
-   and re-injects it under the new key.
+3. `cargo make build-contracts` to regenerate the WASM + hashes. The shard code
+   hashes are injected into the web build via `web/vite.config.ts`
+   (`__USER_SHARD_CODE_HASH__` / `__THREAD_SHARD_CODE_HASH__`); the raw WASM is
+   mirrored to `web/public/` with a `b3sum == code_hash` build-check
+   (`scripts/mirror-shard-wasm.sh`).
+4. Ship. Because nothing is deployed and there is no migration loop, a bump
+   currently strands no state. Once shards carry deployed state, a hash rotation
+   will need the per-identity migration flow described below (re-introduce it
+   before rotating a live shard).
 
-### Helpers
+### Deferred (per-identity migration — when shards carry deployed state)
 
-- `web/src/migrations/legacy-hashes.ts` — per-contract legacy lists + current
-  hashes (wired from `web/vite.config.ts`) + the `MIGRATABLE_CONTRACTS` registry.
-- `web/src/migrations/candidates.ts` — pure `buildMigrationCandidates` /
-  `selectMigrateFrom` (ported from mail `ui/src/inbox.rs`).
-- `web/src/migrations/state-store.ts` — `MigrationStateStore` (localStorage-
-  backed today; a delegate-backed store swaps in for the per-identity era).
-- `web/src/migrations/run.ts` — `runMigrations`, the startup loop.
-
-### Deferred (per-identity — lands with #11/#13)
-
-Once profile/posts contracts become per-identity, extend the identity delegate's
-secret storage with a `{ contract_type → recorded_hash }` map (mirroring mail's
-`AliasInfo`) and run the same `selectMigrateFrom` / candidate-chain / re-inject
-flow against each identity's derived key. Cross-version contact interop follows
-then.
+Re-introduce a migration flow: extend the identity delegate's secret storage
+with a `{ shard_type → recorded_hash }` map (mirroring mail's `AliasInfo`), and
+on startup GET each identity's prior derived key, decode its state, and re-inject
+it under the new key (a shard PUT-of-existing runs the CRDT merge, so re-injection
+is convergent, not an overwrite). Track under a fresh issue — issue #20 and its
+follow-up #23 covered the now-deleted global-contract migration runtime and are
+obsolete.
 
 ## Contract correctness invariants (review checklist)
 
@@ -369,7 +370,8 @@ un-parameterized shard accepts nothing — a safe default, not a footgun).
 
 - All Freenet protocol messages use FlatBuffers types from the stdlib
 - Contract state is JSON-encoded, transported as `Uint8Array`
-- Delta updates are JSON arrays of post/action objects
+- Delta updates are externally-tagged enums (`ShardDelta` `{"Posts":[…]}`/`{"Op":…}`,
+  `ThreadDelta` `{"Likes":[…]}`/`{"Replies":…}`/`{"Quotes":…}`, `InboxDelta`), JSON-encoded — not bare arrays
 - WebSocket URL pattern: `ws://{host}/contract/command`
 - Contract keys derived from instance ID via `ContractKey.fromInstanceId()`
 - CSS follows BEM naming: `block__element--modifier`

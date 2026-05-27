@@ -530,6 +530,48 @@ it now also mirrors the raw wasm to `web/public/` and runs the b3sum check).
   skip the PUT and the first like's UPDATE would no-op. This is the key thing the
   deferred real-node test must confirm.
 
+## Post-cutover holistic review (fixes)
+
+A whole-system review after the teardown (#33) — reading all three shards + the
+delegate + the web client together, rather than one PR diff — surfaced fixes the
+per-slice reviews could not see:
+
+- **GET-response serialization (regression introduced by the teardown).** The
+  stdlib resolves GET promises from a single uncorrelated FIFO queue: the Nth
+  response settles the Nth pending `get()`, regardless of contract. The slice-1
+  `startupDone` barrier covered only startup-time traffic, which #33 removed — so
+  post-cutover the barrier serialized nothing while *multiple* shard flows
+  (user-shard probe/load, per-thread probe/like-refresh) were live at once. Two
+  in-flight GETs could swap responses: a thread GET resolving the user-shard probe
+  (feed never instantiates) or a like-refresh popping a thread probe (that thread
+  never PUT → the like is silently lost). Replaced the barrier with
+  `serializedGet` (`web/src/freenet-api.ts`): every `api.get()` chains behind the
+  previous one's settle, so at most one GET is outstanding and each response
+  matches its own promise. Pinned by `web/src/freenet-api.test.ts`.
+  - **Subtlety (caught in review):** the chain must advance on the UNDERLYING
+    `api.get()` settle, NOT on the app's soft timeout. The stdlib keeps a GET in
+    its `pendingGets` FIFO until a real response/NotFound or its own 30 s
+    `REQUEST_TIMEOUT_MS`. A shorter (8 s) app timeout that advanced the chain
+    would issue the next GET while the stale entry is still queued → two entries
+    → a late response pops the wrong promise (the same misroute). So
+    `serializedGet` chains on the raw stdlib promise and exposes the 8 s only as
+    a soft caller-facing view that does not release the next GET. Regression
+    guard: `does NOT advance the chain on the soft timeout`.
+- **Lost-like revert (M-3).** `ensureThreadShard` now awaits its PUT before the
+  caller sends the like UPDATE (an UPDATE to a never-instantiated contract is
+  dropped by the node), and `completeLike` re-GETs the authoritative aggregate on
+  UPDATE *failure* too, so the optimistic toggle is always reconciled away rather
+  than left stuck.
+- **Fabricated-engagement / dangling threads (H-3) — accepted + mitigated.** A
+  thread shard is keyed by a post id but the contract never checks the root post
+  is real, and a post evicted from the user-shard window (`MAX_POSTS`) leaves its
+  thread shard's likes orphaned. The client mitigation is already in place:
+  `onLikeUpdated` ignores aggregates for any post not in the live feed
+  (`index.ts`), and a post id is the blake3 of its own signed content, so an
+  attacker cannot pre-seed a *real* future post's thread. Residual: a like
+  aggregate trusts only the records present in the addressed thread shard; treat a
+  thread aggregate as authoritative only while its root post is in view.
+
 ## Testing tiers
 
 - **Unit** — per-function `#[test]`s inside each contract crate's `test` module:
@@ -552,8 +594,17 @@ it now also mirrors the raw wasm to `web/public/` and runs the b3sum check).
   WASM-compilation or transport differences. A real-node tier (via the
   `freenet:linux-test` / `freenet:local-dev` skills — publish the shards, drive
   reply/like/quote + two-peer sync over the live WS) is the next testing slice;
-  it is heavier and not a per-PR CI fit. The identity delegate also still lacks
-  unit coverage (deferred from Phase 0).
+  it is heavier and not a per-PR CI fit. It is the only tier that can confirm the
+  load-bearing `ensureThreadShard` GET-rejects-on-uninstantiated assumption above
+  and catch WASM-trap / node-vs-JS key-derivation drift. **Tracked as issue #34**
+  (not only this note).
+- **Delegate unit coverage (added in the holistic-review pass).** The identity
+  delegate now has unit tests (`delegates/identity/src/lib.rs`): export→import seed
+  round-trip, and the delegate's `SignPost`/`SignLike` outputs verify under the
+  same `common` code the contracts run (thread-context binding, vk_hex == owner
+  param). The end-to-end `process()` request path stays uncovered on the host
+  target (its secret store is a WASM-only host import) — exercised only by the
+  WASM-in-node tier above.
 
 `cargo make test` now runs `cargo test --workspace` (was a hand-maintained subset
 that omitted the user/thread shards and the delegate) so every crate — and these
