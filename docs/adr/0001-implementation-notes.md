@@ -548,6 +548,15 @@ per-slice reviews could not see:
   `serializedGet` (`web/src/freenet-api.ts`): every `api.get()` chains behind the
   previous one's settle, so at most one GET is outstanding and each response
   matches its own promise. Pinned by `web/src/freenet-api.test.ts`.
+  - **Subtlety (caught in review):** the chain must advance on the UNDERLYING
+    `api.get()` settle, NOT on the app's soft timeout. The stdlib keeps a GET in
+    its `pendingGets` FIFO until a real response/NotFound or its own 30 s
+    `REQUEST_TIMEOUT_MS`. A shorter (8 s) app timeout that advanced the chain
+    would issue the next GET while the stale entry is still queued → two entries
+    → a late response pops the wrong promise (the same misroute). So
+    `serializedGet` chains on the raw stdlib promise and exposes the 8 s only as
+    a soft caller-facing view that does not release the next GET. Regression
+    guard: `does NOT advance the chain on the soft timeout`.
 - **Lost-like revert (M-3).** `ensureThreadShard` now awaits its PUT before the
   caller sends the like UPDATE (an UPDATE to a never-instantiated contract is
   dropped by the node), and `completeLike` re-GETs the authoritative aggregate on

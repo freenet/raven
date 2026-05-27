@@ -242,25 +242,38 @@ export class FreenetConnection {
   /**
    * Issue a GET serialised behind {@link getChain}, so it is the only GET in
    * flight when its response arrives — defeating the stdlib's uncorrelated FIFO
-   * response queue. The returned promise resolves/rejects exactly with THIS
-   * GET's response (since no other GET overlaps it), and the chain advances on
-   * settle (success or failure) so one rejected/timed-out GET cannot wedge the
-   * rest. A per-GET timeout bounds head-of-line blocking.
+   * response queue.
+   *
+   * CRITICAL: the chain must advance on the UNDERLYING `api.get()` settle, not
+   * on a shorter app-level timeout. The stdlib keeps the GET registered in its
+   * `pendingGets` FIFO until either a real GetResponse/NotFound or its OWN
+   * `REQUEST_TIMEOUT_MS` (30 s) fires. If we advanced the chain on a 8 s app
+   * timeout we would issue the next `api.get()` while the timed-out one is still
+   * in `pendingGets` → two entries → a late response pops the wrong promise
+   * (the very misroute this exists to prevent). So `getChain` chains on the raw
+   * stdlib promise `p`; the chain can only advance once the stdlib entry is
+   * truly gone, and a genuinely hung GET still drains via the stdlib's 30 s
+   * reject. The caller's optional `ms` is a SOFT view (resolve/reject the caller
+   * early) that does NOT release the next GET.
    */
   private serializedGet(req: GetRequest, ms = 8000): Promise<GetResponse> {
     if (!this.api) return Promise.reject(new Error("no api"));
     const api = this.api;
-    const run = this.getChain.then(
-      () => this.withTimeout(api.get(req), ms),
-      () => this.withTimeout(api.get(req), ms),
+    // The raw stdlib GET — its settle is what owns a `pendingGets` slot.
+    const p = this.getChain.then(
+      () => api.get(req),
+      () => api.get(req),
     );
-    // Advance the chain on settle without propagating this GET's result/error
-    // to the next link (each caller still sees its own outcome via `run`).
-    this.getChain = run.then(
+    // Advance the chain ONLY when the stdlib GET itself settles (entry drained),
+    // never on the soft app timeout below.
+    this.getChain = p.then(
       () => undefined,
       () => undefined,
     );
-    return run;
+    // Caller sees a soft 8 s bound; the underlying GET keeps its stdlib slot
+    // until it really settles, so the chain stays correct even if the caller
+    // gave up. (`ms === 0` disables the soft timeout — caller awaits the raw GET.)
+    return ms > 0 ? this.withTimeout(p, ms) : p;
   }
 
   private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {

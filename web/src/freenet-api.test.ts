@@ -231,6 +231,41 @@ describe("FreenetConnection", () => {
       await flush();
       expect(api.getCalls.length).toBe(2);
     });
+
+    // Regression guard for H-A (skeptical review of PR #35): the soft 8 s app
+    // timeout MUST NOT advance the chain, because the stdlib keeps the timed-out
+    // GET in its `pendingGets` FIFO until a real response or its OWN 30 s reject.
+    // If the chain advanced on the soft timeout, the next api.get() would be
+    // issued while the stale entry is still queued → two entries → a late
+    // response pops the wrong promise (the misroute this fix exists to prevent).
+    it("does NOT advance the chain on the soft timeout — only on the real GET settle", async () => {
+      vi.useFakeTimers();
+      try {
+        const { conn, api } = makeConnection();
+
+        conn.setUser(OWNER_VK, "Alice", "alice"); // probe GET in flight
+        await vi.advanceTimersByTimeAsync(0);
+        expect(api.getCalls.length).toBe(1);
+
+        // A second serialised GET is queued behind the (still-unsettled) probe.
+        conn.loadState();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(api.getCalls.length).toBe(1);
+
+        // Fire the 8 s soft timeout WITHOUT settling the underlying GET. The
+        // stdlib entry is still live; the chain must stay blocked.
+        await vi.advanceTimersByTimeAsync(8000);
+        expect(api.getCalls.length).toBe(1); // 2nd GET still NOT issued
+
+        // Only once the real (late) GET settles does the chain advance.
+        api.getCalls[0].resolve({} as GetResponse);
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(api.getCalls.length).toBe(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe("dropPendingLike — nonce matching", () => {
