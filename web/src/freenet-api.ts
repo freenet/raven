@@ -24,7 +24,7 @@ import {
 import { ContractCodeT } from "@freenetorg/freenet-stdlib/common";
 import { Post } from "./types";
 import { deriveShardContractKey, hexToBytes } from "./shard-key";
-import { signPost, signLike, signRepost } from "./identity";
+import { signPost, signLike, signRepost, signQuoteRef } from "./identity";
 
 // Contract post format (matches Rust `common::post::Post`). Signature and
 // author_pubkey are hex strings (ML-DSA-65 sig 3309 B, VK 1952 B); the id is
@@ -36,6 +36,9 @@ interface ContractPost {
   author_handle: string;
   content: string;
   timestamp: number;
+  // Content address of the quoted post (quote repost), empty/absent otherwise.
+  // Matches the Rust `Post.quoted_post` additive field.
+  quoted_post?: string;
   signature: string | null;
 }
 
@@ -45,6 +48,8 @@ interface PendingPostDraft {
   author_handle: string;
   content: string;
   timestamp: number;
+  /** Set for a quote repost: the content address of the quoted post. */
+  quoted_post: string;
 }
 
 // User-shard state (matches Rust `UserShard`). Only `posts` is consumed by the
@@ -77,12 +82,21 @@ interface RepostRecord {
   signature: string | null;
 }
 
-// Thread-shard state (matches Rust `ThreadShard`). `likes` and `reposts` are
-// consumed for engagement aggregates; replies/quotes land in later slices.
+// A quote reference (matches Rust `common::thread::QuoteRef`). Records that
+// signer_pubkey quoted the thread's root post in their own quote_post_id.
+interface QuoteRefRecord {
+  signer_pubkey: string;
+  quote_post_id: string;
+  writer_cert?: unknown;
+  signature: string | null;
+}
+
+// Thread-shard state (matches Rust `ThreadShard`). `likes`, `reposts`, and
+// `quotes` are consumed for engagement aggregates; replies land in a later slice.
 interface ThreadShardState {
   replies?: Record<string, ContractPost>;
   likes?: Record<string, LikeRecord>;
-  quotes?: Record<string, unknown>;
+  quotes?: Record<string, QuoteRefRecord>;
   reposts?: Record<string, RepostRecord>;
 }
 
@@ -114,6 +128,19 @@ export interface RepostState {
   repostedByMe: boolean;
 }
 
+/** A pending quote-ref awaiting the delegate's `SignedQuoteRef`, keyed by nonce. */
+interface PendingQuoteRef {
+  nonce: string;
+  rootPostId: string;
+  quotePostId: string;
+}
+
+/** Aggregate quote state for one post, derived from its thread shard. */
+export interface QuoteState {
+  postId: string;
+  count: number;
+}
+
 // Convert contract format → UI format
 function contractPostToUiPost(cp: ContractPost): Post {
   return {
@@ -131,6 +158,8 @@ function contractPostToUiPost(cp: ContractPost): Post {
     replies: 0,
     liked: false,
     reposted: false,
+    quotes: 0,
+    quotedPostId: cp.quoted_post && cp.quoted_post.length > 0 ? cp.quoted_post : undefined,
   };
 }
 
@@ -160,6 +189,8 @@ export interface FreenetCallbacks {
   onLikeUpdated?: (like: LikeState) => void;
   /** Optional: live repost count / reposted-by-me for a post, from its thread shard. */
   onRepostUpdated?: (repost: RepostState) => void;
+  /** Optional: live quote-repost count for a post, from its thread shard. */
+  onQuoteUpdated?: (quote: QuoteState) => void;
 }
 
 export class FreenetConnection {
@@ -220,6 +251,8 @@ export class FreenetConnection {
   private likeRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Reposts awaiting a delegate `SignedRepost`, keyed by nonce. */
   private pendingReposts: PendingRepost[] = [];
+  /** Quote-refs awaiting a delegate `SignedQuoteRef`, keyed by nonce. */
+  private pendingQuoteRefs: PendingQuoteRef[] = [];
 
   constructor(callbacks: FreenetCallbacks) {
     this.callbacks = callbacks;
@@ -352,6 +385,7 @@ export class FreenetConnection {
         const thread = JSON.parse(json) as ThreadShardState;
         this.emitLikeState(threadRoot, thread.likes ?? {});
         this.emitRepostState(threadRoot, thread.reposts ?? {});
+        this.emitQuoteState(threadRoot, thread.quotes ?? {});
         return;
       }
       // The only other GET source is the owner's user shard. Drop anything else.
@@ -897,6 +931,26 @@ export class FreenetConnection {
    * per-request, so we hold the draft until the signature returns.)
    */
   async publishPost(content: string): Promise<boolean> {
+    return this.publishPostInternal(content, "");
+  }
+
+  /**
+   * Quote-repost `quotedPostId`: publish a new post that embeds it. The post
+   * carries `quoted_post = quotedPostId` (signed into its content address); once
+   * it lands, {@link completePublish} also signs a `QuoteRef` and folds it into
+   * the quoted post's thread shard so the quote count converges. Returns false
+   * if it cannot proceed (no shard / delegate).
+   */
+  async quotePost(quotedPostId: string, content: string): Promise<boolean> {
+    if (!quotedPostId) return false;
+    return this.publishPostInternal(content, quotedPostId);
+  }
+
+  /** Shared publish path; `quotedPost` empty for an ordinary post. */
+  private async publishPostInternal(
+    content: string,
+    quotedPost: string,
+  ): Promise<boolean> {
     // Posts go to the owner's user shard, instantiated once the identity is
     // known. No shard → cannot publish.
     if (!this.api || !this.userShardKey || !this.currentUser) {
@@ -914,6 +968,7 @@ export class FreenetConnection {
       author_handle: this.currentUser.handle,
       content,
       timestamp,
+      quoted_post: quotedPost,
     };
     this.pendingPosts.push(draft);
 
@@ -922,7 +977,8 @@ export class FreenetConnection {
       content,
       this.currentUser.name,
       this.currentUser.handle,
-      timestamp
+      timestamp,
+      quotedPost
     );
     if (!requested) {
       // No delegate (offline) — cannot sign, so cannot publish.
@@ -964,6 +1020,9 @@ export class FreenetConnection {
       author_handle: draft.author_handle,
       content: draft.content,
       timestamp: draft.timestamp,
+      // Carry the quote target through to the on-chain record; omitted (empty)
+      // for an ordinary post so the serialized shape is unchanged.
+      ...(draft.quoted_post ? { quoted_post: draft.quoted_post } : {}),
       signature: signed.signature,
     };
 
@@ -975,11 +1034,111 @@ export class FreenetConnection {
       const update = new UpdateData(UpdateDataType.DeltaUpdate, delta);
       const req = new UpdateRequest(this.userShardKey, update);
       await this.api.update(req);
+      // For a quote repost, also record a QuoteRef on the QUOTED post's thread
+      // shard (root = quoted_post id, quote_post_id = this new post's id) so the
+      // quoted post's quote count converges. Best-effort: a failure here leaves
+      // the quote post published but uncounted, which the next refresh repairs.
+      if (draft.quoted_post) {
+        this.recordQuoteRef(draft.quoted_post, post.id).catch((e) =>
+          console.error("[thread] recordQuoteRef failed:", e),
+        );
+      }
       return true;
     } catch (e) {
       console.error("[freenet] Failed to publish:", e);
       return false;
     }
+  }
+
+  /**
+   * Sign + fold a `QuoteRef` into the quoted post's thread shard. Mirrors the
+   * like/repost ensure→sign→complete flow: derive the thread shard for the
+   * quoted post, ask the delegate to sign a `QuoteRef` bound to it, and route
+   * the `SignedQuoteRef` to {@link completeQuoteRef}.
+   */
+  private async recordQuoteRef(
+    quotedPostId: string,
+    quotePostId: string,
+  ): Promise<boolean> {
+    if (!this.api) return false;
+    const key = this.threadKeyFor(quotedPostId);
+    if (!key) {
+      console.warn("[thread] no thread-shard code hash — cannot record quote");
+      return false;
+    }
+    await this.ensureThreadShard(key, quotedPostId);
+    this.subscribeThread(key);
+    const nonce = crypto.randomUUID();
+    this.pendingQuoteRefs.push({ nonce, rootPostId: quotedPostId, quotePostId });
+    const requested = signQuoteRef(nonce, quotedPostId, quotePostId);
+    if (!requested) {
+      this.pendingQuoteRefs.pop();
+      console.warn("[thread] cannot record quote: delegate not connected");
+      return false;
+    }
+    return true;
+  }
+
+  /** Complete a quote-ref once the delegate returns a `SignedQuoteRef`. */
+  async completeQuoteRef(signed: {
+    nonce: string;
+    root_post_id: string;
+    signer_pubkey: string;
+    quote_post_id: string;
+    signature: string;
+  }): Promise<boolean> {
+    if (!this.api) return false;
+    const idx = this.pendingQuoteRefs.findIndex((p) => p.nonce === signed.nonce);
+    if (idx === -1) {
+      console.warn("[thread] SignedQuoteRef with no matching pending ref", signed.nonce);
+      return false;
+    }
+    this.pendingQuoteRefs.splice(idx, 1);
+    const key = this.threadKeyFor(signed.root_post_id);
+    if (!key) return false;
+
+    const record: QuoteRefRecord = {
+      signer_pubkey: signed.signer_pubkey,
+      quote_post_id: signed.quote_post_id,
+      signature: signed.signature,
+    };
+    try {
+      const deltaBytes = new TextEncoder().encode(
+        JSON.stringify({ Quotes: [record] }),
+      );
+      const update = new UpdateData(
+        UpdateDataType.DeltaUpdate,
+        new DeltaUpdate(Array.from(deltaBytes)),
+      );
+      await this.api.update(new UpdateRequest(key, update));
+      this.refreshLikesNow(signed.root_post_id);
+      return true;
+    } catch (e) {
+      console.error("[thread] failed to send quote ref:", e);
+      this.refreshLikesNow(signed.root_post_id);
+      return false;
+    }
+  }
+
+  /** Drop a pending quote-ref by nonce (delegate Error). */
+  dropPendingQuoteRef(nonce: string): boolean {
+    const idx = this.pendingQuoteRefs.findIndex((p) => p.nonce === nonce);
+    if (idx === -1) return false;
+    this.pendingQuoteRefs.splice(idx, 1);
+    return true;
+  }
+
+  /**
+   * Reduce a thread shard's `quotes` map to a quote-repost count for the UI.
+   * Quotes are a grow-set (one entry per quoting post), so the count is the map
+   * size — no per-signer dedup or tombstones.
+   */
+  private emitQuoteState(
+    rootPostId: string,
+    quotes: Record<string, QuoteRefRecord>,
+  ): void {
+    const count = Object.keys(quotes).length;
+    this.callbacks.onQuoteUpdated?.({ postId: rootPostId, count });
   }
 
   /**

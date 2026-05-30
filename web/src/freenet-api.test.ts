@@ -99,6 +99,7 @@ vi.mock("./identity", () => ({
   signPost: vi.fn(() => true),
   signLike: vi.fn(() => true),
   signRepost: vi.fn(() => true),
+  signQuoteRef: vi.fn(() => true),
 }));
 
 import {
@@ -106,6 +107,7 @@ import {
   type FreenetCallbacks,
   type LikeState,
   type RepostState,
+  type QuoteState,
 } from "./freenet-api";
 
 // A real ML-DSA-65 VK is 1952 bytes → 3904 hex chars; setUser only initialises
@@ -120,12 +122,14 @@ function makeConnection() {
     onStatusChange: ReturnType<typeof vi.fn>;
     onLikeUpdated: ReturnType<typeof vi.fn>;
     onRepostUpdated: ReturnType<typeof vi.fn>;
+    onQuoteUpdated: ReturnType<typeof vi.fn>;
   } = {
     onPostsLoaded: vi.fn(),
     onNewPost: vi.fn(),
     onStatusChange: vi.fn(),
     onLikeUpdated: vi.fn(),
     onRepostUpdated: vi.fn(),
+    onQuoteUpdated: vi.fn(),
   };
   const conn = new FreenetConnection(callbacks as unknown as FreenetCallbacks);
   conn.connect();
@@ -135,6 +139,28 @@ function makeConnection() {
 
 /** Flush the microtask queue so chained `.then` callbacks run. */
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+/**
+ * Resolve every GET that appears over a few flush cycles as "exists", letting
+ * fire-and-forget serializedGet chains (e.g. recordQuoteRef → ensureThreadShard)
+ * make progress without depending on exact ordering. Returns the index of the
+ * last GET resolved.
+ */
+async function drainGets(api: FakeWsApi): Promise<void> {
+  for (let i = 0; i < 8; i++) {
+    await flush();
+    let resolvedAny = false;
+    for (const g of api.getCalls) {
+      if (!(g as unknown as { _settled?: boolean })._settled) {
+        (g as unknown as { _settled?: boolean })._settled = true;
+        g.resolve({} as GetResponse);
+        resolvedAny = true;
+      }
+    }
+    await flush();
+    if (!resolvedAny && i > 1) break;
+  }
+}
 
 beforeEach(() => {
   FakeWsApi.instances = [];
@@ -469,6 +495,125 @@ describe("FreenetConnection", () => {
 
       expect(conn.dropPendingRepost(nonce)).toBe(true);
       expect(conn.dropPendingRepost(nonce)).toBe(false);
+    });
+  });
+
+  describe("quote repost", () => {
+    it("quotePost publishes a post carrying quoted_post, then records a QuoteRef", async () => {
+      const { conn, api } = makeConnection();
+      conn.setUser(OWNER_VK, "Alice", "alice");
+      await flush();
+      if (api.getCalls.length) api.getCalls[0].resolve({} as GetResponse);
+      await flush();
+      await flush();
+
+      const signPostMock = (await import("./identity"))
+        .signPost as unknown as ReturnType<typeof vi.fn>;
+      const signQuoteRefMock = (await import("./identity"))
+        .signQuoteRef as unknown as ReturnType<typeof vi.fn>;
+
+      const ok = await conn.quotePost("quoted-post-id", "my take");
+      expect(ok).toBe(true);
+      // signPost was called WITH the quoted_post arg (6th positional).
+      const call = signPostMock.mock.calls[signPostMock.mock.calls.length - 1];
+      expect(call[1]).toBe("my take"); // content
+      expect(call[5]).toBe("quoted-post-id"); // quoted_post
+      const nonce = call[0] as string;
+
+      const updatesBefore = api.updateCalls.length;
+      // Complete the publish: sends the quote post to the user shard, then
+      // kicks off recordQuoteRef (ensure thread shard + signQuoteRef).
+      const pub = await conn.completePublish({
+        nonce,
+        post_id: "new-quote-post-id",
+        signature: "sig",
+        public_key: OWNER_VK,
+      });
+      expect(pub).toBe(true);
+      expect(api.updateCalls.length).toBe(updatesBefore + 1); // the quote post
+
+      // recordQuoteRef (fire-and-forget) derives the quoted post's thread shard
+      // via a probe GET. Drain any GETs that appear, resolving each as "exists"
+      // so ensureThreadShard returns and signQuoteRef fires.
+      await drainGets(api);
+      const qCall = signQuoteRefMock.mock.calls[signQuoteRefMock.mock.calls.length - 1];
+      expect(qCall).toBeDefined();
+      expect(qCall[1]).toBe("quoted-post-id"); // root = quoted post
+      expect(qCall[2]).toBe("new-quote-post-id"); // quote_post_id = new post
+    });
+
+    it("completeQuoteRef folds a Quotes delta into the quoted post's thread shard", async () => {
+      const { conn, api } = makeConnection();
+
+      const signQuoteRefMock = (await import("./identity"))
+        .signQuoteRef as unknown as ReturnType<typeof vi.fn>;
+      // Seed a pending quote-ref via the public quotePost→completePublish path is
+      // heavy; instead drive recordQuoteRef indirectly is private, so register
+      // through quotePost + completePublish like above, then complete the ref.
+      conn.setUser(OWNER_VK, "Alice", "alice");
+      await drainGets(api);
+      const signPostMock = (await import("./identity"))
+        .signPost as unknown as ReturnType<typeof vi.fn>;
+      await conn.quotePost("root-q", "c");
+      const pubNonce = signPostMock.mock.calls[signPostMock.mock.calls.length - 1][0] as string;
+      await conn.completePublish({
+        nonce: pubNonce,
+        post_id: "new-q",
+        signature: "s",
+        public_key: OWNER_VK,
+      });
+      await drainGets(api); // thread probe → signQuoteRef fires
+      const qNonce = signQuoteRefMock.mock.calls[signQuoteRefMock.mock.calls.length - 1][0] as string;
+
+      const updatesBefore = api.updateCalls.length;
+      const ok = await conn.completeQuoteRef({
+        nonce: qNonce,
+        root_post_id: "root-q",
+        signer_pubkey: OWNER_VK,
+        quote_post_id: "new-q",
+        signature: "s",
+      });
+      expect(ok).toBe(true);
+      expect(api.updateCalls.length).toBe(updatesBefore + 1); // Quotes delta sent
+      expect(conn.dropPendingQuoteRef(qNonce)).toBe(false); // consumed
+    });
+
+    it("a thread-shard GET emits onQuoteUpdated with the quote count", async () => {
+      const { conn, api, callbacks } = makeConnection();
+      conn.setUser(OWNER_VK, "Alice", "alice");
+      await flush();
+      api.getCalls[0].resolve({} as GetResponse);
+      await flush();
+      await flush();
+      if (api.getCalls[1]) api.getCalls[1].resolve({} as GetResponse);
+      await flush();
+      await flush();
+
+      // Register the thread instance→root mapping via a repost (cheapest path).
+      const rootId = "quote-thread-root";
+      const rp = conn.repostPost(rootId, true);
+      await flush();
+      const probe = api.getCalls[api.getCalls.length - 1];
+      probe.resolve({} as GetResponse);
+      await rp;
+
+      const quotes = {
+        q1: { signer_pubkey: OWNER_VK, quote_post_id: "p1", signature: "s" },
+        q2: { signer_pubkey: "cd".repeat(1952), quote_post_id: "p2", signature: "s" },
+      };
+      const stateBytes = Array.from(
+        new TextEncoder().encode(JSON.stringify({ quotes })),
+      );
+      callbacks.onQuoteUpdated.mockClear();
+      api.handler.onContractGet({
+        key: probe.req.key,
+        state: stateBytes,
+      } as unknown as GetResponse);
+
+      expect(callbacks.onQuoteUpdated).toHaveBeenCalledTimes(1);
+      const emitted = callbacks.onQuoteUpdated.mock.calls[0][0] as QuoteState;
+      expect(emitted.postId).toBe(rootId);
+      expect(emitted.count).toBe(2);
     });
   });
 

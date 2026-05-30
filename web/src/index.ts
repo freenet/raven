@@ -2,7 +2,7 @@ import "./scss/styles.scss";
 import { APP_NAME, APP_LOGO_URL } from "./branding";
 import { initTheme } from "./theme";
 import { createApp } from "./app";
-import { FreenetConnection, type LikeState, type RepostState } from "./freenet-api";
+import { FreenetConnection, type LikeState, type RepostState, type QuoteState } from "./freenet-api";
 import { Post } from "./types";
 import { createOnboarding } from "./components/onboarding";
 import {
@@ -95,6 +95,17 @@ function renderApp(identity: Identity): void {
         }
       });
     },
+    (postId: string, content: string) => {
+      connection.quotePost(postId, content).then((ok) => {
+        if (!ok) {
+          console.warn("[freenet] Quote not sent (no delegate / shard)");
+        } else {
+          // The quote post lands on the owner's user shard; refresh the feed so
+          // it shows up (same pattern as a normal publish).
+          setTimeout(() => connection.loadState(), 300);
+        }
+      });
+    },
   );
   appRoot.appendChild(appElement);
 
@@ -171,6 +182,13 @@ const connection = new FreenetConnection({
     if (!post) return;
     post.reposts = repost.count;
     post.reposted = repost.repostedByMe;
+    refreshFeed();
+  },
+  onQuoteUpdated: (quote: QuoteState) => {
+    // Authoritative quote-repost count from the post's thread shard.
+    const post = localPosts.find((p) => p.id === quote.postId);
+    if (!post) return;
+    post.quotes = quote.count;
     refreshFeed();
   },
   onDelegateResponse: (response: DelegateResponse) => {
@@ -292,6 +310,35 @@ const connection = new FreenetConnection({
         return;
       }
 
+      // A signed quote ref came back — fold it into the quoted post's thread shard.
+      const signedQuote = payload as {
+        type?: string;
+        nonce?: string;
+        root_post_id?: string;
+        signer_pubkey?: string;
+        quote_post_id?: string;
+        signature?: string;
+      };
+      if (
+        signedQuote.type === "SignedQuoteRef" &&
+        signedQuote.nonce &&
+        signedQuote.root_post_id &&
+        signedQuote.signer_pubkey &&
+        signedQuote.quote_post_id &&
+        signedQuote.signature
+      ) {
+        connection
+          .completeQuoteRef({
+            nonce: signedQuote.nonce,
+            root_post_id: signedQuote.root_post_id,
+            signer_pubkey: signedQuote.signer_pubkey,
+            quote_post_id: signedQuote.quote_post_id,
+            signature: signedQuote.signature,
+          })
+          .catch((e) => console.error("[delegate] completeQuoteRef failed:", e));
+        return;
+      }
+
       // Check for an error from the delegate.
       const p = payload as { type?: string; message?: string; nonce?: string };
       if (p.type === "Error") {
@@ -305,6 +352,7 @@ const connection = new FreenetConnection({
           // on its card — re-render from localPosts to revert it.
           if (connection.dropPendingLike(p.nonce)) refreshFeed();
           if (connection.dropPendingRepost(p.nonce)) refreshFeed();
+          connection.dropPendingQuoteRef(p.nonce);
         }
         if (p.message?.includes("no identity")) {
           console.log("[identity] No identity in delegate — show onboarding");
