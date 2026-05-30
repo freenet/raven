@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 pub const LIKE_DOMAIN_TAG: &[u8] = b"raven:thread-like:v1";
 /// Domain tag for a quote-reference record's signing payload.
 pub const QUOTE_DOMAIN_TAG: &[u8] = b"raven:thread-quote:v1";
+/// Domain tag for a repost record's signing payload.
+pub const REPOST_DOMAIN_TAG: &[u8] = b"raven:thread-repost:v1";
 
 /// Why a thread record failed verification.
 #[derive(Debug, PartialEq, Eq)]
@@ -95,6 +97,33 @@ pub struct QuoteRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer_cert: Option<WriterCert>,
     /// Hex-encoded ML-DSA-65 signature over [`QuoteRef::signing_payload`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// A signed "repost" (retweet/boost) of the thread's root post by
+/// `signer_pubkey` — an amplification with no body of its own, the plain-repost
+/// half of the engagement surface (the quote half is [`QuoteRef`] + a real
+/// post). Convergence is per-reposter and identical to [`LikeRecord`]: `seq` is
+/// a monotonic counter and `reposted` whether this is a repost (`true`) or an
+/// un-repost tombstone (`false`); the merge keeps the higher `seq` and an
+/// **un-repost wins an equal-`seq` tie**.
+///
+/// Schema-tolerance: additive fields carry `#[serde(default, …)]`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RepostRecord {
+    /// Hex-encoded ML-DSA-65 verifying key of the reposter.
+    pub signer_pubkey: String,
+    /// Monotonic per-reposter counter; resolves concurrent repost/un-repost
+    /// without a clock. Part of the signed payload so it cannot be forged to win
+    /// a race.
+    pub seq: u64,
+    /// `true` = repost, `false` = un-repost (a tombstone).
+    pub reposted: bool,
+    /// Optional writer credential (see [`WriterCert`]); unused today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_cert: Option<WriterCert>,
+    /// Hex-encoded ML-DSA-65 signature over [`RepostRecord::signing_payload`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }
@@ -180,6 +209,33 @@ impl QuoteRef {
     }
 }
 
+impl RepostRecord {
+    /// Bytes signed/verified: domain tag, **root post id** (binds to thread),
+    /// signer, seq, reposted. `signature` excluded (derived from this). Mirrors
+    /// [`LikeRecord::signing_payload`] under a distinct domain tag, so a repost
+    /// can never be replayed as a like (or vice versa).
+    pub fn signing_payload(&self, root_post_id: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        put(&mut buf, REPOST_DOMAIN_TAG);
+        put(&mut buf, root_post_id.as_bytes());
+        put(&mut buf, self.signer_pubkey.as_bytes());
+        put(&mut buf, &self.seq.to_le_bytes());
+        put(&mut buf, &[self.reposted as u8]);
+        buf
+    }
+
+    /// Verify the repost is well-formed and signed by `signer_pubkey` for the
+    /// given thread root. Does **not** check writer authority — that is the
+    /// contract's `verify_writer_cert` seam.
+    pub fn verify(&self, root_post_id: &str) -> Result<(), VerifyError> {
+        verify_sig(
+            &self.signer_pubkey,
+            self.signature.as_deref(),
+            &self.signing_payload(root_post_id),
+        )
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -194,6 +250,20 @@ mod test {
             signer_pubkey: hex::encode(sk.verifying_key().encode()),
             seq,
             liked,
+            writer_cert: None,
+            signature: None,
+        };
+        let sig: Signature<MlDsa65> = sk.sign(&r.signing_payload(ROOT));
+        r.signature = Some(hex::encode(sig.encode()));
+        r
+    }
+
+    fn signed_repost(seed: [u8; 32], seq: u64, reposted: bool) -> RepostRecord {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut r = RepostRecord {
+            signer_pubkey: hex::encode(sk.verifying_key().encode()),
+            seq,
+            reposted,
             writer_cert: None,
             signature: None,
         };
@@ -316,6 +386,76 @@ mod test {
     }
 
     #[test]
+    fn repost_verifies_for_its_thread() {
+        let r = signed_repost([1u8; 32], 1, true);
+        assert_eq!(r.verify(ROOT), Ok(()));
+    }
+
+    #[test]
+    fn repost_rejected_in_another_thread() {
+        // Thread binding: a repost signed for ROOT must not verify under a
+        // different root id (cross-thread replay defense).
+        let r = signed_repost([1u8; 32], 1, true);
+        assert_eq!(
+            r.verify("a_different_root"),
+            Err(VerifyError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn repost_rejects_tampered_seq_or_flag() {
+        let mut r = signed_repost([1u8; 32], 1, true);
+        let bumped = RepostRecord {
+            seq: 99,
+            ..r.clone()
+        };
+        assert_eq!(bumped.verify(ROOT), Err(VerifyError::SignatureInvalid));
+        r.reposted = false; // flip repost→un-repost without re-signing
+        assert_eq!(r.verify(ROOT), Err(VerifyError::SignatureInvalid));
+    }
+
+    #[test]
+    fn repost_rejects_missing_signature() {
+        let mut r = signed_repost([1u8; 32], 1, true);
+        r.signature = None;
+        assert_eq!(r.verify(ROOT), Err(VerifyError::BadSignature));
+    }
+
+    #[test]
+    fn repost_is_domain_separated_from_like() {
+        // Same root + signer + seq + flag, but a like payload and a repost
+        // payload must never collide (distinct domain tags), so neither can be
+        // replayed as the other.
+        let like = signed_like([3u8; 32], 0, true);
+        let repost = RepostRecord {
+            signer_pubkey: like.signer_pubkey.clone(),
+            seq: like.seq,
+            reposted: like.liked,
+            writer_cert: None,
+            signature: None,
+        };
+        assert_ne!(like.signing_payload(ROOT), repost.signing_payload(ROOT));
+    }
+
+    #[test]
+    fn golden_repost_signing_payload() {
+        // GOLDEN VECTOR — a change here means the signing format changed and ALL
+        // deployed repost signatures break. Do not "fix" by updating the literal
+        // unless that break is intended and versioned (bump REPOST_DOMAIN_TAG).
+        let r = RepostRecord {
+            signer_pubkey: "aabbcc".into(),
+            seq: 3,
+            reposted: true,
+            writer_cert: None,
+            signature: None,
+        };
+        let expected = "16000000726176656e3a7468726561642d7265706f73743a76310b000000726f6f745f\
+            746872656164060000006161626263630800000003000000000000000100000001";
+        let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(hex::encode(r.signing_payload("root_thread")), expected);
+    }
+
+    #[test]
     fn decodes_old_shape_records() {
         // Missing signature/writer_cert + unknown forward field must decode.
         let like: LikeRecord =
@@ -326,5 +466,9 @@ mod test {
             serde_json::from_str(r#"{"signer_pubkey":"ab","quote_post_id":"x","future":1}"#)
                 .unwrap();
         assert!(quote.signature.is_none());
+        let repost: RepostRecord =
+            serde_json::from_str(r#"{"signer_pubkey":"ab","seq":3,"reposted":true,"future":1}"#)
+                .unwrap();
+        assert!(repost.signature.is_none() && repost.writer_cert.is_none());
     }
 }

@@ -1,6 +1,6 @@
 #![allow(unexpected_cfgs)]
 use freenet_microblogging_common::post::Post;
-use freenet_microblogging_common::thread::LikeRecord;
+use freenet_microblogging_common::thread::{LikeRecord, RepostRecord};
 use freenet_stdlib::prelude::*;
 use ml_dsa::signature::{Keypair, Signer};
 use ml_dsa::{KeyGen, MlDsa65, SigningKey as MlDsaSigningKey};
@@ -47,6 +47,17 @@ enum Request {
         seq: u64,
         liked: bool,
     },
+    /// Sign a repost (or un-repost) for a thread. Mirrors `SignLike`: the
+    /// delegate builds the canonical `RepostRecord` payload via the single
+    /// trusted encoder (`common::thread`) and signs it. `root_post_id` is the
+    /// thread root; `seq` is the reposter's monotonic counter; `reposted` is
+    /// true to repost, false to un-repost (tombstone). `nonce` is echoed.
+    SignRepost {
+        nonce: String,
+        root_post_id: String,
+        seq: u64,
+        reposted: bool,
+    },
     /// Export the secret seed for backup/migration.
     ExportIdentity,
     /// Import a secret seed + identity from another device.
@@ -80,6 +91,17 @@ enum Response {
         signer_pubkey: String, // hex-encoded VK
         seq: u64,
         liked: bool,
+        signature: String, // hex-encoded ML-DSA-65 signature
+    },
+    /// A signed `RepostRecord` ready to fold into a thread shard via
+    /// `ThreadDelta::Reposts`. `nonce` is echoed; the other fields reconstruct
+    /// the exact signed record. Mirrors `SignedLike`.
+    SignedRepost {
+        nonce: String,
+        root_post_id: String,
+        signer_pubkey: String, // hex-encoded VK
+        seq: u64,
+        reposted: bool,
         signature: String, // hex-encoded ML-DSA-65 signature
     },
     ExportedIdentity {
@@ -187,6 +209,29 @@ fn build_signed_like(
     (record, hex::encode(signature.encode()))
 }
 
+/// Assemble the canonical [`RepostRecord`] and sign it for `root_post_id`.
+/// Mirror of [`build_signed_like`]; the thread shard verifies these via
+/// [`RepostRecord::verify`]. Pure (no `ctx` / secret store) so it is
+/// unit-testable on the host target.
+fn build_signed_repost(
+    signing_key: &MlDsaSigningKey<MlDsa65>,
+    root_post_id: &str,
+    seq: u64,
+    reposted: bool,
+) -> (RepostRecord, String) {
+    let signer_pubkey = vk_hex(signing_key);
+    let record = RepostRecord {
+        signer_pubkey,
+        seq,
+        reposted,
+        writer_cert: None,
+        signature: None,
+    };
+    let signature: ml_dsa::Signature<MlDsa65> =
+        signing_key.sign(&record.signing_payload(root_post_id));
+    (record, hex::encode(signature.encode()))
+}
+
 #[delegate]
 impl DelegateInterface for IdentityDelegate {
     fn process(
@@ -232,6 +277,12 @@ impl DelegateInterface for IdentityDelegate {
                         seq,
                         liked,
                     } => sign_like(ctx, &nonce, &root_post_id, seq, liked),
+                    Request::SignRepost {
+                        nonce,
+                        root_post_id,
+                        seq,
+                        reposted,
+                    } => sign_repost(ctx, &nonce, &root_post_id, seq, reposted),
                     Request::ExportIdentity => export_identity(ctx),
                     Request::ImportIdentity {
                         secret_key,
@@ -381,6 +432,41 @@ fn sign_like(
         signer_pubkey: record.signer_pubkey,
         seq,
         liked,
+        signature,
+    }
+}
+
+fn sign_repost(
+    ctx: &DelegateCtx,
+    nonce: &str,
+    root_post_id: &str,
+    seq: u64,
+    reposted: bool,
+) -> Response {
+    let signing_key = match load_signing_key(ctx) {
+        Ok(k) => k,
+        // Re-tag the load error with this request's nonce so the UI can drop
+        // exactly the stranded pending action.
+        Err(Response::Error { message, .. }) => {
+            return Response::Error {
+                message,
+                nonce: Some(nonce.to_string()),
+            };
+        }
+        Err(resp) => return resp,
+    };
+
+    // Build + sign the canonical record with the single trusted encoder
+    // (`common::thread`) — the same bytes the thread shard verifies, bound to
+    // the thread root id.
+    let (record, signature) = build_signed_repost(&signing_key, root_post_id, seq, reposted);
+
+    Response::SignedRepost {
+        nonce: nonce.to_string(),
+        root_post_id: root_post_id.to_string(),
+        signer_pubkey: record.signer_pubkey,
+        seq,
+        reposted,
         signature,
     }
 }
@@ -618,6 +704,67 @@ mod test {
             signer_pubkey: record.signer_pubkey,
             seq: 3,
             liked: false, // flipped like→unlike
+            writer_cert: None,
+            signature: Some(sig_hex),
+        };
+        assert_eq!(
+            tampered_flag.verify(root),
+            Err(ThreadVerifyError::SignatureInvalid)
+        );
+    }
+
+    // 3d. sign_repost: the delegate's RepostRecord signature verifies under
+    //     common's thread verify, is bound to the THREAD root, and seq/reposted
+    //     are signed (flipping either after signing breaks verify). Mirrors the
+    //     like tests — the same path the thread shard runs.
+    #[test]
+    fn signed_repost_verifies_and_is_thread_bound() {
+        let sk = signing_key_from_seed(&SEED_A);
+        let root = "root_post_content_address_abc";
+        let (record, sig_hex) = build_signed_repost(&sk, root, 1, true);
+
+        let wire = RepostRecord {
+            signer_pubkey: record.signer_pubkey.clone(),
+            seq: record.seq,
+            reposted: record.reposted,
+            writer_cert: None,
+            signature: Some(sig_hex),
+        };
+        assert_eq!(wire.verify(root), Ok(()));
+        assert_eq!(wire.signer_pubkey, vk_hex(&sk));
+        assert_eq!(wire.seq, 1);
+        assert!(wire.reposted);
+
+        // Thread binding: the same signed repost must NOT verify under a
+        // different root id (cross-thread replay defense).
+        assert_eq!(
+            wire.verify("a_completely_different_root"),
+            Err(ThreadVerifyError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn signed_repost_seq_and_flag_are_bound() {
+        let sk = signing_key_from_seed(&SEED_A);
+        let root = "root_xyz";
+        let (record, sig_hex) = build_signed_repost(&sk, root, 3, true);
+
+        let tampered_seq = RepostRecord {
+            signer_pubkey: record.signer_pubkey.clone(),
+            seq: 4, // bumped
+            reposted: record.reposted,
+            writer_cert: None,
+            signature: Some(sig_hex.clone()),
+        };
+        assert_eq!(
+            tampered_seq.verify(root),
+            Err(ThreadVerifyError::SignatureInvalid)
+        );
+
+        let tampered_flag = RepostRecord {
+            signer_pubkey: record.signer_pubkey,
+            seq: 3,
+            reposted: false, // flipped repost→un-repost
             writer_cert: None,
             signature: Some(sig_hex),
         };

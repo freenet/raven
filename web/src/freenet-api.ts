@@ -24,7 +24,7 @@ import {
 import { ContractCodeT } from "@freenetorg/freenet-stdlib/common";
 import { Post } from "./types";
 import { deriveShardContractKey, hexToBytes } from "./shard-key";
-import { signPost, signLike } from "./identity";
+import { signPost, signLike, signRepost } from "./identity";
 
 // Contract post format (matches Rust `common::post::Post`). Signature and
 // author_pubkey are hex strings (ML-DSA-65 sig 3309 B, VK 1952 B); the id is
@@ -66,12 +66,24 @@ interface LikeRecord {
   signature: string | null;
 }
 
-// Thread-shard state (matches Rust `ThreadShard`). Only `likes` is consumed in
-// this slice; replies/quotes land in later slices.
+// A repost record (matches Rust `common::thread::RepostRecord`). Mirror of
+// LikeRecord: signer_pubkey is the reposter's VK hex; `reposted` true=repost /
+// false=un-repost (tombstone); signature is over the canonical payload.
+interface RepostRecord {
+  signer_pubkey: string;
+  seq: number;
+  reposted: boolean;
+  writer_cert?: unknown;
+  signature: string | null;
+}
+
+// Thread-shard state (matches Rust `ThreadShard`). `likes` and `reposts` are
+// consumed for engagement aggregates; replies/quotes land in later slices.
 interface ThreadShardState {
   replies?: Record<string, ContractPost>;
   likes?: Record<string, LikeRecord>;
   quotes?: Record<string, unknown>;
+  reposts?: Record<string, RepostRecord>;
 }
 
 /** A pending like awaiting the delegate's `SignedLike`, keyed by nonce. */
@@ -81,11 +93,25 @@ interface PendingLike {
   liked: boolean;
 }
 
+/** A pending repost awaiting the delegate's `SignedRepost`, keyed by nonce. */
+interface PendingRepost {
+  nonce: string;
+  rootPostId: string;
+  reposted: boolean;
+}
+
 /** Aggregate like state for one post, derived from its thread shard. */
 export interface LikeState {
   postId: string;
   count: number;
   likedByMe: boolean;
+}
+
+/** Aggregate repost state for one post, derived from its thread shard. */
+export interface RepostState {
+  postId: string;
+  count: number;
+  repostedByMe: boolean;
 }
 
 // Convert contract format → UI format
@@ -132,6 +158,8 @@ export interface FreenetCallbacks {
   onDelegateResponse?: (response: DelegateResponse) => void;
   /** Optional: live like count / liked-by-me for a post, from its thread shard. */
   onLikeUpdated?: (like: LikeState) => void;
+  /** Optional: live repost count / reposted-by-me for a post, from its thread shard. */
+  onRepostUpdated?: (repost: RepostState) => void;
 }
 
 export class FreenetConnection {
@@ -190,6 +218,8 @@ export class FreenetConnection {
   private pendingLikes: PendingLike[] = [];
   /** Per-thread debounce timers coalescing like-refresh GETs (root id → timer). */
   private likeRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Reposts awaiting a delegate `SignedRepost`, keyed by nonce. */
+  private pendingReposts: PendingRepost[] = [];
 
   constructor(callbacks: FreenetCallbacks) {
     this.callbacks = callbacks;
@@ -313,13 +343,15 @@ export class FreenetConnection {
   private handleGetResponse(response: GetResponse): void {
     try {
       const respId = this.responseInstanceId(response.key);
-      // Thread-shard GET (a like refresh / subscription): recompute the post's
-      // like aggregate and emit it, independent of the user-shard feed below.
+      // Thread-shard GET (a like/repost refresh / subscription): recompute the
+      // post's engagement aggregates and emit them, independent of the
+      // user-shard feed below. One thread GET carries both surfaces.
       const threadRoot = respId ? this.threadInstanceToRoot.get(respId) : undefined;
       if (threadRoot) {
         const json = new TextDecoder("utf8").decode(Uint8Array.from(response.state));
         const thread = JSON.parse(json) as ThreadShardState;
         this.emitLikeState(threadRoot, thread.likes ?? {});
+        this.emitRepostState(threadRoot, thread.reposts ?? {});
         return;
       }
       // The only other GET source is the owner's user shard. Drop anything else.
@@ -584,7 +616,7 @@ export class FreenetConnection {
       contract,
     );
     const initialState = new TextEncoder().encode(
-      JSON.stringify({ replies: {}, likes: {}, quotes: {} }),
+      JSON.stringify({ replies: {}, likes: {}, quotes: {}, reposts: {} }),
     );
     await this.api.put(
       new PutRequest(container, Array.from(initialState), undefined, false, false),
@@ -622,6 +654,43 @@ export class FreenetConnection {
     if (!requested) {
       this.pendingLikes.pop();
       console.warn("[thread] cannot like: delegate not connected to sign");
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Repost or un-repost a post — the plain-repost (retweet) half of the
+   * engagement surface. Mirror of {@link likePost}: derives/instantiates the
+   * post's thread shard, then asks the delegate to sign a `RepostRecord`; the
+   * matching `SignedRepost` is routed to {@link completeRepost}, which folds it
+   * into the thread shard via `ThreadDelta::Reposts`. Returns false if it cannot
+   * proceed (no delegate / thread code hash). The authoritative count comes back
+   * via the thread-shard refresh GET after the update lands.
+   */
+  async repostPost(rootPostId: string, reposted: boolean): Promise<boolean> {
+    if (!this.api) return false;
+    const key = this.threadKeyFor(rootPostId);
+    if (!key) {
+      console.warn("[thread] no thread-shard code hash — cannot repost");
+      return false;
+    }
+    try {
+      await this.ensureThreadShard(key, rootPostId);
+      this.subscribeThread(key);
+    } catch (e) {
+      console.error("[thread] ensure/subscribe failed:", e);
+      return false;
+    }
+    const nonce = crypto.randomUUID();
+    this.pendingReposts.push({ nonce, rootPostId, reposted });
+    // seq is the reposter's monotonic counter; ms-precision time is monotonic
+    // enough for a single user's repost/un-repost toggles (the contract resolves
+    // concurrent same-key records by higher seq).
+    const requested = signRepost(nonce, rootPostId, Date.now(), reposted);
+    if (!requested) {
+      this.pendingReposts.pop();
+      console.warn("[thread] cannot repost: delegate not connected to sign");
       return false;
     }
     return true;
@@ -674,6 +743,53 @@ export class FreenetConnection {
     }
   }
 
+  /** Complete a repost once the delegate returns a `SignedRepost`. Mirror of
+   * {@link completeLike}. */
+  async completeRepost(signed: {
+    nonce: string;
+    root_post_id: string;
+    signer_pubkey: string;
+    seq: number;
+    reposted: boolean;
+    signature: string;
+  }): Promise<boolean> {
+    if (!this.api) return false;
+    const idx = this.pendingReposts.findIndex((p) => p.nonce === signed.nonce);
+    if (idx === -1) {
+      console.warn("[thread] SignedRepost with no matching pending repost", signed.nonce);
+      return false;
+    }
+    this.pendingReposts.splice(idx, 1);
+    const key = this.threadKeyFor(signed.root_post_id);
+    if (!key) return false;
+
+    const record: RepostRecord = {
+      signer_pubkey: signed.signer_pubkey,
+      seq: signed.seq,
+      reposted: signed.reposted,
+      signature: signed.signature,
+    };
+    try {
+      const deltaBytes = new TextEncoder().encode(
+        JSON.stringify({ Reposts: [record] }),
+      );
+      const update = new UpdateData(
+        UpdateDataType.DeltaUpdate,
+        new DeltaUpdate(Array.from(deltaBytes)),
+      );
+      await this.api.update(new UpdateRequest(key, update));
+      // Read back the authoritative aggregate once our own update lands.
+      this.refreshLikesNow(signed.root_post_id);
+      return true;
+    } catch (e) {
+      console.error("[thread] failed to send repost:", e);
+      // The update did not land — re-GET so the optimistic toggle is reconciled
+      // away (onRepostUpdated reverts the UI).
+      this.refreshLikesNow(signed.root_post_id);
+      return false;
+    }
+  }
+
   /** GET a post's thread shard now to recompute its like aggregate. */
   private refreshLikesNow(rootPostId: string): void {
     if (!this.api) return;
@@ -721,6 +837,18 @@ export class FreenetConnection {
   }
 
   /**
+   * Drop a pending repost by nonce (delegate returned an Error for it). Returns
+   * true if a pending repost was actually dropped, so the caller can revert the
+   * optimistic UI toggle. Mirror of {@link dropPendingLike}.
+   */
+  dropPendingRepost(nonce: string): boolean {
+    const idx = this.pendingReposts.findIndex((p) => p.nonce === nonce);
+    if (idx === -1) return false;
+    this.pendingReposts.splice(idx, 1);
+    return true;
+  }
+
+  /**
    * Reduce a thread shard's `likes` map to an aggregate for the UI: count of
    * records with `liked == true`, and whether the current owner is among them.
    */
@@ -736,6 +864,28 @@ export class FreenetConnection {
       }
     }
     this.callbacks.onLikeUpdated?.({ postId: rootPostId, count, likedByMe });
+  }
+
+  /**
+   * Reduce a thread shard's `reposts` map to an aggregate for the UI: count of
+   * records with `reposted == true`, and whether the current owner is among
+   * them. Mirror of {@link emitLikeState}.
+   */
+  private emitRepostState(
+    rootPostId: string,
+    reposts: Record<string, RepostRecord>,
+  ): void {
+    let count = 0;
+    let repostedByMe = false;
+    for (const rec of Object.values(reposts)) {
+      if (rec.reposted) {
+        count++;
+        if (this.ownerVkHex && rec.signer_pubkey === this.ownerVkHex) {
+          repostedByMe = true;
+        }
+      }
+    }
+    this.callbacks.onRepostUpdated?.({ postId: rootPostId, count, repostedByMe });
   }
 
   /**

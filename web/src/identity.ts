@@ -127,6 +127,29 @@ export function signLike(
   return true;
 }
 
+/**
+ * Ask the delegate to sign a repost/un-repost for a thread. Mirror of
+ * {@link signLike}: the delegate builds the canonical `RepostRecord` payload
+ * (common::thread) and replies with a `SignedRepost` routed through
+ * onDelegateResponse → freenet-api completeRepost. Returns false if no delegate.
+ */
+export function signRepost(
+  nonce: string,
+  rootPostId: string,
+  seq: number,
+  reposted: boolean
+): boolean {
+  if (!isDelegateConnected()) return false;
+  sendIdentityMessage(delegateApi!, delegateKeyBytes!, delegateCodeHashBytes!, {
+    type: "SignRepost",
+    nonce,
+    root_post_id: rootPostId,
+    seq,
+    reposted,
+  }).catch((e) => console.warn("[identity] SignRepost failed:", e));
+  return true;
+}
+
 export function exportIdentity(): void {
   if (!isDelegateConnected()) {
     // Offline / no delegate: synthesize a placeholder so the modal still appears

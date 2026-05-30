@@ -31,13 +31,16 @@
 //!   the user-shard follow rule). Capped post-merge by `truncate_likes`
 //!   (tombstones first, then a total order over keys).
 //! * **quotes** — grow-set deduped by `quote_post_id`, capped post-merge.
+//! * **reposts** — per-reposter join semilattice identical to **likes**: keep
+//!   the higher `seq` per reposter, un-repost wins an equal-`seq` tie. Capped
+//!   post-merge by `truncate_reposts`.
 //!
 //! `validate_state` checks authority + self-verification + thread-binding + no
 //! duplicates, but deliberately does **not** enforce the caps: a transiently
 //! over-bound merged state is normal, and rejecting it would break convergence.
 
 use freenet_microblogging_common::post::{MAX_CONTENT_LEN, Post};
-use freenet_microblogging_common::thread::{LikeRecord, QuoteRef, WriterCert};
+use freenet_microblogging_common::thread::{LikeRecord, QuoteRef, RepostRecord, WriterCert};
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -52,6 +55,10 @@ const MAX_LIKES: usize = 50_000;
 
 /// Cap on distinct quote references retained.
 const MAX_QUOTES: usize = 5_000;
+
+/// Cap on distinct reposters retained. Public-write, so this bounds flood blast
+/// radius alongside the (future) writer-credential gate. Mirrors `MAX_LIKES`.
+const MAX_REPOSTS: usize = 50_000;
 
 /// Thread shard state: replies, likes, and quote references for one root post.
 ///
@@ -77,6 +84,10 @@ struct ThreadShard {
     /// Quote references keyed by the quoting post's content-addressed id.
     #[serde(default)]
     quotes: BTreeMap<String, QuoteRef>,
+    /// Reposts keyed by reposter VK hex; the value is the full signed record,
+    /// kept so every merge path can re-verify it (same rationale as `likes`).
+    #[serde(default)]
+    reposts: BTreeMap<String, RepostRecord>,
 }
 
 impl<'a> TryFrom<State<'a>> for ThreadShard {
@@ -97,6 +108,8 @@ enum ThreadDelta {
     Likes(Vec<LikeRecord>),
     /// One or more quote references.
     Quotes(Vec<QuoteRef>),
+    /// One or more repost/un-repost records.
+    Reposts(Vec<RepostRecord>),
 }
 
 /// This thread's root post id, as the UTF-8 string carried in the contract
@@ -138,6 +151,14 @@ fn quote_is_acceptable(quote: &QuoteRef, root: &str) -> bool {
     !root.is_empty() && quote.verify(root).is_ok() && verify_writer_cert(quote.writer_cert.as_ref())
 }
 
+/// Whether a repost record is acceptable: thread-bound self-verifying signature
+/// and an acceptable writer credential. Mirrors `like_is_acceptable`.
+fn repost_is_acceptable(repost: &RepostRecord, root: &str) -> bool {
+    !root.is_empty()
+        && repost.verify(root).is_ok()
+        && verify_writer_cert(repost.writer_cert.as_ref())
+}
+
 /// Per-key like merge: does the incoming `(new_seq, new_liked)` replace the
 /// current record for a liker? Higher `seq` wins; on equal `seq` an **unlike**
 /// (`!liked`) wins. Identical to the user-shard follow rule — a deterministic,
@@ -163,6 +184,33 @@ fn merge_like(likes: &mut BTreeMap<String, LikeRecord>, like: LikeRecord, root: 
         Some(cur) if !like_replaces(like.seq, like.liked, cur) => {}
         _ => {
             likes.insert(like.signer_pubkey.clone(), like);
+        }
+    }
+}
+
+/// Per-key repost merge — identical join to `like_replaces`: higher `seq` wins;
+/// on equal `seq` an **un-repost** (`!reposted`) wins. Deterministic and
+/// order-independent.
+fn repost_replaces(new_seq: u64, new_reposted: bool, cur: &RepostRecord) -> bool {
+    if new_seq != cur.seq {
+        new_seq > cur.seq
+    } else {
+        !new_reposted && cur.reposted
+    }
+}
+
+/// Re-verify one repost for `root` and merge it by the per-reposter join rule.
+/// Every path into `shard.reposts` goes through here (public-write surface), so a
+/// repost without a valid signature for its named signer + this thread is never
+/// stored. Mirrors `merge_like`.
+fn merge_repost(reposts: &mut BTreeMap<String, RepostRecord>, repost: RepostRecord, root: &str) {
+    if !repost_is_acceptable(&repost, root) {
+        return;
+    }
+    match reposts.get(&repost.signer_pubkey) {
+        Some(cur) if !repost_replaces(repost.seq, repost.reposted, cur) => {}
+        _ => {
+            reposts.insert(repost.signer_pubkey.clone(), repost);
         }
     }
 }
@@ -215,12 +263,32 @@ fn truncate_quotes(quotes: &mut BTreeMap<String, QuoteRef>) {
     }
 }
 
+/// Truncate reposts to `MAX_REPOSTS` as a function of the key set: evict
+/// tombstones (un-reposts) first, then the largest reposter key. Deterministic
+/// and order-independent. Mirrors `truncate_likes`.
+fn truncate_reposts(reposts: &mut BTreeMap<String, RepostRecord>) {
+    if reposts.len() <= MAX_REPOSTS {
+        return;
+    }
+    let mut order: Vec<(bool, String)> = reposts
+        .iter()
+        .map(|(k, v)| (v.reposted, k.clone()))
+        .collect();
+    // Keep active reposts (reposted = true) before tombstones; within a class,
+    // keep smaller keys. Sort so survivors come first: reposted desc, key asc.
+    order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    for (_, key) in order.into_iter().skip(MAX_REPOSTS) {
+        reposts.remove(&key);
+    }
+}
+
 /// Normalize a merged state: enforce all caps post-merge. Pure function of the
 /// accumulated sets.
 fn normalize(shard: &mut ThreadShard) {
     truncate_replies(&mut shard.replies);
     truncate_likes(&mut shard.likes);
     truncate_quotes(&mut shard.quotes);
+    truncate_reposts(&mut shard.reposts);
 }
 
 /// Apply one decoded `ThreadDelta` to the shard. Unacceptable entries are
@@ -250,6 +318,11 @@ fn apply_thread_delta(shard: &mut ThreadShard, delta: ThreadDelta, root: &str) {
                         .entry(quote.quote_post_id.clone())
                         .or_insert(quote);
                 }
+            }
+        }
+        ThreadDelta::Reposts(reposts) => {
+            for repost in reposts {
+                merge_repost(&mut shard.reposts, repost, root);
             }
         }
     }
@@ -308,6 +381,9 @@ fn apply_state_delta(shard: &mut ThreadShard, sd: ThreadStateDelta, root: &str) 
     for like in sd.likes {
         merge_like(&mut shard.likes, like, root);
     }
+    for repost in sd.reposts {
+        merge_repost(&mut shard.reposts, repost, root);
+    }
 }
 
 /// Full-state merge: fold every surface of `other` into `shard` under the same
@@ -329,6 +405,9 @@ fn merge_state(shard: &mut ThreadShard, other: ThreadShard, root: &str) {
         if quote_is_acceptable(&quote, root) {
             shard.quotes.entry(qid).or_insert(quote);
         }
+    }
+    for (_signer, repost) in other.reposts {
+        merge_repost(&mut shard.reposts, repost, root);
     }
 }
 
@@ -364,6 +443,13 @@ impl ContractInterface for ThreadShard {
         // its quote_post_id.
         for (qid, quote) in &shard.quotes {
             if qid != &quote.quote_post_id || !quote_is_acceptable(quote, &root) {
+                return Err(ContractError::InvalidState);
+            }
+        }
+        // Every repost must self-verify for this thread and key under its own
+        // signer — the same full re-proof update_state performs (mirrors likes).
+        for (signer, repost) in &shard.reposts {
+            if signer != &repost.signer_pubkey || !repost_is_acceptable(repost, &root) {
                 return Err(ContractError::InvalidState);
             }
         }
@@ -418,6 +504,13 @@ impl ContractInterface for ThreadShard {
                 .map(|(k, v)| (k.clone(), v.seq, v.liked))
                 .collect(),
             quotes: shard.quotes.keys().cloned().collect(),
+            // (signer, seq, reposted) — enough to diff which reposters the
+            // requester is stale on; the full signed record ships in the delta.
+            reposts: shard
+                .reposts
+                .iter()
+                .map(|(k, v)| (k.clone(), v.seq, v.reposted))
+                .collect(),
         };
         let bytes =
             serde_json::to_vec(&summary).map_err(|e| ContractError::Other(format!("{e}")))?;
@@ -439,6 +532,11 @@ impl ContractInterface for ThreadShard {
             .likes
             .iter()
             .map(|(k, seq, liked)| (k, (*seq, *liked)))
+            .collect();
+        let have_reposts: BTreeMap<&String, (u64, bool)> = have
+            .reposts
+            .iter()
+            .map(|(k, seq, reposted)| (k, (*seq, *reposted)))
             .collect();
 
         // Replies the requester lacks.
@@ -468,10 +566,25 @@ impl ContractInterface for ThreadShard {
             .map(|(_, v)| v.clone())
             .collect();
 
+        // Reposts the requester lacks or has at a lower (seq, reposted-rank).
+        // Ship the full signed record so the receiver re-verifies it.
+        let reposts_delta: Vec<RepostRecord> = shard
+            .reposts
+            .iter()
+            .filter(|(k, v)| match have_reposts.get(*k) {
+                Some((seq, reposted)) => {
+                    v.seq > *seq || (v.seq == *seq && *reposted && !v.reposted)
+                }
+                None => true,
+            })
+            .map(|(_, v)| v.clone())
+            .collect();
+
         let delta = ThreadStateDelta {
             replies: missing_replies,
             quotes: missing_quotes,
             likes: likes_delta,
+            reposts: reposts_delta,
         };
         let bytes = serde_json::to_vec(&delta).map_err(|e| ContractError::Other(format!("{e}")))?;
         Ok(StateDelta::from(bytes))
@@ -489,6 +602,9 @@ struct ThreadSummary {
     likes: Vec<(String, u64, bool)>,
     #[serde(default)]
     quotes: Vec<String>,
+    /// (signer, seq, reposted) so a stale repost can be refreshed.
+    #[serde(default)]
+    reposts: Vec<(String, u64, bool)>,
 }
 
 /// The delta `get_state_delta` ships: all three surfaces in one message, each a
@@ -504,12 +620,14 @@ struct ThreadStateDelta {
     likes: Vec<LikeRecord>,
     #[serde(default)]
     quotes: Vec<QuoteRef>,
+    #[serde(default)]
+    reposts: Vec<RepostRecord>,
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use freenet_microblogging_common::thread::{LikeRecord, QuoteRef};
+    use freenet_microblogging_common::thread::{LikeRecord, QuoteRef, RepostRecord};
     use ml_dsa::KeyGen;
     use ml_dsa::signature::{Keypair, Signer};
     use ml_dsa::{MlDsa65, Signature};
@@ -569,6 +687,20 @@ mod test {
         let sig: Signature<MlDsa65> = sk.sign(&q.signing_payload(ROOT));
         q.signature = Some(hex::encode(sig.encode()));
         q
+    }
+
+    fn signed_repost(seed: [u8; 32], seq: u64, reposted: bool) -> RepostRecord {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut r = RepostRecord {
+            signer_pubkey: hex::encode(sk.verifying_key().encode()),
+            seq,
+            reposted,
+            writer_cert: None,
+            signature: None,
+        };
+        let sig: Signature<MlDsa65> = sk.sign(&r.signing_payload(ROOT));
+        r.signature = Some(hex::encode(sig.encode()));
+        r
     }
 
     fn state_of(shard: &ThreadShard) -> State<'static> {
@@ -680,6 +812,88 @@ mod test {
             vec![delta_item(&ThreadDelta::Likes(vec![bad]))],
         );
         assert!(out.likes.is_empty());
+    }
+
+    #[test]
+    fn reposts_converge_equal_seq_unrepost_wins() {
+        // Same reposter, same seq, Repost vs Un-repost → un-repost wins
+        // regardless of order (equal-seq tie-break, mirroring likes).
+        let repost = signed_repost([2u8; 32], 5, true);
+        let unrepost = signed_repost([2u8; 32], 5, false);
+
+        let a = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Reposts(vec![
+                repost.clone(),
+                unrepost.clone(),
+            ]))],
+        );
+        let b = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Reposts(vec![unrepost, repost]))],
+        );
+        let signer = vk_hex([2u8; 32]);
+        assert!(!a.reposts[&signer].reposted);
+        assert_eq!(a.reposts[&signer], b.reposts[&signer]);
+    }
+
+    #[test]
+    fn reposts_higher_seq_wins() {
+        let r1 = signed_repost([2u8; 32], 1, true);
+        let r2 = signed_repost([2u8; 32], 2, false);
+        let out = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Reposts(vec![r2, r1]))],
+        );
+        let signer = vk_hex([2u8; 32]);
+        assert_eq!(out.reposts[&signer].seq, 2);
+        assert!(!out.reposts[&signer].reposted);
+    }
+
+    #[test]
+    fn tampered_repost_signature_rejected() {
+        let mut bad = signed_repost([2u8; 32], 1, true);
+        bad.seq = 99; // breaks signature
+        let out = run_update(
+            ThreadShard::default(),
+            vec![delta_item(&ThreadDelta::Reposts(vec![bad]))],
+        );
+        assert!(out.reposts.is_empty());
+    }
+
+    #[test]
+    fn forged_repost_via_full_state_merge_rejected() {
+        // A peer ships a full ThreadShard with a repost whose signature does not
+        // verify; merge_state must re-verify and drop it (public-write surface).
+        let mut forged = signed_repost([2u8; 32], 1, true);
+        forged.reposted = false; // flip after signing → bad signature
+        let mut malicious = ThreadShard::default();
+        malicious
+            .reposts
+            .insert(forged.signer_pubkey.clone(), forged);
+        let out = run_update(
+            ThreadShard::default(),
+            vec![UpdateData::State(State::from(
+                serde_json::to_vec(&malicious).unwrap(),
+            ))],
+        );
+        assert!(out.reposts.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_forged_repost_state() {
+        // validate_state must reject a state carrying a repost that does not
+        // self-verify, so it agrees with update_state (AGENTS.md → "validate
+        // agrees with update").
+        let mut forged = signed_repost([2u8; 32], 1, true);
+        forged.reposted = false; // break signature
+        let mut shard = ThreadShard::default();
+        shard.reposts.insert(forged.signer_pubkey.clone(), forged);
+        let res =
+            ThreadShard::validate_state(params(), state_of(&shard), RelatedContracts::default());
+        // validate_state signals a forged repost via Err(InvalidState) (same as
+        // the forged-like path), not Ok(Invalid).
+        assert!(res.is_err());
     }
 
     #[test]
@@ -997,6 +1211,20 @@ mod integration {
         q
     }
 
+    fn repost(seed: [u8; 32], seq: u64, reposted: bool) -> RepostRecord {
+        let sk = MlDsa65::from_seed(&seed.into());
+        let mut r = RepostRecord {
+            signer_pubkey: hex::encode(sk.verifying_key().encode()),
+            seq,
+            reposted,
+            writer_cert: None,
+            signature: None,
+        };
+        let sig: Signature<MlDsa65> = sk.sign(&r.signing_payload(ROOT));
+        r.signature = Some(hex::encode(sig.encode()));
+        r
+    }
+
     /// Apply a batch of deltas to a replica, returning its new state — the
     /// contract's own `update_state`, exactly as a node would call it.
     fn apply(shard: &ThreadShard, items: Vec<UpdateData<'static>>) -> ThreadShard {
@@ -1058,6 +1286,7 @@ mod integration {
                 delta(&ThreadDelta::Replies(vec![reply([1; 32], "a-reply", 100)])),
                 delta(&ThreadDelta::Likes(vec![like([2; 32], 1, true)])),
                 delta(&ThreadDelta::Quotes(vec![quote([3; 32], "qa")])),
+                delta(&ThreadDelta::Reposts(vec![repost([6; 32], 1, true)])),
             ],
         );
         let b = apply(
@@ -1065,6 +1294,7 @@ mod integration {
             vec![
                 delta(&ThreadDelta::Replies(vec![reply([4; 32], "b-reply", 200)])),
                 delta(&ThreadDelta::Likes(vec![like([5; 32], 1, true)])),
+                delta(&ThreadDelta::Reposts(vec![repost([8; 32], 1, true)])),
             ],
         );
 
@@ -1074,6 +1304,40 @@ mod integration {
         assert_eq!(a2.replies.len(), 2);
         assert_eq!(a2.likes.len(), 2);
         assert_eq!(a2.quotes.len(), 1);
+        assert_eq!(a2.reposts.len(), 2);
+    }
+
+    #[test]
+    fn concurrent_repost_unrepost_converges_over_sync() {
+        // Same reposter, equal seq, opposite intents on the two replicas — must
+        // settle on the un-repost (equal-seq tie-break) over the sync protocol,
+        // in either reconcile direction. Mirrors the like case.
+        let empty = ThreadShard::default();
+        let a = apply(
+            &empty,
+            vec![delta(&ThreadDelta::Reposts(vec![repost([9; 32], 5, true)]))],
+        );
+        let b = apply(
+            &empty,
+            vec![delta(&ThreadDelta::Reposts(vec![repost(
+                [9; 32], 5, false,
+            )]))],
+        );
+
+        let (a2, b2) = reconcile(&a, &b);
+        assert_eq!(canonical(&a2), canonical(&b2));
+        let signer = hex::encode(
+            MlDsa65::from_seed(&[9u8; 32].into())
+                .verifying_key()
+                .encode(),
+        );
+        assert!(
+            !a2.reposts[&signer].reposted,
+            "equal-seq un-repost wins after sync"
+        );
+
+        let (b3, a3) = reconcile(&b, &a);
+        assert_eq!(canonical(&a3), canonical(&b3));
     }
 
     #[test]

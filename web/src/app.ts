@@ -8,6 +8,7 @@ import { Post } from "./types";
 export function createApp(
   publishFn?: (content: string) => Promise<boolean>,
   likeFn?: (postId: string, liked: boolean) => void,
+  repostFn?: (postId: string, reposted: boolean) => void,
 ): HTMLElement {
   const posts: Post[] = [];
   const followedPubkeys = new Set<string>();
@@ -33,7 +34,8 @@ export function createApp(
       }
     },
     followedPubkeys,
-    likeFn
+    likeFn,
+    repostFn
   );
 
   mainArea.appendChild(feed);
