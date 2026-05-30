@@ -39,6 +39,8 @@ const ICON_SHARE = `<svg width="18" height="18" viewBox="0 0 18 18" fill="none" 
 export interface PostCardCallbacks {
   /** Fired on a like toggle. `liked` is the new desired state. */
   onLike?: (postId: string, liked: boolean) => void;
+  /** Fired on a repost toggle. `reposted` is the new desired state. */
+  onRepost?: (postId: string, reposted: boolean) => void;
 }
 
 export function createPostCard(
@@ -185,7 +187,8 @@ export function createPostCard(
   const reply = makeAction("reply", ICON_REPLY, replyCount);
   reply.btn.setAttribute("aria-label", "Reply");
 
-  // Repost (local toggle)
+  // Repost (optimistic toggle; authoritative count returns via onRepostUpdated
+  // and is reconciled by the feed re-render, mirroring likes).
   const repostEl = makeAction("repost", ICON_REPOST, repostCount);
   repostEl.btn.setAttribute("aria-label", "Repost");
   if (reposted) repostEl.btn.classList.add("is-active");
@@ -195,7 +198,7 @@ export function createPostCard(
     repostCount += reposted ? 1 : -1;
     repostEl.countEl.textContent = repostCount > 0 ? String(repostCount) : "";
     repostEl.btn.classList.toggle("is-active", reposted);
-    // TODO: wire to reposts contract
+    callbacks.onRepost?.(post.id, reposted);
   });
 
   // Like (local toggle)

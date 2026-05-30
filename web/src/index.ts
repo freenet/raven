@@ -2,7 +2,7 @@ import "./scss/styles.scss";
 import { APP_NAME, APP_LOGO_URL } from "./branding";
 import { initTheme } from "./theme";
 import { createApp } from "./app";
-import { FreenetConnection, type LikeState } from "./freenet-api";
+import { FreenetConnection, type LikeState, type RepostState } from "./freenet-api";
 import { Post } from "./types";
 import { createOnboarding } from "./components/onboarding";
 import {
@@ -86,6 +86,15 @@ function renderApp(identity: Identity): void {
         }
       });
     },
+    (postId: string, reposted: boolean) => {
+      connection.repostPost(postId, reposted).then((ok) => {
+        if (!ok) {
+          console.warn("[freenet] Repost not sent (no delegate / thread shard)");
+          // Revert the optimistic toggle from localPosts.
+          refreshFeed();
+        }
+      });
+    },
   );
   appRoot.appendChild(appElement);
 
@@ -153,6 +162,15 @@ const connection = new FreenetConnection({
     if (!post) return;
     post.likes = like.count;
     post.liked = like.likedByMe;
+    refreshFeed();
+  },
+  onRepostUpdated: (repost: RepostState) => {
+    // Authoritative repost aggregate from the post's thread shard — reconcile
+    // the optimistic UI with real state and re-render. Mirror of onLikeUpdated.
+    const post = localPosts.find((p) => p.id === repost.postId);
+    if (!post) return;
+    post.reposts = repost.count;
+    post.reposted = repost.repostedByMe;
     refreshFeed();
   },
   onDelegateResponse: (response: DelegateResponse) => {
@@ -237,17 +255,56 @@ const connection = new FreenetConnection({
         return;
       }
 
+      // A signed repost came back — fold it into the post's thread shard.
+      const signedRepost = payload as {
+        type?: string;
+        nonce?: string;
+        root_post_id?: string;
+        signer_pubkey?: string;
+        seq?: number;
+        reposted?: boolean;
+        signature?: string;
+      };
+      if (
+        signedRepost.type === "SignedRepost" &&
+        signedRepost.nonce &&
+        signedRepost.root_post_id &&
+        signedRepost.signer_pubkey &&
+        typeof signedRepost.seq === "number" &&
+        typeof signedRepost.reposted === "boolean" &&
+        signedRepost.signature
+      ) {
+        connection
+          .completeRepost({
+            nonce: signedRepost.nonce,
+            root_post_id: signedRepost.root_post_id,
+            signer_pubkey: signedRepost.signer_pubkey,
+            seq: signedRepost.seq,
+            reposted: signedRepost.reposted,
+            signature: signedRepost.signature,
+          })
+          .then((ok) => {
+            // On a hard false, revert the optimistic toggle from localPosts so
+            // the repost never sticks on the card (mirrors the like path).
+            if (!ok) refreshFeed();
+          })
+          .catch((e) => console.error("[delegate] completeRepost failed:", e));
+        return;
+      }
+
       // Check for an error from the delegate.
       const p = payload as { type?: string; message?: string; nonce?: string };
       if (p.type === "Error") {
-        // If the error carries a nonce it came from a failed SignPost or
-        // SignLike — drop exactly that stranded pending action. Errors without
-        // a nonce (GetIdentity, Export, …) leave the queues untouched.
+        // If the error carries a nonce it came from a failed SignPost,
+        // SignLike, or SignRepost — drop exactly that stranded pending action.
+        // Errors without a nonce (GetIdentity, Export, …) leave the queues
+        // untouched.
         if (p.nonce) {
           connection.dropPendingPost(p.nonce);
-          // A dropped pending like leaves an un-acked optimistic toggle on its
-          // card — re-render from localPosts to revert it.
+          // A dropped pending like/repost leaves an un-acked optimistic toggle
+          // on its card — re-render from localPosts to revert it.
           if (connection.dropPendingLike(p.nonce)) refreshFeed();
+          if (connection.dropPendingRepost(p.nonce)) refreshFeed();
         }
         if (p.message?.includes("no identity")) {
           console.log("[identity] No identity in delegate — show onboarding");

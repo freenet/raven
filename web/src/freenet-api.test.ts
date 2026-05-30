@@ -98,9 +98,15 @@ vi.mock("@freenetorg/freenet-stdlib", async (importActual) => {
 vi.mock("./identity", () => ({
   signPost: vi.fn(() => true),
   signLike: vi.fn(() => true),
+  signRepost: vi.fn(() => true),
 }));
 
-import { FreenetConnection, type FreenetCallbacks, type LikeState } from "./freenet-api";
+import {
+  FreenetConnection,
+  type FreenetCallbacks,
+  type LikeState,
+  type RepostState,
+} from "./freenet-api";
 
 // A real ML-DSA-65 VK is 1952 bytes → 3904 hex chars; setUser only initialises
 // the user shard for a key of exactly that length (the offline 64-char fake is
@@ -113,11 +119,13 @@ function makeConnection() {
     onNewPost: ReturnType<typeof vi.fn>;
     onStatusChange: ReturnType<typeof vi.fn>;
     onLikeUpdated: ReturnType<typeof vi.fn>;
+    onRepostUpdated: ReturnType<typeof vi.fn>;
   } = {
     onPostsLoaded: vi.fn(),
     onNewPost: vi.fn(),
     onStatusChange: vi.fn(),
     onLikeUpdated: vi.fn(),
+    onRepostUpdated: vi.fn(),
   };
   const conn = new FreenetConnection(callbacks as unknown as FreenetCallbacks);
   conn.connect();
@@ -390,6 +398,80 @@ describe("FreenetConnection", () => {
     });
   });
 
+  describe("optimistic repost revert", () => {
+    it("completeRepost (matched nonce) updates then refreshes on SUCCESS", async () => {
+      const { conn, api } = makeConnection();
+
+      const signRepostMock = (await import("./identity"))
+        .signRepost as unknown as ReturnType<typeof vi.fn>;
+      const repostPromise = conn.repostPost("root-ok", true);
+      await flush();
+      api.getCalls[api.getCalls.length - 1].resolve({} as GetResponse); // probe exists
+      await repostPromise;
+      // signRepost(nonce, rootPostId, seq, reposted) — first arg is the nonce.
+      const nonce = signRepostMock.mock.calls[0][0] as string;
+
+      const getsBefore = api.getCalls.length;
+      const ok = await conn.completeRepost({
+        nonce,
+        root_post_id: "root-ok",
+        signer_pubkey: OWNER_VK,
+        seq: Date.now(),
+        reposted: true,
+        signature: "sig",
+      });
+      expect(ok).toBe(true);
+      expect(api.updateCalls.length).toBe(1);
+      expect(api.getCalls.length).toBe(getsBefore + 1);
+      expect(conn.dropPendingRepost(nonce)).toBe(false); // consumed
+    });
+
+    it("completeRepost refreshes on update FAILURE so the UI reconciles", async () => {
+      const { conn, api } = makeConnection();
+      api.updateError = new Error("update rejected");
+
+      const signRepostMock = (await import("./identity"))
+        .signRepost as unknown as ReturnType<typeof vi.fn>;
+      const repostPromise = conn.repostPost("root-fail", true);
+      await flush();
+      api.getCalls[api.getCalls.length - 1].resolve({} as GetResponse);
+      await repostPromise;
+      const nonce = signRepostMock.mock.calls[
+        signRepostMock.mock.calls.length - 1
+      ][0] as string;
+
+      const getsBefore = api.getCalls.length;
+      const ok = await conn.completeRepost({
+        nonce,
+        root_post_id: "root-fail",
+        signer_pubkey: OWNER_VK,
+        seq: Date.now(),
+        reposted: true,
+        signature: "sig",
+      });
+      expect(ok).toBe(false);
+      expect(api.updateCalls.length).toBe(1);
+      expect(api.getCalls.length).toBe(getsBefore + 1);
+    });
+
+    it("dropPendingRepost returns true for a real pending repost, then false", async () => {
+      const { conn, api } = makeConnection();
+      const signRepostMock = (await import("./identity"))
+        .signRepost as unknown as ReturnType<typeof vi.fn>;
+
+      const repostPromise = conn.repostPost("root-drop", true);
+      await flush();
+      api.getCalls[api.getCalls.length - 1].resolve({} as GetResponse);
+      await repostPromise;
+      const nonce = signRepostMock.mock.calls[
+        signRepostMock.mock.calls.length - 1
+      ][0] as string;
+
+      expect(conn.dropPendingRepost(nonce)).toBe(true);
+      expect(conn.dropPendingRepost(nonce)).toBe(false);
+    });
+  });
+
   describe("completePublish / dropPendingPost — nonce matching", () => {
     async function seedDraft(conn: FreenetConnection) {
       // publishPost needs a user shard + currentUser. setUser sets currentUser
@@ -509,12 +591,20 @@ describe("FreenetConnection", () => {
         b: { signer_pubkey: "cd".repeat(1952), seq: 1, liked: true, signature: "s" },
         c: { signer_pubkey: "ef".repeat(1952), seq: 2, liked: false, signature: "s" },
       };
+      // One thread GET carries both surfaces: two reposts true (one by owner),
+      // one un-repost tombstone.
+      const reposts = {
+        a: { signer_pubkey: OWNER_VK, seq: 1, reposted: true, signature: "s" },
+        b: { signer_pubkey: "cd".repeat(1952), seq: 1, reposted: true, signature: "s" },
+        c: { signer_pubkey: "ef".repeat(1952), seq: 2, reposted: false, signature: "s" },
+      };
       const stateBytes = Array.from(
-        new TextEncoder().encode(JSON.stringify({ likes })),
+        new TextEncoder().encode(JSON.stringify({ likes, reposts })),
       );
       const key = probe.req.key; // same ContractKey the thread uses
 
       callbacks.onLikeUpdated.mockClear();
+      callbacks.onRepostUpdated.mockClear();
       api.handler.onContractGet({
         key,
         state: stateBytes,
@@ -525,6 +615,12 @@ describe("FreenetConnection", () => {
       expect(emitted.postId).toBe(rootId);
       expect(emitted.count).toBe(2); // two liked:true records
       expect(emitted.likedByMe).toBe(true); // owner is among them
+
+      expect(callbacks.onRepostUpdated).toHaveBeenCalledTimes(1);
+      const reEmit = callbacks.onRepostUpdated.mock.calls[0][0] as RepostState;
+      expect(reEmit.postId).toBe(rootId);
+      expect(reEmit.count).toBe(2); // two reposted:true records
+      expect(reEmit.repostedByMe).toBe(true); // owner is among them
     });
   });
 });
