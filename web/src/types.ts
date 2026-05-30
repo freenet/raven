@@ -8,6 +8,10 @@ export interface Post {
   replies: number;
   liked: boolean;
   reposted: boolean;
+  /** Count of quote reposts of this post (from its thread shard). */
+  quotes?: number;
+  /** Content address of the post this one quotes, if it is a quote repost. */
+  quotedPostId?: string;
 }
 
 export interface User {

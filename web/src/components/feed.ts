@@ -7,7 +7,8 @@ export function createFeed(
   onPost: (content: string) => void,
   followedPubkeys: Set<string> = new Set(),
   onLike?: (postId: string, liked: boolean) => void,
-  onRepost?: (postId: string, reposted: boolean) => void
+  onRepost?: (postId: string, reposted: boolean) => void,
+  onQuote?: (post: Post) => void
 ): HTMLElement {
   const feed = document.createElement("main");
   feed.className = "feed-column";
@@ -60,8 +61,12 @@ export function createFeed(
         "padding:32px 16px;color:var(--text-muted);font-size:15px;text-align:center;";
       postList.appendChild(empty);
     } else {
+      const resolveQuoted = (id: string): Post | undefined =>
+        currentPosts.find((p) => p.id === id);
       for (const post of filtered) {
-        postList.appendChild(createPostCard(post, { onLike, onRepost }));
+        postList.appendChild(
+          createPostCard(post, { onLike, onRepost, onQuote, resolveQuoted })
+        );
       }
     }
   }

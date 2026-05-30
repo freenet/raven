@@ -68,6 +68,16 @@ pub struct Post {
     /// post ids/signatures are unaffected.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reply_to: String,
+    /// Content-addressed id of the post this one **quotes** (ADR-0001 quote
+    /// repost), if any. Empty/absent for a non-quote post. When non-empty it is
+    /// **mixed into the signing payload** (so the quote target is signed and a
+    /// quote cannot be retargeted without invalidating the id/signature); when
+    /// empty the payload is byte-identical to a pre-`quoted_post` post, so
+    /// existing post ids/signatures are unaffected. Appended **after**
+    /// `reply_to` so the two optional fields compose deterministically — a post
+    /// can be both a reply and a quote.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quoted_post: String,
     /// Hex-encoded ML-DSA-65 signature over the signing payload (3309 bytes).
     /// Optional only for forward/backward wire tolerance; an unsigned post is
     /// rejected by [`Post::verify`].
@@ -87,10 +97,12 @@ impl Post {
     /// builds. `id` and `signature` are intentionally excluded — they are
     /// *derived from* this payload.
     ///
-    /// `reply_to` is appended **only when non-empty**: a top-level post (empty
-    /// `reply_to`) produces the exact pre-`reply_to` byte sequence, so its id and
-    /// signature are unchanged; a reply binds its target thread into the signed
-    /// bytes, so a reply cannot be replayed into a different thread.
+    /// `reply_to` then `quoted_post` are each appended **only when non-empty**: a
+    /// post with both empty produces the exact pre-`reply_to` byte sequence, so
+    /// its id and signature are unchanged; a reply binds its target thread and a
+    /// quote binds its quoted post into the signed bytes, so neither can be
+    /// retargeted. The fixed order (reply_to before quoted_post) keeps a
+    /// reply-and-quote post deterministic.
     pub fn signing_payload(&self) -> Vec<u8> {
         fn put(buf: &mut Vec<u8>, field: &[u8]) {
             buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
@@ -105,6 +117,9 @@ impl Post {
         put(&mut buf, &self.timestamp.to_le_bytes());
         if !self.reply_to.is_empty() {
             put(&mut buf, self.reply_to.as_bytes());
+        }
+        if !self.quoted_post.is_empty() {
+            put(&mut buf, self.quoted_post.as_bytes());
         }
         buf
     }
@@ -172,6 +187,7 @@ mod test {
             content: "Hello world".into(),
             timestamp: 1_700_000_000_000,
             reply_to: String::new(),
+            quoted_post: String::new(),
             signature: None,
         }
     }
@@ -188,6 +204,7 @@ mod test {
             content: content.into(),
             timestamp: 1_700_000_000_000,
             reply_to: String::new(),
+            quoted_post: String::new(),
             signature: None,
         };
         p.id = p.compute_id();
@@ -302,6 +319,7 @@ mod test {
             content: "nice post".into(),
             timestamp: 1_700_000_000_001,
             reply_to: "root_post_id_aaaa".into(),
+            quoted_post: String::new(),
             signature: None,
         };
         reply.id = reply.compute_id();
@@ -334,6 +352,7 @@ mod test {
             content: "hello".into(),
             timestamp: 1_700_000_000_000,
             reply_to: String::new(),
+            quoted_post: String::new(),
             signature: None,
         };
         let expected = "0d000000726176656e3a706f73743a763108000000303031313232333305000000\
@@ -355,6 +374,7 @@ mod test {
             content: "hello".into(),
             timestamp: 1_700_000_000_000,
             reply_to: "rootid".into(),
+            quoted_post: String::new(),
             signature: None,
         };
         let expected = "0d000000726176656e3a706f73743a763108000000303031313232333305000000\
@@ -362,6 +382,102 @@ mod test {
             06000000726f6f746964";
         let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(hex::encode(p.signing_payload()), expected);
+    }
+
+    #[test]
+    fn golden_signing_payload_quote() {
+        // GOLDEN VECTOR — pins the quote variant (empty reply_to, non-empty
+        // quoted_post appended). Do not update the literal unless the format
+        // break is intended and POST_DOMAIN_TAG is bumped.
+        let p = Post {
+            id: String::new(),
+            author_pubkey: "00112233".into(),
+            author_name: "Alice".into(),
+            author_handle: "@alice".into(),
+            content: "hello".into(),
+            timestamp: 1_700_000_000_000,
+            reply_to: String::new(),
+            quoted_post: "qid".into(),
+            signature: None,
+        };
+        let expected = "0d000000726176656e3a706f73743a763108000000303031313232333305000000\
+            416c6963650600000040616c6963650500000068656c6c6f080000000068e5cf8b010000\
+            03000000716964";
+        let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(hex::encode(p.signing_payload()), expected);
+    }
+
+    #[test]
+    fn golden_signing_payload_reply_and_quote() {
+        // GOLDEN VECTOR — a post that is BOTH a reply and a quote. Fixed field
+        // order: reply_to THEN quoted_post. Pins that composition so it can never
+        // silently reorder (which would break every reply-quote signature).
+        let p = Post {
+            id: String::new(),
+            author_pubkey: "00112233".into(),
+            author_name: "Alice".into(),
+            author_handle: "@alice".into(),
+            content: "hello".into(),
+            timestamp: 1_700_000_000_000,
+            reply_to: "rootid".into(),
+            quoted_post: "qid".into(),
+            signature: None,
+        };
+        let expected = "0d000000726176656e3a706f73743a763108000000303031313232333305000000\
+            416c6963650600000040616c6963650500000068656c6c6f080000000068e5cf8b010000\
+            06000000726f6f74696403000000716964";
+        let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(hex::encode(p.signing_payload()), expected);
+    }
+
+    #[test]
+    fn quoted_post_is_signed_and_bound() {
+        // A quote binds its target into the signature: changing quoted_post after
+        // signing breaks the id (id is over the payload), so a quote cannot be
+        // retargeted to a different post.
+        let sk = MlDsa65::from_seed(&[5u8; 32].into());
+        let mut q = Post {
+            id: String::new(),
+            author_pubkey: hex::encode(sk.verifying_key().encode()),
+            author_name: "Carol".into(),
+            author_handle: "@carol".into(),
+            content: "great point".into(),
+            timestamp: 1_700_000_000_002,
+            reply_to: String::new(),
+            quoted_post: "quoted_aaaa".into(),
+            signature: None,
+        };
+        q.id = q.compute_id();
+        let sig: Signature<MlDsa65> = sk.sign(&q.signing_payload());
+        q.signature = Some(hex::encode(sig.encode()));
+        assert_eq!(q.verify(), Ok(()));
+
+        // Retarget to a different quoted post → id no longer matches.
+        let mut moved = q.clone();
+        moved.quoted_post = "quoted_bbbb".into();
+        assert_eq!(moved.verify(), Err(VerifyError::IdMismatch));
+    }
+
+    #[test]
+    fn empty_quoted_post_is_payload_compatible() {
+        // A post with empty quoted_post (and empty reply_to) must hash/sign
+        // exactly as a pre-quoted_post post: quoted_post is appended only when
+        // non-empty, so ids/signatures of existing posts are unaffected.
+        let p = sample();
+        assert!(p.quoted_post.is_empty() && p.reply_to.is_empty());
+        let mut expected = Vec::new();
+        for field in [
+            POST_DOMAIN_TAG,
+            p.author_pubkey.as_bytes(),
+            p.author_name.as_bytes(),
+            p.author_handle.as_bytes(),
+            p.content.as_bytes(),
+            &p.timestamp.to_le_bytes(),
+        ] {
+            expected.extend_from_slice(&(field.len() as u32).to_le_bytes());
+            expected.extend_from_slice(field);
+        }
+        assert_eq!(p.signing_payload(), expected);
     }
 
     #[test]

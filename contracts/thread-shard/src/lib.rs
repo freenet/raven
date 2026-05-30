@@ -654,6 +654,7 @@ mod test {
             content: content.into(),
             timestamp: ts,
             reply_to: ROOT.into(),
+            quoted_post: String::new(),
             signature: None,
         };
         p.id = p.compute_id();
@@ -729,6 +730,7 @@ mod test {
             content: "hi".into(),
             timestamp: 100,
             reply_to: "some_other_thread".into(),
+            quoted_post: String::new(),
             signature: None,
         };
         wrong.id = wrong.compute_id();
@@ -1176,6 +1178,7 @@ mod integration {
             content: content.into(),
             timestamp: ts,
             reply_to: ROOT.into(),
+            quoted_post: String::new(),
             signature: None,
         };
         p.id = p.compute_id();
@@ -1446,6 +1449,7 @@ mod integration {
             content: "the original post".into(),
             timestamp: 1_000,
             reply_to: String::new(),
+            quoted_post: String::new(),
             signature: None,
         };
         root_post.id = root_post.compute_id();
@@ -1467,6 +1471,7 @@ mod integration {
             content: "good reply".into(),
             timestamp: 1_001,
             reply_to: root_post.id.clone(),
+            quoted_post: String::new(),
             signature: None,
         };
         good_reply.id = good_reply.compute_id();

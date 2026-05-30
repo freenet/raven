@@ -39,8 +39,128 @@ const ICON_SHARE = `<svg width="18" height="18" viewBox="0 0 18 18" fill="none" 
 export interface PostCardCallbacks {
   /** Fired on a like toggle. `liked` is the new desired state. */
   onLike?: (postId: string, liked: boolean) => void;
-  /** Fired on a repost toggle. `reposted` is the new desired state. */
+  /** Fired on a plain-repost toggle. `reposted` is the new desired state. */
   onRepost?: (postId: string, reposted: boolean) => void;
+  /** Fired when the user picks "Quote" — opens a quote composer for this post. */
+  onQuote?: (post: Post) => void;
+  /** Resolve a quoted post's id to a Post for the embed, if present in the feed. */
+  resolveQuoted?: (postId: string) => Post | undefined;
+}
+
+/**
+ * Small popover anchored to the repost button offering Repost / Quote, the
+ * X/Threads pattern. Closes on selection, outside click, or Escape. Kept
+ * dependency-free (no menu lib) and inline-styled to match the action bar.
+ */
+function openRepostMenu(
+  anchor: HTMLElement,
+  opts: { reposted: boolean; onRepost: () => void; onQuote: () => void },
+): void {
+  // Only one menu at a time.
+  document.querySelector(".repost-menu")?.remove();
+
+  const menu = document.createElement("div");
+  menu.className = "repost-menu";
+  menu.setAttribute("role", "menu");
+  const rect = anchor.getBoundingClientRect();
+  menu.style.cssText = [
+    "position:fixed",
+    `top:${Math.round(rect.bottom + 6)}px`,
+    `left:${Math.round(rect.left)}px`,
+    "z-index:1000",
+    "min-width:160px",
+    "background:var(--surface-0)",
+    "border:1px solid var(--line)",
+    "border-radius:10px",
+    "box-shadow:0 6px 24px rgba(0,0,0,0.18)",
+    "padding:6px",
+    "display:flex",
+    "flex-direction:column",
+    "gap:2px",
+  ].join(";");
+
+  function item(label: string, onClick: () => void): HTMLButtonElement {
+    const b = document.createElement("button");
+    b.setAttribute("role", "menuitem");
+    b.textContent = label;
+    b.style.cssText = [
+      "text-align:left",
+      "padding:8px 10px",
+      "border:none",
+      "background:transparent",
+      "border-radius:6px",
+      "font-size:14px",
+      "color:var(--ink-1)",
+      "cursor:pointer",
+    ].join(";");
+    b.addEventListener("mouseenter", () => (b.style.background = "var(--surface-1, rgba(0,0,0,0.05))"));
+    b.addEventListener("mouseleave", () => (b.style.background = "transparent"));
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      close();
+      onClick();
+    });
+    return b;
+  }
+
+  function close(): void {
+    menu.remove();
+    document.removeEventListener("click", onOutside, true);
+    document.removeEventListener("keydown", onKey, true);
+  }
+  function onOutside(e: MouseEvent): void {
+    if (!menu.contains(e.target as Node)) close();
+  }
+  function onKey(e: KeyboardEvent): void {
+    if (e.key === "Escape") close();
+  }
+
+  menu.appendChild(item(opts.reposted ? "Undo repost" : "Repost", opts.onRepost));
+  menu.appendChild(item("Quote", opts.onQuote));
+  document.body.appendChild(menu);
+  // Defer outside-click registration so this very click doesn't close it.
+  setTimeout(() => {
+    document.addEventListener("click", onOutside, true);
+    document.addEventListener("keydown", onKey, true);
+  }, 0);
+}
+
+/** Inline embed of a quoted post (or a placeholder if not yet loaded). */
+function createQuoteEmbed(quotedPostId: string, quoted?: Post): HTMLElement {
+  const embed = document.createElement("div");
+  embed.className = "post-card__quote-embed";
+  embed.style.cssText = [
+    "margin:8px 0 4px",
+    "border:1px solid var(--line)",
+    "border-radius:12px",
+    "padding:10px 12px",
+  ].join(";");
+
+  if (!quoted) {
+    embed.style.color = "var(--ink-3)";
+    embed.style.fontSize = "13px";
+    embed.textContent = `Quoted post ${quotedPostId.slice(0, 10)}… (not loaded)`;
+    return embed;
+  }
+
+  const head = document.createElement("div");
+  head.style.cssText = "display:flex;gap:6px;align-items:baseline;font-size:13px;margin-bottom:2px;";
+  const name = document.createElement("span");
+  name.style.cssText = "font-weight:600;color:var(--ink-0);";
+  name.textContent = quoted.author.displayName;
+  const handle = document.createElement("span");
+  handle.style.cssText = "color:var(--ink-3);";
+  handle.textContent = `@${quoted.author.handle}`;
+  head.appendChild(name);
+  head.appendChild(handle);
+
+  const text = document.createElement("div");
+  text.style.cssText = "font-size:14px;color:var(--ink-1);white-space:pre-wrap;";
+  text.textContent = quoted.content;
+
+  embed.appendChild(head);
+  embed.appendChild(text);
+  return embed;
 }
 
 export function createPostCard(
@@ -187,18 +307,41 @@ export function createPostCard(
   const reply = makeAction("reply", ICON_REPLY, replyCount);
   reply.btn.setAttribute("aria-label", "Reply");
 
-  // Repost (optimistic toggle; authoritative count returns via onRepostUpdated
-  // and is reconciled by the feed re-render, mirroring likes).
-  const repostEl = makeAction("repost", ICON_REPOST, repostCount);
+  // Repost: the count is plain reposts + quote reposts (both amplify, matching
+  // X/Threads). Clicking opens a small menu: "Repost" (optimistic toggle, count
+  // reconciled via onRepostUpdated, mirroring likes) and "Quote" (opens a quote
+  // composer via onQuote). The repost icon stays active while plain-reposted.
+  const quoteCount = post.quotes ?? 0;
+  const repostEl = makeAction("repost", ICON_REPOST, repostCount + quoteCount);
   repostEl.btn.setAttribute("aria-label", "Repost");
+  repostEl.btn.setAttribute("aria-haspopup", "menu");
   if (reposted) repostEl.btn.classList.add("is-active");
-  repostEl.btn.addEventListener("click", (e) => {
-    e.stopPropagation();
+
+  function setRepostCountLabel(): void {
+    const total = repostCount + (post.quotes ?? 0);
+    repostEl.countEl.textContent = total > 0 ? String(total) : "";
+  }
+
+  function doPlainRepost(): void {
     reposted = !reposted;
     repostCount += reposted ? 1 : -1;
-    repostEl.countEl.textContent = repostCount > 0 ? String(repostCount) : "";
+    setRepostCountLabel();
     repostEl.btn.classList.toggle("is-active", reposted);
     callbacks.onRepost?.(post.id, reposted);
+  }
+
+  repostEl.btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    // Without a quote handler wired, fall back to the plain-repost toggle.
+    if (!callbacks.onQuote) {
+      doPlainRepost();
+      return;
+    }
+    openRepostMenu(repostEl.btn, {
+      reposted,
+      onRepost: () => doPlainRepost(),
+      onQuote: () => callbacks.onQuote?.(post),
+    });
   });
 
   // Like (local toggle)
@@ -228,6 +371,15 @@ export function createPostCard(
 
   body.appendChild(meta);
   body.appendChild(content);
+
+  // Quote-repost embed: if this post quotes another, render the quoted post as
+  // an inline card beneath the content. Resolved from the feed via the callback;
+  // if the quoted post isn't loaded yet, show a lightweight placeholder.
+  if (post.quotedPostId) {
+    const quoted = callbacks.resolveQuoted?.(post.quotedPostId);
+    body.appendChild(createQuoteEmbed(post.quotedPostId, quoted));
+  }
+
   body.appendChild(actions);
 
   article.appendChild(avatarCol);

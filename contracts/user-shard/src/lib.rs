@@ -588,6 +588,7 @@ mod test {
             content: content.to_string(),
             timestamp,
             reply_to: String::new(),
+            quoted_post: String::new(),
             signature: None,
         };
         p.id = p.compute_id();
@@ -1210,6 +1211,7 @@ mod integration {
             content: content.into(),
             timestamp: ts,
             reply_to: String::new(),
+            quoted_post: String::new(),
             signature: None,
         };
         p.id = p.compute_id();
@@ -1427,6 +1429,7 @@ mod integration {
             content: "not the owner".into(),
             timestamp: 50,
             reply_to: String::new(),
+            quoted_post: String::new(),
             signature: None,
         };
         foreign.id = foreign.compute_id();

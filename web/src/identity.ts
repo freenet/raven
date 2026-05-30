@@ -90,7 +90,8 @@ export function signPost(
   content: string,
   authorName: string,
   authorHandle: string,
-  timestamp: number
+  timestamp: number,
+  quotedPost = ""
 ): boolean {
   if (!isDelegateConnected()) return false;
   sendIdentityMessage(delegateApi!, delegateKeyBytes!, delegateCodeHashBytes!, {
@@ -100,6 +101,7 @@ export function signPost(
     author_name: authorName,
     author_handle: authorHandle,
     timestamp,
+    quoted_post: quotedPost,
   }).catch((e) => console.warn("[identity] SignPost failed:", e));
   return true;
 }
@@ -147,6 +149,27 @@ export function signRepost(
     seq,
     reposted,
   }).catch((e) => console.warn("[identity] SignRepost failed:", e));
+  return true;
+}
+
+/**
+ * Ask the delegate to sign a quote reference for a thread: records that the
+ * signer quoted `rootPostId` in their own `quotePostId`. The delegate replies
+ * with a `SignedQuoteRef` routed through onDelegateResponse → freenet-api
+ * completeQuoteRef. Returns false if no delegate.
+ */
+export function signQuoteRef(
+  nonce: string,
+  rootPostId: string,
+  quotePostId: string
+): boolean {
+  if (!isDelegateConnected()) return false;
+  sendIdentityMessage(delegateApi!, delegateKeyBytes!, delegateCodeHashBytes!, {
+    type: "SignQuoteRef",
+    nonce,
+    root_post_id: rootPostId,
+    quote_post_id: quotePostId,
+  }).catch((e) => console.warn("[identity] SignQuoteRef failed:", e));
   return true;
 }
 
