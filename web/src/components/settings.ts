@@ -228,6 +228,13 @@ export function createSettings(): HTMLElement {
   const signOut = document.createElement("button");
   signOut.className = "settings-danger";
   signOut.textContent = "Sign out";
+  // Local-only sign-out: forgets the in-memory identity and reloads the app
+  // back into onboarding. Network records the user already published stay
+  // on their thread/user shards — only this device's session is dropped.
+  signOut.addEventListener("click", () => {
+    if (!confirm("Sign out? Your secret key leaves this device — make sure you've exported it first.")) return;
+    window.location.reload();
+  });
   screen.appendChild(
     list(
       row("Export your identity key", "Back up your secret key to restore on another device", exportBtn),

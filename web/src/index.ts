@@ -51,14 +51,16 @@ let delegateTimeoutId: ReturnType<typeof setTimeout> | null = null;
 // ---------------------------------------------------------------------------
 // Feed helpers
 // ---------------------------------------------------------------------------
-type FeedEl = HTMLElement & { updatePosts: (posts: Post[]) => void };
-
-function getFeedEl(): FeedEl | null {
-  return appElement?.querySelector(".feed-column") as FeedEl | null;
-}
+// createApp() attaches updatePosts on the app element itself so updates keep
+// flowing even when the visible screen is profile/explore/notifications and
+// the .feed-column DOM node is detached. The cached feed inside app.ts always
+// receives the new list; when the user navigates back to Home it re-renders
+// from the latest state, preserving the optimistic-then-reconcile contract
+// from PRs #36/#37/#38.
+type AppEl = HTMLElement & { updatePosts: (posts: Post[]) => void };
 
 function refreshFeed(): void {
-  getFeedEl()?.updatePosts(localPosts);
+  (appElement as AppEl | null)?.updatePosts?.(localPosts);
 }
 
 // ---------------------------------------------------------------------------

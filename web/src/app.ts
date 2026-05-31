@@ -61,8 +61,12 @@ export function createApp(cb: AppCallbacks): HTMLElement {
   }
 
   function showThread(root: Post, replies: Post[]): void {
-    // Thread is a transient view — sidebar shows "feed" highlighted (current
-    // active screen *area*) since there's no thread destination in nav.
+    // Thread is a transient snapshot. Live like/repost/quote updates that
+    // land while the user is viewing a thread won't visually reconcile here —
+    // the next navigation rebuilds the feed from the latest `posts` array,
+    // so authoritative state is preserved end-to-end. Sidebar shows "feed"
+    // highlighted (current active screen *area*) since there's no thread
+    // destination in nav.
     sidebar.setActiveView("feed");
     const screen = createThread(root, replies, {
       onBack: showFeed,
