@@ -1,6 +1,5 @@
 import { Post } from "../types";
 import { formatRelativeTime } from "../utils";
-import { getIdentity } from "../identity";
 
 function getInitials(displayName: string): string {
   return displayName
@@ -37,26 +36,19 @@ const ICON_SHARE = `<svg width="18" height="18" viewBox="0 0 18 18" fill="none" 
 </svg>`;
 
 export interface PostCardCallbacks {
-  /** Fired on a like toggle. `liked` is the new desired state. */
   onLike?: (postId: string, liked: boolean) => void;
-  /** Fired on a plain-repost toggle. `reposted` is the new desired state. */
   onRepost?: (postId: string, reposted: boolean) => void;
-  /** Fired when the user picks "Quote" — opens a quote composer for this post. */
   onQuote?: (post: Post) => void;
-  /** Resolve a quoted post's id to a Post for the embed, if present in the feed. */
   resolveQuoted?: (postId: string) => Post | undefined;
+  onOpen?: (post: Post) => void;
+  /** When true, the post-text reads at "lead" size — used for the top of feed. */
+  lead?: boolean;
 }
 
-/**
- * Small popover anchored to the repost button offering Repost / Quote, the
- * X/Threads pattern. Closes on selection, outside click, or Escape. Kept
- * dependency-free (no menu lib) and inline-styled to match the action bar.
- */
 function openRepostMenu(
   anchor: HTMLElement,
   opts: { reposted: boolean; onRepost: () => void; onQuote: () => void },
 ): void {
-  // Only one menu at a time.
   document.querySelector(".repost-menu")?.remove();
 
   const menu = document.createElement("div");
@@ -69,10 +61,10 @@ function openRepostMenu(
     `left:${Math.round(rect.left)}px`,
     "z-index:1000",
     "min-width:160px",
-    "background:var(--surface-0)",
+    "background:var(--bg-elevated)",
     "border:1px solid var(--line)",
     "border-radius:10px",
-    "box-shadow:0 6px 24px rgba(0,0,0,0.18)",
+    "box-shadow:var(--shadow-md)",
     "padding:6px",
     "display:flex",
     "flex-direction:column",
@@ -93,7 +85,7 @@ function openRepostMenu(
       "color:var(--ink-1)",
       "cursor:pointer",
     ].join(";");
-    b.addEventListener("mouseenter", () => (b.style.background = "var(--surface-1, rgba(0,0,0,0.05))"));
+    b.addEventListener("mouseenter", () => (b.style.background = "var(--surface-hover)"));
     b.addEventListener("mouseleave", () => (b.style.background = "transparent"));
     b.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -118,46 +110,40 @@ function openRepostMenu(
   menu.appendChild(item(opts.reposted ? "Undo repost" : "Repost", opts.onRepost));
   menu.appendChild(item("Quote", opts.onQuote));
   document.body.appendChild(menu);
-  // Defer outside-click registration so this very click doesn't close it.
   setTimeout(() => {
     document.addEventListener("click", onOutside, true);
     document.addEventListener("keydown", onKey, true);
   }, 0);
 }
 
-/** Inline embed of a quoted post (or a placeholder if not yet loaded). */
 function createQuoteEmbed(quotedPostId: string, quoted?: Post): HTMLElement {
   const embed = document.createElement("div");
-  embed.className = "post-card__quote-embed";
-  embed.style.cssText = [
-    "margin:8px 0 4px",
-    "border:1px solid var(--line)",
-    "border-radius:12px",
-    "padding:10px 12px",
-  ].join(";");
+  embed.className = "post__quote-embed";
 
   if (!quoted) {
+    embed.textContent = `Quoted post ${quotedPostId.slice(0, 10)}… (not loaded)`;
     embed.style.color = "var(--ink-3)";
     embed.style.fontSize = "13px";
-    embed.textContent = `Quoted post ${quotedPostId.slice(0, 10)}… (not loaded)`;
     return embed;
   }
 
   const head = document.createElement("div");
-  head.style.cssText = "display:flex;gap:6px;align-items:baseline;font-size:13px;margin-bottom:2px;";
+  head.className = "post__quote-embed-head";
+
   const name = document.createElement("span");
-  name.style.cssText = "font-weight:600;color:var(--ink-0);";
+  name.className = "post__quote-embed-name";
   name.textContent = quoted.author.displayName;
+
   const handle = document.createElement("span");
-  handle.style.cssText = "color:var(--ink-3);";
+  handle.className = "post__quote-embed-handle";
   handle.textContent = `@${quoted.author.handle}`;
-  head.appendChild(name);
-  head.appendChild(handle);
 
   const text = document.createElement("div");
-  text.style.cssText = "font-size:14px;color:var(--ink-1);white-space:pre-wrap;";
+  text.className = "post__quote-embed-text";
   text.textContent = quoted.content;
 
+  head.appendChild(name);
+  head.appendChild(handle);
   embed.appendChild(head);
   embed.appendChild(text);
   return embed;
@@ -168,222 +154,135 @@ export function createPostCard(
   callbacks: PostCardCallbacks = {},
 ): HTMLElement {
   const article = document.createElement("article");
-  article.className = "post-card";
+  article.className = "post";
+  article.addEventListener("click", () => callbacks.onOpen?.(post));
 
-  // Avatar column
-  const avatarCol = document.createElement("div");
-  avatarCol.className = "post-card__avatar-col";
+  // Repost context line (above byline when current user reposted)
+  if (post.reposted) {
+    const ctx = document.createElement("div");
+    ctx.className = "post__repost-ctx";
+    ctx.innerHTML = `${ICON_REPOST} <span>You reposted</span>`;
+    article.appendChild(ctx);
+  }
+
+  // Byline (avatar + name + meta)
+  const byline = document.createElement("div");
+  byline.className = "post__byline";
 
   const avatar = document.createElement("div");
-  avatar.className = "post-card__avatar";
+  avatar.className = "post__avatar";
   avatar.textContent = getInitials(post.author.displayName);
   if (post.author.avatarColor) {
     avatar.style.background = post.author.avatarColor;
+    avatar.style.color = "#fff";
+    avatar.style.borderColor = "transparent";
   }
 
-  avatarCol.appendChild(avatar);
+  const who = document.createElement("div");
+  who.className = "post__who";
 
-  // Body
-  const body = document.createElement("div");
-  body.className = "post-card__body";
+  const name = document.createElement("span");
+  name.className = "post__name";
+  name.textContent = post.author.displayName;
 
-  // Meta row (name + handle + follow button + timestamp)
-  const meta = document.createElement("div");
-  meta.className = "post-card__meta";
+  const when = document.createElement("span");
+  when.className = "post__when";
+  when.innerHTML = `@${post.author.handle}<i>·</i>${formatRelativeTime(post.timestamp)}`;
 
-  const displayName = document.createElement("span");
-  displayName.className = "post-card__name";
-  displayName.textContent = post.author.displayName;
-  // Clicking the author name logs the pubkey (routing will be wired later)
-  if (post.author.publicKey) {
-    displayName.style.cssText = "cursor:pointer;";
-    displayName.addEventListener("click", (e) => {
-      e.stopPropagation();
-      console.log(`[profile] Navigate to profile: ${post.author.displayName} (${post.author.publicKey})`);
-    });
+  who.appendChild(name);
+  who.appendChild(when);
+
+  byline.appendChild(avatar);
+  byline.appendChild(who);
+  article.appendChild(byline);
+
+  // Body text
+  const text = document.createElement("p");
+  text.className = callbacks.lead ? "post__text post__text--lead" : "post__text";
+  text.textContent = post.content;
+  article.appendChild(text);
+
+  // Quote embed (when this post quotes another)
+  if (post.quotedPostId) {
+    const quoted = callbacks.resolveQuoted?.(post.quotedPostId);
+    article.appendChild(createQuoteEmbed(post.quotedPostId, quoted));
   }
 
-  const handle = document.createElement("span");
-  handle.className = "post-card__handle";
-  handle.textContent = `@${post.author.handle}`;
+  // Action row
+  const foot = document.createElement("div");
+  foot.className = "post__foot";
+  foot.addEventListener("click", (e) => e.stopPropagation());
 
-  const timestamp = document.createElement("span");
-  timestamp.className = "post-card__timestamp";
-  timestamp.textContent = formatRelativeTime(post.timestamp);
+  const rule = document.createElement("div");
+  rule.className = "post__rule";
+  foot.appendChild(rule);
 
-  meta.appendChild(displayName);
-  meta.appendChild(handle);
-
-  // Follow button: show only if author has a publicKey and is not the current user
-  const identity = getIdentity();
-  const isOwnPost =
-    identity && post.author.publicKey
-      ? identity.publicKey === post.author.publicKey
-      : false;
-
-  // Don't show follow button if author has no publicKey or is the current user
-  const showFollowBtn = Boolean(post.author.publicKey) && !isOwnPost;
-
-  if (showFollowBtn) {
-    const followBtn = document.createElement("button");
-    followBtn.className = "post-card__follow-btn";
-    followBtn.textContent = "Follow";
-    followBtn.style.cssText = [
-      "font-family:var(--font-mono)",
-      "font-size:9px",
-      "font-weight:400",
-      "letter-spacing:0.08em",
-      "text-transform:uppercase",
-      "color:var(--ink-2)",
-      "background:transparent",
-      "border:1px solid var(--line)",
-      "border-radius:7px",
-      "padding:2px 8px",
-      "cursor:pointer",
-      "margin-left:4px",
-      "transition:background 0.12s,color 0.12s,border-color 0.12s",
-      "flex-shrink:0",
-    ].join(";");
-    followBtn.addEventListener("mouseenter", () => {
-      followBtn.style.background = "var(--ink-0)";
-      followBtn.style.color = "var(--surface-0)";
-      followBtn.style.borderColor = "var(--ink-0)";
-    });
-    followBtn.addEventListener("mouseleave", () => {
-      followBtn.style.background = "transparent";
-      followBtn.style.color = "var(--ink-2)";
-      followBtn.style.borderColor = "var(--line)";
-    });
-    followBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      // TODO: wire to follows contract
-      console.log(`[follows] Follow clicked for ${post.author.handle} (${post.author.publicKey ?? "unknown"})`);
-    });
-    meta.appendChild(followBtn);
-  }
-
-  meta.appendChild(timestamp);
-
-  // Content
-  const content = document.createElement("p");
-  content.className = "post-card__content";
-  content.textContent = post.content;
-
-  // Action bar
-  const actions = document.createElement("div");
-  actions.className = "post-card__actions";
-
-  // Mutable state (local only for now)
+  // Like state (optimistic)
   let liked = post.liked ?? false;
   let likeCount = post.likes ?? 0;
+  const likeBtn = document.createElement("button");
+  likeBtn.className = "post-act post-act--like";
+  if (liked) likeBtn.classList.add("is-active");
+  likeBtn.setAttribute("aria-label", "Like");
+  likeBtn.innerHTML = `${liked ? ICON_LIKE_FILLED : ICON_LIKE}<span>${likeCount > 0 ? likeCount : ""}</span>`;
+  likeBtn.addEventListener("click", () => {
+    liked = !liked;
+    likeCount += liked ? 1 : -1;
+    likeBtn.classList.toggle("is-active", liked);
+    likeBtn.innerHTML = `${liked ? ICON_LIKE_FILLED : ICON_LIKE}<span>${likeCount > 0 ? likeCount : ""}</span>`;
+    callbacks.onLike?.(post.id, liked);
+  });
+
+  // Reply (opens thread view via onOpen)
+  const replyBtn = document.createElement("button");
+  replyBtn.className = "post-act post-act--reply";
+  replyBtn.setAttribute("aria-label", "Reply");
+  replyBtn.innerHTML = `${ICON_REPLY}<span>${(post.replies ?? 0) > 0 ? post.replies : ""}</span>`;
+  replyBtn.addEventListener("click", () => callbacks.onOpen?.(post));
+
+  // Repost: menu → plain repost or quote
   let reposted = post.reposted ?? false;
   let repostCount = post.reposts ?? 0;
-  const replyCount = post.replies ?? 0;
-
-  // Helper to build an action button
-  function makeAction(
-    modifier: string,
-    iconHtml: string,
-    count: number
-  ): { btn: HTMLButtonElement; countEl: HTMLSpanElement; iconWrap: HTMLSpanElement } {
-    const btn = document.createElement("button");
-    btn.className = `post-action post-action--${modifier}`;
-
-    const iconWrap = document.createElement("span");
-    iconWrap.className = "post-action__icon-wrap";
-    iconWrap.innerHTML = iconHtml;
-
-    const countEl = document.createElement("span");
-    countEl.className = "post-action__count";
-    countEl.textContent = count > 0 ? String(count) : "";
-
-    btn.appendChild(iconWrap);
-    btn.appendChild(countEl);
-
-    return { btn, countEl, iconWrap };
-  }
-
-  // Reply (no action, visual only)
-  const reply = makeAction("reply", ICON_REPLY, replyCount);
-  reply.btn.setAttribute("aria-label", "Reply");
-
-  // Repost: the count is plain reposts + quote reposts (both amplify, matching
-  // X/Threads). Clicking opens a small menu: "Repost" (optimistic toggle, count
-  // reconciled via onRepostUpdated, mirroring likes) and "Quote" (opens a quote
-  // composer via onQuote). The repost icon stays active while plain-reposted.
   const quoteCount = post.quotes ?? 0;
-  const repostEl = makeAction("repost", ICON_REPOST, repostCount + quoteCount);
-  repostEl.btn.setAttribute("aria-label", "Repost");
-  repostEl.btn.setAttribute("aria-haspopup", "menu");
-  if (reposted) repostEl.btn.classList.add("is-active");
-
-  function setRepostCountLabel(): void {
-    const total = repostCount + (post.quotes ?? 0);
-    repostEl.countEl.textContent = total > 0 ? String(total) : "";
+  const repostBtn = document.createElement("button");
+  repostBtn.className = "post-act post-act--repost";
+  if (reposted) repostBtn.classList.add("is-active");
+  repostBtn.setAttribute("aria-label", "Repost");
+  repostBtn.setAttribute("aria-haspopup", "menu");
+  function renderRepost(): void {
+    const total = repostCount + quoteCount;
+    repostBtn.innerHTML = `${ICON_REPOST}<span>${total > 0 ? total : ""}</span>`;
   }
-
+  renderRepost();
   function doPlainRepost(): void {
     reposted = !reposted;
     repostCount += reposted ? 1 : -1;
-    setRepostCountLabel();
-    repostEl.btn.classList.toggle("is-active", reposted);
+    repostBtn.classList.toggle("is-active", reposted);
+    renderRepost();
     callbacks.onRepost?.(post.id, reposted);
   }
-
-  repostEl.btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    // Without a quote handler wired, fall back to the plain-repost toggle.
+  repostBtn.addEventListener("click", () => {
     if (!callbacks.onQuote) {
       doPlainRepost();
       return;
     }
-    openRepostMenu(repostEl.btn, {
+    openRepostMenu(repostBtn, {
       reposted,
-      onRepost: () => doPlainRepost(),
+      onRepost: doPlainRepost,
       onQuote: () => callbacks.onQuote?.(post),
     });
   });
 
-  // Like (local toggle)
-  const likeEl = makeAction("like", liked ? ICON_LIKE_FILLED : ICON_LIKE, likeCount);
-  likeEl.btn.setAttribute("aria-label", "Like");
-  if (liked) likeEl.btn.classList.add("is-active");
-  likeEl.btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    // Optimistic toggle; the thread shard's authoritative count comes back via
-    // onLikeUpdated and is reconciled by the feed (setPostLikeState).
-    liked = !liked;
-    likeCount += liked ? 1 : -1;
-    likeEl.countEl.textContent = likeCount > 0 ? String(likeCount) : "";
-    likeEl.btn.classList.toggle("is-active", liked);
-    likeEl.iconWrap.innerHTML = liked ? ICON_LIKE_FILLED : ICON_LIKE;
-    callbacks.onLike?.(post.id, liked);
-  });
+  const shareBtn = document.createElement("button");
+  shareBtn.className = "post-act post-act--share";
+  shareBtn.setAttribute("aria-label", "Share");
+  shareBtn.innerHTML = ICON_SHARE;
 
-  // Share (no action)
-  const shareEl = makeAction("share", ICON_SHARE, 0);
-  shareEl.btn.setAttribute("aria-label", "Share");
-
-  actions.appendChild(reply.btn);
-  actions.appendChild(repostEl.btn);
-  actions.appendChild(likeEl.btn);
-  actions.appendChild(shareEl.btn);
-
-  body.appendChild(meta);
-  body.appendChild(content);
-
-  // Quote-repost embed: if this post quotes another, render the quoted post as
-  // an inline card beneath the content. Resolved from the feed via the callback;
-  // if the quoted post isn't loaded yet, show a lightweight placeholder.
-  if (post.quotedPostId) {
-    const quoted = callbacks.resolveQuoted?.(post.quotedPostId);
-    body.appendChild(createQuoteEmbed(post.quotedPostId, quoted));
-  }
-
-  body.appendChild(actions);
-
-  article.appendChild(avatarCol);
-  article.appendChild(body);
+  foot.appendChild(likeBtn);
+  foot.appendChild(replyBtn);
+  foot.appendChild(repostBtn);
+  foot.appendChild(shareBtn);
+  article.appendChild(foot);
 
   return article;
 }

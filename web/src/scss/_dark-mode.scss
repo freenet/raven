@@ -6,6 +6,10 @@
   --surface-1: #111a2c;
   --surface-2: #1a2540;
   --surface-3: #2a3754;
+  // bg-elevated tracks the dark sidebar/panel surface — without this override
+  // the compose modal, onboarding card, settings hover, and explore-search
+  // focus state all render bright white over the dark theme.
+  --bg-elevated: #111a2c;
 
   // Ink (inverted)
   --ink-0: #f1f5f9;

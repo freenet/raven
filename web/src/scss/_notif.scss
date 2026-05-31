@@ -1,0 +1,91 @@
+// Notifications screen + sidebar badge.
+
+.notif {
+  display: flex;
+  gap: 14px;
+  padding: 16px 26px;
+  border-bottom: 1px solid var(--line-2);
+  cursor: pointer;
+  transition: background 0.12s;
+
+  &:hover { background: var(--surface-hover); }
+}
+
+.notif__icon {
+  width: 30px;
+  flex-shrink: 0;
+  display: flex;
+  justify-content: center;
+  padding-top: 2px;
+
+  svg { width: 20px; height: 20px; }
+
+  &--like     { color: var(--danger); }
+  &--repost   { color: var(--trust); }
+  &--reply,
+  &--mention,
+  &--follow   { color: var(--accent); }
+}
+
+.notif__body { flex: 1; min-width: 0; }
+
+.notif__avatars {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.notif__text {
+  font-family: var(--font-body);
+  font-size: 14.5px;
+  line-height: 1.45;
+  color: var(--ink-0);
+  letter-spacing: -0.005em;
+
+  b { font-weight: 600; }
+}
+
+.notif__when {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  margin-left: 6px;
+}
+
+.notif__excerpt {
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink-3);
+  margin-top: 6px;
+  text-wrap: pretty;
+}
+
+.notif__reply {
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--ink-1);
+  margin-top: 6px;
+  text-wrap: pretty;
+}
+
+// Sidebar nav badge (notification count)
+.nav-item__badge {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 999px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}

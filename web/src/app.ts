@@ -1,141 +1,147 @@
-import { createSidebar, SidebarView } from "./components/sidebar";
+import { createSidebar, SidebarView, SidebarHandle } from "./components/sidebar";
 import { createFeed } from "./components/feed";
 import { createProfile } from "./components/profile";
 import { createRightPanel } from "./components/right-panel";
-import { createQuoteComposer } from "./components/compose-box";
+import { createNotifications } from "./components/notifications";
+import { createExplore } from "./components/explore";
+import { createSettings } from "./components/settings";
+import { createThread } from "./components/thread";
+import { openComposeModal } from "./components/compose-modal";
 import { getIdentity } from "./identity";
 import { Post } from "./types";
 
-/** Open a modal quote composer for `quoted`; on submit, fire `quoteFn`. */
-function openQuoteComposer(
-  quoted: Post,
-  quoteFn?: (postId: string, content: string) => void,
-): void {
-  if (!quoteFn) return;
-  document.querySelector(".quote-modal-overlay")?.remove();
-
-  const overlay = document.createElement("div");
-  overlay.className = "quote-modal-overlay";
-  overlay.style.cssText = [
-    "position:fixed",
-    "inset:0",
-    "z-index:1100",
-    "background:rgba(0,0,0,0.4)",
-    "display:flex",
-    "align-items:flex-start",
-    "justify-content:center",
-    "padding-top:10vh",
-  ].join(";");
-
-  const panel = document.createElement("div");
-  panel.style.cssText = [
-    "width:min(560px,92vw)",
-    "background:var(--surface-0)",
-    "border:1px solid var(--line)",
-    "border-radius:16px",
-    "padding:14px 16px",
-    "box-shadow:0 12px 40px rgba(0,0,0,0.25)",
-  ].join(";");
-
-  const close = (): void => overlay.remove();
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) close();
-  });
-  document.addEventListener(
-    "keydown",
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        close();
-        document.removeEventListener("keydown", onKey, true);
-      }
-    },
-    true,
-  );
-
-  const composer = createQuoteComposer(quoted, (content: string) => {
-    quoteFn(quoted.id, content);
-    close();
-  });
-  panel.appendChild(composer);
-  overlay.appendChild(panel);
-  document.body.appendChild(overlay);
+export interface AppCallbacks {
+  publish: (content: string) => void;
+  like: (postId: string, liked: boolean) => void;
+  repost: (postId: string, reposted: boolean) => void;
+  quote: (postId: string, content: string) => void;
+  /** Reply to a thread root. */
+  reply?: (rootPostId: string, content: string) => void;
 }
 
-export function createApp(
-  publishFn?: (content: string) => Promise<boolean>,
-  likeFn?: (postId: string, liked: boolean) => void,
-  repostFn?: (postId: string, reposted: boolean) => void,
-  quoteFn?: (postId: string, content: string) => void,
-): HTMLElement {
+type FeedEl = HTMLElement & { updatePosts: (p: Post[]) => void };
+
+export function createApp(cb: AppCallbacks): HTMLElement {
   const posts: Post[] = [];
   const followedPubkeys = new Set<string>();
 
   const app = document.createElement("div");
   app.className = "app-layout";
 
-  // Main content area (feed or profile)
   const mainArea = document.createElement("div");
   mainArea.style.cssText = "flex:1;min-width:0;display:flex;flex-direction:column;";
 
-  // Track current view
   let currentView: SidebarView = "feed";
 
-  // Build feed element (created once, shown/hidden)
-  const feed = createFeed(
-    posts,
-    (content: string) => {
-      if (publishFn) {
-        publishFn(content).catch((e) =>
-          console.error("[freenet] Publish failed:", e)
-        );
-      }
-    },
-    followedPubkeys,
-    likeFn,
-    repostFn,
-    (quoted: Post) => openQuoteComposer(quoted, quoteFn)
-  );
-
-  mainArea.appendChild(feed);
-
-  // Navigation handler
-  function navigate(view: SidebarView): void {
-    if (view === currentView) return;
-    currentView = view;
-
-    // Remove current child and replace
-    mainArea.innerHTML = "";
-
-    if (view === "feed") {
-      mainArea.appendChild(feed);
-    } else if (view === "profile") {
-      const identity = getIdentity();
-      if (identity) {
-        // Filter posts authored by the current user
-        const myPosts = posts.filter(
-          (p) => p.author.publicKey && p.author.publicKey === identity.publicKey
-        );
-        const profileUser = {
-          displayName: identity.displayName,
-          handle: identity.handle,
-          publicKey: identity.publicKey,
-        };
-        const profileEl = createProfile(profileUser, myPosts);
-        mainArea.appendChild(profileEl);
-      } else {
-        // No identity yet — fall back to feed
-        currentView = "feed";
-        mainArea.appendChild(feed);
-      }
+  function openCompose(quoted?: Post): void {
+    if (quoted) {
+      openComposeModal((content) => cb.quote(quoted.id, content), { quoted });
+    } else {
+      openComposeModal((content) => cb.publish(content));
     }
   }
 
-  const sidebar = createSidebar({ onNavigate: navigate });
-  app.appendChild(sidebar);
+  // Build feed once, reuse across navigations.
+  const feed = createFeed(posts, followedPubkeys, {
+    onCompose: () => openCompose(),
+    onOpen: (post) => openThread(post),
+    onLike: cb.like,
+    onRepost: cb.repost,
+    onQuote: (post) => openCompose(post),
+  }) as FeedEl;
 
+  mainArea.appendChild(feed);
+
+  let sidebar: SidebarHandle;
+
+  function showFeed(): void {
+    currentView = "feed";
+    sidebar.setActiveView("feed");
+    mainArea.replaceChildren(feed);
+  }
+
+  function showThread(root: Post, replies: Post[]): void {
+    // Thread is a transient snapshot. Live like/repost/quote updates that
+    // land while the user is viewing a thread won't visually reconcile here —
+    // the next navigation rebuilds the feed from the latest `posts` array,
+    // so authoritative state is preserved end-to-end. Sidebar shows "feed"
+    // highlighted (current active screen *area*) since there's no thread
+    // destination in nav.
+    sidebar.setActiveView("feed");
+    const screen = createThread(root, replies, {
+      onBack: showFeed,
+      onReply: (rootId, content) => cb.reply?.(rootId, content),
+    });
+    mainArea.replaceChildren(screen);
+  }
+
+  function openThread(post: Post): void {
+    // For now, "replies" is the set of posts in `posts` that quote or reply
+    // to this one. Reply-relationship wiring lands with #12 backend; until
+    // then this surfaces quote-reposts of the root.
+    const replies = posts.filter((p) => p.quotedPostId === post.id);
+    showThread(post, replies);
+  }
+
+  function navigate(view: SidebarView): void {
+    if (view === currentView) return;
+    currentView = view;
+    sidebar.setActiveView(view);
+
+    if (view === "feed") {
+      mainArea.replaceChildren(feed);
+      return;
+    }
+    if (view === "explore") {
+      mainArea.replaceChildren(createExplore());
+      return;
+    }
+    if (view === "notifications") {
+      mainArea.replaceChildren(createNotifications());
+      return;
+    }
+    if (view === "profile") {
+      const identity = getIdentity();
+      if (!identity) {
+        mainArea.replaceChildren(feed);
+        currentView = "feed";
+        sidebar.setActiveView("feed");
+        return;
+      }
+      const myPosts = posts.filter(
+        (p) => p.author.publicKey && p.author.publicKey === identity.publicKey,
+      );
+      const profileUser = {
+        displayName: identity.displayName,
+        handle: identity.handle,
+        publicKey: identity.publicKey,
+      };
+      mainArea.replaceChildren(
+        createProfile(profileUser, myPosts, {
+          onLike: cb.like,
+          onRepost: cb.repost,
+          onQuote: (p) => openCompose(p),
+          onOpen: (p) => openThread(p),
+          onSettings: () => navigate("settings"),
+        }),
+      );
+      return;
+    }
+    if (view === "settings") {
+      mainArea.replaceChildren(createSettings());
+      return;
+    }
+  }
+
+  sidebar = createSidebar({
+    onNavigate: navigate,
+    onCompose: () => openCompose(),
+    notifCount: 0,
+  });
+  app.appendChild(sidebar);
   app.appendChild(mainArea);
 
-  // Right panel column
+  // Right panel
   const rightCol = document.createElement("div");
   rightCol.className = "right-panel-col";
   rightCol.style.cssText = [
@@ -146,12 +152,10 @@ export function createApp(
     "border-left:1px solid var(--line)",
     "background:transparent",
   ].join(";");
-
-  const rightPanel = createRightPanel();
-  rightCol.appendChild(rightPanel);
+  rightCol.appendChild(createRightPanel({ onNavigate: navigate }));
   app.appendChild(rightCol);
 
-  // Expose feed methods for external updates
+  // Public surface used by index.ts to push updates.
   const appEl = app as unknown as HTMLElement & {
     updatePosts: (updatedPosts: Post[]) => void;
     addPost: (post: Post) => void;
@@ -160,14 +164,12 @@ export function createApp(
   appEl.updatePosts = (updatedPosts: Post[]) => {
     posts.length = 0;
     posts.push(...updatedPosts);
-    const feedEl = feed as HTMLElement & { updatePosts: (p: Post[]) => void };
-    feedEl.updatePosts(updatedPosts);
+    feed.updatePosts(updatedPosts);
   };
 
   appEl.addPost = (post: Post) => {
     posts.unshift(post);
-    const feedEl = feed as HTMLElement & { updatePosts: (p: Post[]) => void };
-    feedEl.updatePosts([...posts]);
+    feed.updatePosts([...posts]);
   };
 
   return app;

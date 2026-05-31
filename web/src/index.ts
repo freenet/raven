@@ -25,6 +25,15 @@ document.title = APP_NAME;
 // guarantees onboarding/splash also respect saved preference.
 initTheme();
 
+// Editorial design tokens are intentionally locked at boot (not user-tweakable).
+// The handoff-bundle design tooling exposed sliders for these; we ship the
+// validated combination directly. See _raven.scss for matching selectors.
+const root = document.documentElement;
+root.dataset.size = "regular";
+root.dataset.actions = "friendly";
+root.dataset.surface = "warm";
+root.dataset.avatars = "ink";
+
 // Show secret key in modal whenever delegate replies to ExportIdentity.
 onIdentityExported((secretKey) => showKeyExportModal(secretKey));
 
@@ -42,14 +51,16 @@ let delegateTimeoutId: ReturnType<typeof setTimeout> | null = null;
 // ---------------------------------------------------------------------------
 // Feed helpers
 // ---------------------------------------------------------------------------
-type FeedEl = HTMLElement & { updatePosts: (posts: Post[]) => void };
-
-function getFeedEl(): FeedEl | null {
-  return appElement?.querySelector(".feed-column") as FeedEl | null;
-}
+// createApp() attaches updatePosts on the app element itself so updates keep
+// flowing even when the visible screen is profile/explore/notifications and
+// the .feed-column DOM node is detached. The cached feed inside app.ts always
+// receives the new list; when the user navigates back to Home it re-renders
+// from the latest state, preserving the optimistic-then-reconcile contract
+// from PRs #36/#37/#38.
+type AppEl = HTMLElement & { updatePosts: (posts: Post[]) => void };
 
 function refreshFeed(): void {
-  getFeedEl()?.updatePosts(localPosts);
+  (appElement as AppEl | null)?.updatePosts?.(localPosts);
 }
 
 // ---------------------------------------------------------------------------
@@ -66,17 +77,16 @@ function renderApp(identity: Identity): void {
 
   connection.setUser(identity.publicKey, identity.displayName, identity.handle);
 
-  appElement = createApp(
-    (content: string) => {
+  appElement = createApp({
+    publish: (content: string) => {
       connection.publishPost(content).then((ok) => {
         if (ok) {
           console.log("[freenet] Post published");
           setTimeout(() => connection.loadState(), 300);
         }
       });
-      return Promise.resolve(true);
     },
-    (postId: string, liked: boolean) => {
+    like: (postId: string, liked: boolean) => {
       connection.likePost(postId, liked).then((ok) => {
         if (!ok) {
           console.warn("[freenet] Like not sent (no delegate / thread shard)");
@@ -86,7 +96,7 @@ function renderApp(identity: Identity): void {
         }
       });
     },
-    (postId: string, reposted: boolean) => {
+    repost: (postId: string, reposted: boolean) => {
       connection.repostPost(postId, reposted).then((ok) => {
         if (!ok) {
           console.warn("[freenet] Repost not sent (no delegate / thread shard)");
@@ -95,7 +105,7 @@ function renderApp(identity: Identity): void {
         }
       });
     },
-    (postId: string, content: string) => {
+    quote: (postId: string, content: string) => {
       connection.quotePost(postId, content).then((ok) => {
         if (!ok) {
           console.warn("[freenet] Quote not sent (no delegate / shard)");
@@ -106,7 +116,7 @@ function renderApp(identity: Identity): void {
         }
       });
     },
-  );
+  });
   appRoot.appendChild(appElement);
 
   // Load posts now that app is rendered

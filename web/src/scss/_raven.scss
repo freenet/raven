@@ -1,0 +1,386 @@
+// Editorial reading surface — feed/post/masthead/tabs/quickpost.
+// Replaces the older .post-card / .tab-bar / inline .compose-box look.
+// Tokens defined per data-attribute on <html> in index.ts (size, actions,
+// surface, avatars); the matching variants live at the bottom of this file.
+
+// Stack inside the feed column
+.screen { min-height: 100vh; }
+
+// Feed-column background swap: the editorial surface reads cleaner on bg-elevated.
+.feed-column { background: var(--bg-elevated); }
+
+// ============================================================================
+// Masthead — Fraunces kicker + title; sticky over feed.
+// ============================================================================
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  padding: 18px 26px 0;
+  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--line);
+}
+
+.masthead__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.kicker {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+}
+
+.masthead__title {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 400;
+  letter-spacing: -0.04em;
+  color: var(--ink-0);
+  margin-top: 7px;
+}
+
+// ============================================================================
+// Feed tabs (Following / Discover)
+// ============================================================================
+.feed-tabs {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.feed-tab {
+  padding: 9px 4px 12px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-3);
+  position: relative;
+  background: none;
+  border: none;
+  cursor: pointer;
+  letter-spacing: -0.01em;
+  transition: color 0.12s;
+
+  &:hover { color: var(--ink-1); }
+
+  &--on {
+    color: var(--ink-0);
+
+    &::after {
+      content: '';
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      border-radius: 3px 3px 0 0;
+      background: var(--accent);
+    }
+  }
+}
+
+// ============================================================================
+// Quickpost row — opens the compose modal.
+// ============================================================================
+.quickpost {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 14px 26px;
+  border-bottom: 1px solid var(--line-2);
+  cursor: text;
+}
+
+.quickpost__field {
+  flex: 1;
+  font-family: var(--font-body);
+  font-size: 15px;
+  color: var(--ink-4);
+}
+
+.quickpost__btn {
+  font-family: var(--font-body);
+  font-weight: 500;
+  font-size: 13.5px;
+  letter-spacing: -0.01em;
+  color: var(--surface-0);
+  background: var(--ink-0);
+  border: none;
+  cursor: pointer;
+  padding: 8px 18px;
+  border-radius: 9px;
+  transition: background 0.14s;
+
+  &:hover { background: var(--ink-1); }
+}
+
+// ============================================================================
+// Post row — byline-above-text editorial layout.
+// ============================================================================
+.post {
+  padding: 20px 26px;
+  border-bottom: 1px solid var(--line-2);
+  cursor: pointer;
+  transition: background 0.1s;
+  animation: fadeUp 0.26s ease both;
+
+  &:hover { background: var(--surface-hover); }
+  &:last-child { border-bottom: none; }
+}
+
+.post__repost-ctx {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  margin-bottom: 11px;
+}
+
+.post__byline {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 13px;
+}
+
+.post__avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  overflow: hidden;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 14px;
+  line-height: 1;
+  background: var(--accent-bg);
+  border: 1.5px solid var(--accent-mid);
+  color: var(--accent);
+
+  img { width: 100%; height: 100%; object-fit: cover; }
+}
+
+.post__who {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.post__name {
+  font-family: var(--font-body);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink-0);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+
+  &:hover {
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+  }
+}
+
+.post__verif {
+  color: var(--trust);
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.post__when {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+
+  i {
+    font-style: normal;
+    color: var(--ink-4);
+    opacity: 0.6;
+    margin: 0 4px;
+  }
+}
+
+.post__text {
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+  letter-spacing: -0.003em;
+  color: var(--ink-1);
+  text-wrap: pretty;
+  margin: 0;
+  word-break: break-word;
+  white-space: pre-wrap;
+
+  &--lead {
+    font-size: 18.5px;
+    line-height: 1.5;
+    color: var(--ink-0);
+  }
+}
+
+.post__tag { color: var(--accent); }
+
+.post__foot {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-top: 16px;
+}
+
+.post__rule {
+  width: 26px;
+  height: 1px;
+  background: var(--ink-0);
+  opacity: 0.16;
+  flex-shrink: 0;
+}
+
+.post-act {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-body);
+  font-size: 12px;
+  color: var(--ink-3);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  transition: color 0.12s;
+
+  svg { width: 16px; height: 16px; }
+
+  &:hover,
+  &--reply:hover { color: var(--accent); }
+
+  &--repost:hover,
+  &--repost.is-active { color: var(--trust); }
+
+  &--like:hover,
+  &--like.is-active { color: var(--danger); }
+
+  &--share { margin-left: auto; }
+}
+
+// ============================================================================
+// Inline quote embed inside a post.
+// ============================================================================
+.post__quote-embed {
+  margin: 8px 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.post__quote-embed-head {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 13px;
+  margin-bottom: 2px;
+}
+
+.post__quote-embed-name {
+  font-weight: 600;
+  color: var(--ink-0);
+}
+
+.post__quote-embed-handle { color: var(--ink-3); }
+
+.post__quote-embed-text {
+  font-size: 14px;
+  color: var(--ink-1);
+  white-space: pre-wrap;
+}
+
+// ============================================================================
+// Following-empty / generic empty notes
+// ============================================================================
+.following-note {
+  padding: 40px 26px;
+  text-align: center;
+}
+
+.following-note__title {
+  font-family: var(--font-display);
+  font-size: 19px;
+  font-weight: 400;
+  letter-spacing: -0.03em;
+  color: var(--ink-0);
+}
+
+.following-note__sub {
+  font-family: var(--font-body);
+  font-size: 13.5px;
+  color: var(--ink-3);
+  margin-top: 8px;
+  line-height: 1.5;
+}
+
+.screen-empty {
+  padding: 56px 26px;
+  text-align: center;
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--ink-3);
+}
+
+// ============================================================================
+// Tweak variants — baked in at <html data-...> by index.ts.
+// ============================================================================
+
+// data-actions="friendly" — drop rule, widen gap, larger icons.
+[data-actions="friendly"] .post__rule { display: none; }
+[data-actions="friendly"] .post__foot { gap: 26px; }
+[data-actions="friendly"] .post-act svg { width: 18px; height: 18px; }
+
+// data-surface="warm" — warm paper feed column.
+[data-surface="warm"] .feed-column { background: #fbfaf8; }
+[data-surface="warm"] .masthead,
+[data-surface="warm"] .thread-head { background: rgba(251, 250, 248, 0.92); }
+
+// data-avatars="ink" — dark-ink avatar for the current identity (and any
+// avatar with no inline background color). Other users carry inline color.
+[data-avatars="ink"] .post__avatar,
+[data-avatars="ink"] .quickpost__avatar,
+[data-avatars="ink"] .sidebar-profile__avatar,
+[data-avatars="ink"] .compose-box__avatar {
+  background: var(--ink-0);
+  border-color: transparent;
+  color: var(--surface-0);
+}
+
+// data-size — body type scale.
+[data-size="small"] .post__text { font-size: 15px; }
+[data-size="small"] .post__text--lead { font-size: 17px; }
+[data-size="large"] .post__text { font-size: 17.5px; }
+[data-size="large"] .post__text--lead { font-size: 20px; }
+
+// ============================================================================
+// Dark surface tweak overrides.
+// data-theme + data-surface live on the same <html> element, so we need
+// both selectors compounded — a descendant combinator would never match.
+// ============================================================================
+[data-theme="dark"][data-surface="warm"] .feed-column { background: #14121c; }
+[data-theme="dark"][data-surface="warm"] .masthead,
+[data-theme="dark"][data-surface="warm"] .thread-head,
+[data-theme="dark"][data-surface="warm"] .search-box { background: rgba(20, 18, 28, 0.92); }

@@ -15,7 +15,9 @@
 // 4. Sidebar: logo, nav, post CTA
 @use 'sidebar';
 
-// 5. Feed: tab bar, compose box, post cards
+// 5. Feed: tab bar, compose box, post cards (legacy kit chrome still used by
+//    a few right-panel + sidebar bits; the editorial reading surface lives in
+//    _raven, _thread, _notif, _explore, _settings, _compose-modal).
 @use 'feed';
 
 // 6. Right panel: search, trending, who to follow
@@ -24,11 +26,22 @@
 // 7. All button variants
 @use 'buttons';
 
-// 8. Modal dialogs
+// 8. Modal dialogs (key export)
 @use 'modal';
 
-// 9. Dark mode overrides
+// 9. Editorial reading surface (feed/post/masthead/tabs/quickpost)
+@use 'raven';
+
+// 10. Editorial screen modules
+@use 'thread';
+@use 'compose-modal';
+@use 'notif';
+@use 'explore';
+@use 'settings';
+@use 'onboarding';
+
+// 11. Dark mode overrides
 @use 'dark-mode';
 
-// 9. Responsive breakpoints, bottom nav, FAB
+// 12. Responsive breakpoints, bottom nav, FAB
 @use 'responsive';
