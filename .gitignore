@@ -22,6 +22,7 @@ web/model_code_hash.txt
 web/tests/node_modules/
 web/tests/playwright-report/
 web/tests/test-results/
+.playwright-mcp/
 
 # IDE
 .idea/

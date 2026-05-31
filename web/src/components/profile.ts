@@ -1,304 +1,166 @@
-/**
- * profile.ts — User profile page component
- */
-
 import { Post, User } from "../types";
-import { createPostCard } from "./post-card";
+import { createPostCard, PostCardCallbacks } from "./post-card";
 
 function getInitials(displayName: string): string {
   return displayName
     .split(" ")
     .slice(0, 2)
-    .map((word) => word[0])
+    .map((w) => w[0])
     .join("")
     .toUpperCase();
 }
 
 function truncateKey(key: string): string {
-  if (key.length <= 20) return key;
-  return `${key.slice(0, 8)}…${key.slice(-8)}`;
+  if (key.length <= 22) return key;
+  return `${key.slice(0, 10)}…${key.slice(-8)}`;
 }
 
-export function createProfile(user: User, posts: Post[]): HTMLElement {
-  injectStyles();
+export interface ProfileCallbacks extends PostCardCallbacks {
+  onSettings?: () => void;
+  /** Optional bio + counts shown alongside the editorial header. */
+  bio?: string;
+  following?: number;
+  followers?: number;
+}
 
-  const profile = document.createElement("main");
-  profile.className = "profile-page";
+export function createProfile(
+  user: User,
+  posts: Post[],
+  cb: ProfileCallbacks = {},
+): HTMLElement {
+  const screen = document.createElement("main");
+  screen.className = "feed-column screen";
 
-  // ---- Header ----
+  // Masthead
+  const masthead = document.createElement("div");
+  masthead.className = "masthead";
+  const row = document.createElement("div");
+  row.className = "masthead__row";
+  const titleWrap = document.createElement("div");
+  const kicker = document.createElement("div");
+  kicker.className = "kicker";
+  kicker.textContent = `Identity · ${posts.length} ${posts.length === 1 ? "post" : "posts"}`;
+  const title = document.createElement("div");
+  title.className = "masthead__title";
+  title.textContent = user.displayName;
+  titleWrap.appendChild(kicker);
+  titleWrap.appendChild(title);
+  row.appendChild(titleWrap);
+  masthead.appendChild(row);
+
+  // Header
   const header = document.createElement("div");
   header.className = "profile-header";
 
-  const headerTitle = document.createElement("div");
-  headerTitle.className = "profile-header__title";
-  headerTitle.textContent = "Profile";
-
-  header.appendChild(headerTitle);
-
-  // ---- Hero ----
-  const hero = document.createElement("div");
-  hero.className = "profile-hero";
+  const top = document.createElement("div");
+  top.className = "profile-header__top";
 
   const avatar = document.createElement("div");
-  avatar.className = "profile-avatar";
+  avatar.className = "profile-header__avatar";
   avatar.textContent = getInitials(user.displayName);
   if (user.avatarColor) {
     avatar.style.background = user.avatarColor;
+    avatar.style.color = "#fff";
+    avatar.style.borderColor = "transparent";
   }
 
-  const info = document.createElement("div");
-  info.className = "profile-info";
+  const edit = document.createElement("button");
+  edit.className = "profile-edit";
+  edit.textContent = "Edit profile";
+  edit.addEventListener("click", () => cb.onSettings?.());
 
-  const displayNameEl = document.createElement("div");
-  displayNameEl.className = "profile-info__name";
-  displayNameEl.textContent = user.displayName;
+  top.appendChild(avatar);
+  top.appendChild(edit);
 
-  const handleEl = document.createElement("div");
-  handleEl.className = "profile-info__handle";
-  handleEl.textContent = `@${user.handle}`;
+  const name = document.createElement("div");
+  name.className = "profile-header__name";
+  name.textContent = user.displayName;
 
-  info.appendChild(displayNameEl);
-  info.appendChild(handleEl);
+  const handle = document.createElement("div");
+  handle.className = "profile-header__handle";
+  handle.textContent = `@${user.handle}`;
 
-  if (user.publicKey) {
-    const keyStrip = document.createElement("div");
-    keyStrip.className = "profile-info__keystrip";
-    keyStrip.title = user.publicKey;
-    keyStrip.innerHTML = `
-      <span class="profile-info__keystrip-label">Public key</span>
-      <span class="profile-info__keystrip-value">${truncateKey(user.publicKey)}</span>
-      <span class="verified-badge">✓ verified</span>
-    `;
-    info.appendChild(keyStrip);
+  header.appendChild(top);
+  header.appendChild(name);
+  header.appendChild(handle);
+
+  if (cb.bio) {
+    const bio = document.createElement("p");
+    bio.className = "profile-header__bio";
+    bio.textContent = cb.bio;
+    header.appendChild(bio);
   }
 
   const stats = document.createElement("div");
   stats.className = "profile-stats";
+  const triplets: [number, string][] = [
+    [posts.length, "Posts"],
+    [cb.following ?? 0, "Following"],
+    [cb.followers ?? 0, "Followers"],
+  ];
+  for (const [n, label] of triplets) {
+    const stat = document.createElement("div");
+    stat.className = "profile-stat";
+    const num = document.createElement("span");
+    num.className = "profile-stat__num";
+    num.textContent = String(n);
+    const lab = document.createElement("span");
+    lab.className = "profile-stat__label";
+    lab.textContent = label;
+    stat.appendChild(num);
+    stat.appendChild(lab);
+    stats.appendChild(stat);
+  }
+  header.appendChild(stats);
 
-  const postCountEl = document.createElement("span");
-  postCountEl.className = "profile-stats__item";
-  postCountEl.innerHTML = `<strong>${posts.length}</strong> Posts`;
+  if (user.publicKey) {
+    const keyrow = document.createElement("div");
+    keyrow.className = "profile-keyrow";
+    const lab = document.createElement("span");
+    lab.className = "profile-keyrow__label";
+    lab.textContent = "ML-DSA-65";
+    const key = document.createElement("span");
+    key.className = "profile-keyrow__key";
+    key.textContent = truncateKey(user.publicKey);
+    const badge = document.createElement("span");
+    badge.className = "info-strip__badge";
+    badge.style.marginLeft = "auto";
+    badge.textContent = "✓ verified";
+    keyrow.appendChild(lab);
+    keyrow.appendChild(key);
+    keyrow.appendChild(badge);
+    header.appendChild(keyrow);
+  }
 
-  stats.appendChild(postCountEl);
+  // Posts list
+  const rhead = document.createElement("div");
+  rhead.className = "thread-rhead";
+  rhead.innerHTML = `<span>Your posts</span>`;
+  rhead.style.paddingTop = "20px";
 
-  hero.appendChild(avatar);
-  hero.appendChild(info);
-  hero.appendChild(stats);
-
-  // ---- Posts section ----
-  const postsSection = document.createElement("div");
-  postsSection.className = "profile-posts";
-
-  const postsSectionTitle = document.createElement("div");
-  postsSectionTitle.className = "profile-posts__title";
-  postsSectionTitle.textContent = "Your posts";
-
-  postsSection.appendChild(postsSectionTitle);
+  screen.appendChild(masthead);
+  screen.appendChild(header);
+  screen.appendChild(rhead);
 
   if (posts.length === 0) {
     const empty = document.createElement("div");
-    empty.className = "profile-posts__empty";
-    empty.innerHTML = `
-      <span class="profile-posts__empty-glyph">"</span>
-      <span class="profile-posts__empty-text">Nothing posted yet</span>
-    `;
-    postsSection.appendChild(empty);
+    empty.className = "screen-empty";
+    empty.textContent = "Nothing posted yet.";
+    screen.appendChild(empty);
   } else {
+    const resolveQuoted = (id: string): Post | undefined => posts.find((p) => p.id === id);
     for (const post of posts) {
-      postsSection.appendChild(createPostCard(post));
+      screen.appendChild(
+        createPostCard(post, {
+          onLike: cb.onLike,
+          onRepost: cb.onRepost,
+          onQuote: cb.onQuote,
+          onOpen: cb.onOpen,
+          resolveQuoted,
+        }),
+      );
     }
   }
 
-  profile.appendChild(header);
-  profile.appendChild(hero);
-  profile.appendChild(postsSection);
-
-  return profile;
-}
-
-let stylesInjected = false;
-
-function injectStyles(): void {
-  if (stylesInjected) return;
-  stylesInjected = true;
-
-  const style = document.createElement("style");
-  style.textContent = `
-    .profile-page {
-      flex: 1;
-      min-width: 0;
-      min-height: 100vh;
-      background: rgba(255, 255, 255, 0.55);
-    }
-
-    .profile-header {
-      position: sticky;
-      top: 0;
-      z-index: 10;
-      background: rgba(248, 250, 252, 0.96);
-      border-bottom: 1px solid var(--line);
-      padding: 18px 26px;
-    }
-
-    .profile-header__title {
-      font-family: var(--font-display);
-      font-size: 22px;
-      font-weight: 400;
-      letter-spacing: -0.04em;
-      color: var(--ink-0);
-      line-height: 1.15;
-    }
-
-    .profile-hero {
-      display: flex;
-      flex-direction: column;
-      align-items: flex-start;
-      gap: 14px;
-      padding: 26px 26px 22px;
-      border-bottom: 1px solid var(--line-2);
-    }
-
-    .profile-avatar {
-      width: 72px;
-      height: 72px;
-      border-radius: 50%;
-      background: var(--accent-bg);
-      border: 1.5px solid var(--accent-mid);
-      color: var(--accent);
-      font-family: var(--font-display);
-      font-style: italic;
-      font-weight: 400;
-      font-size: 28px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-      box-shadow: var(--shadow-sm);
-    }
-
-    .profile-info {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-
-    .profile-info__name {
-      font-family: var(--font-display);
-      font-size: 22px;
-      font-weight: 400;
-      letter-spacing: -0.04em;
-      color: var(--ink-0);
-      line-height: 1.2;
-    }
-
-    .profile-info__handle {
-      font-family: var(--font-mono);
-      font-size: 10px;
-      letter-spacing: 0.02em;
-      color: var(--ink-3);
-    }
-
-    .profile-info__keystrip {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      margin-top: 8px;
-      padding: 6px 10px;
-      background: rgba(239, 246, 255, 0.8);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      max-width: 100%;
-      flex-wrap: wrap;
-    }
-
-    .profile-info__keystrip-label {
-      font-family: var(--font-mono);
-      font-size: 8px;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--ink-4);
-    }
-
-    .profile-info__keystrip-value {
-      font-family: var(--font-mono);
-      font-size: 10px;
-      letter-spacing: 0.02em;
-      color: var(--ink-2);
-      user-select: all;
-    }
-
-    .verified-badge {
-      font-family: var(--font-mono);
-      font-size: 8px;
-      color: var(--trust);
-      background: var(--trust-bg);
-      padding: 2px 8px;
-      border-radius: 4px;
-      border: 1px solid rgba(51, 153, 102, 0.15);
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-
-    .profile-stats {
-      display: flex;
-      gap: 16px;
-      margin-top: 4px;
-    }
-
-    .profile-stats__item {
-      font-family: var(--font-mono);
-      font-size: 10px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--ink-4);
-    }
-
-    .profile-stats__item strong {
-      color: var(--ink-0);
-      font-family: var(--font-display);
-      font-style: normal;
-      font-weight: 500;
-      font-size: 13px;
-      letter-spacing: -0.025em;
-      margin-right: 4px;
-      text-transform: none;
-    }
-
-    .profile-posts__title {
-      font-family: var(--font-mono);
-      font-size: 7.5px;
-      font-weight: 400;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--ink-4);
-      padding: 16px 26px 8px;
-    }
-
-    .profile-posts__empty {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 10px;
-      padding: 48px 20px;
-    }
-
-    .profile-posts__empty-glyph {
-      font-family: var(--font-display);
-      font-style: italic;
-      font-weight: 300;
-      font-size: 60px;
-      color: var(--surface-3);
-      line-height: 1;
-      letter-spacing: -0.05em;
-    }
-
-    .profile-posts__empty-text {
-      font-family: var(--font-mono);
-      font-size: 9.5px;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--ink-4);
-    }
-  `;
-  document.head.appendChild(style);
+  return screen;
 }

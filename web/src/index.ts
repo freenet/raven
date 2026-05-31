@@ -25,6 +25,15 @@ document.title = APP_NAME;
 // guarantees onboarding/splash also respect saved preference.
 initTheme();
 
+// Editorial design tokens are intentionally locked at boot (not user-tweakable).
+// The handoff-bundle design tooling exposed sliders for these; we ship the
+// validated combination directly. See _raven.scss for matching selectors.
+const root = document.documentElement;
+root.dataset.size = "regular";
+root.dataset.actions = "friendly";
+root.dataset.surface = "warm";
+root.dataset.avatars = "ink";
+
 // Show secret key in modal whenever delegate replies to ExportIdentity.
 onIdentityExported((secretKey) => showKeyExportModal(secretKey));
 
@@ -66,17 +75,16 @@ function renderApp(identity: Identity): void {
 
   connection.setUser(identity.publicKey, identity.displayName, identity.handle);
 
-  appElement = createApp(
-    (content: string) => {
+  appElement = createApp({
+    publish: (content: string) => {
       connection.publishPost(content).then((ok) => {
         if (ok) {
           console.log("[freenet] Post published");
           setTimeout(() => connection.loadState(), 300);
         }
       });
-      return Promise.resolve(true);
     },
-    (postId: string, liked: boolean) => {
+    like: (postId: string, liked: boolean) => {
       connection.likePost(postId, liked).then((ok) => {
         if (!ok) {
           console.warn("[freenet] Like not sent (no delegate / thread shard)");
@@ -86,7 +94,7 @@ function renderApp(identity: Identity): void {
         }
       });
     },
-    (postId: string, reposted: boolean) => {
+    repost: (postId: string, reposted: boolean) => {
       connection.repostPost(postId, reposted).then((ok) => {
         if (!ok) {
           console.warn("[freenet] Repost not sent (no delegate / thread shard)");
@@ -95,7 +103,7 @@ function renderApp(identity: Identity): void {
         }
       });
     },
-    (postId: string, content: string) => {
+    quote: (postId: string, content: string) => {
       connection.quotePost(postId, content).then((ok) => {
         if (!ok) {
           console.warn("[freenet] Quote not sent (no delegate / shard)");
@@ -106,7 +114,7 @@ function renderApp(identity: Identity): void {
         }
       });
     },
-  );
+  });
   appRoot.appendChild(appElement);
 
   // Load posts now that app is rendered

@@ -86,6 +86,35 @@ ol {
   to   { transform: none; opacity: 1; }
 }
 
+@keyframes veilIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+// Floating toast for transient confirmations (publish complete, etc.)
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--ink-0);
+  color: var(--surface-0);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 9px 16px;
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 5000;
+  animation: sheetUp 0.2s ease both;
+
+  .live-dot { background: var(--trust); }
+}
+
 // Thin scrollbars throughout
 ::-webkit-scrollbar { width: 3px; height: 3px; }
 ::-webkit-scrollbar-track { background: transparent; }
