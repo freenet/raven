@@ -7,5 +7,5 @@ test("webapp loads, mounts, and renders the feed shell", async ({ page }) => {
   // App shell mounts (sidebar appears in the 3-column layout).
   await expect(page.locator("aside.sidebar")).toBeVisible({ timeout: 10_000 });
   // At least one mock post renders in offline mode.
-  await expect(page.locator("article.post-card").first()).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator("article.post").first()).toBeVisible({ timeout: 10_000 });
 });
