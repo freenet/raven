@@ -32,6 +32,31 @@
   gap: 16px;
   padding: 15px 26px;
   border-bottom: 1px solid var(--line-2);
+
+  // Scaffold rows: control visible but not wired. The button is `disabled`
+  // in TS (blocks both mouse and keyboard); dim the body here so users see
+  // the preference is not yet active.
+  &.is-scaffold {
+    .settings-row__main,
+    .toggle-switch,
+    .segmented { opacity: 0.55; }
+    .toggle-switch { cursor: not-allowed; }
+  }
+}
+
+.settings-row__scaffold-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--ink-4);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 400;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  vertical-align: middle;
 }
 
 .settings-row__main {

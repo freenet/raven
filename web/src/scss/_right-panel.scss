@@ -193,6 +193,40 @@
   text-overflow: ellipsis;
 }
 
+// ── Scaffold body (text inside an empty panel-card) ────────────────────────
+.panel-card__body {
+  padding: 14px 16px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  color: var(--ink-3);
+  line-height: 1.5;
+}
+
+// ── About card body ────────────────────────────────────────────────────────
+.about-card__body {
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.about-card__desc {
+  font-family: var(--font-body);
+  font-size: 13px;
+  color: var(--ink-2);
+  line-height: 1.6;
+  letter-spacing: -0.005em;
+}
+
+.about-card__link {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  text-decoration: none;
+}
+
 // ── More link ──────────────────────────────────────────────────────────────
 .panel-card__more {
   display: block;

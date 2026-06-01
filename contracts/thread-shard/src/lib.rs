@@ -1511,4 +1511,62 @@ mod integration {
             "reply must not land on the wrong thread"
         );
     }
+
+    #[test]
+    fn truncate_reposts_evicts_tombstones_first_under_cap() {
+        // The repost cap (`MAX_REPOSTS`) is enforced post-merge by
+        // `truncate_reposts` — a function of the key set, so it must be
+        // deterministic and order-independent. The tombstone-first rule keeps
+        // the active-repost set intact under pressure: un-reposts (tombstones)
+        // and the largest reposter keys are dropped before any active repost.
+        //
+        // Test plan: build a synthetic shard with MAX_REPOSTS active reposts +
+        // K tombstones, run normalize, assert (1) size == MAX_REPOSTS, (2) every
+        // surviving record is active (`reposted == true`).
+        let mut shard = ThreadShard::default();
+
+        // MAX_REPOSTS active records.
+        for i in 0..MAX_REPOSTS {
+            let key = format!("active_{i:08}");
+            shard.reposts.insert(
+                key.clone(),
+                RepostRecord {
+                    signer_pubkey: key,
+                    seq: 1,
+                    reposted: true,
+                    writer_cert: None,
+                    signature: None,
+                },
+            );
+        }
+        // Add 32 tombstones on top, pushing total to MAX_REPOSTS + 32.
+        for i in 0..32 {
+            let key = format!("tombstone_{i:08}");
+            shard.reposts.insert(
+                key.clone(),
+                RepostRecord {
+                    signer_pubkey: key,
+                    seq: 1,
+                    reposted: false,
+                    writer_cert: None,
+                    signature: None,
+                },
+            );
+        }
+        assert_eq!(shard.reposts.len(), MAX_REPOSTS + 32);
+
+        truncate_reposts(&mut shard.reposts);
+
+        assert_eq!(
+            shard.reposts.len(),
+            MAX_REPOSTS,
+            "cap enforced exactly at MAX_REPOSTS"
+        );
+        for r in shard.reposts.values() {
+            assert!(
+                r.reposted,
+                "tombstones must be evicted before any active repost survives"
+            );
+        }
+    }
 }

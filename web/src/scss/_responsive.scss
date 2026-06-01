@@ -82,12 +82,9 @@
 
   .feed-column { border-right: none; }
 
-  .feed-header { padding: 0; }
-
-  .compose-box { padding: 12px 14px 4px; }
-  .post-card { padding: 12px 14px 10px; }
-
-  .compose-box__textarea { font-size: 16px; }
+  .masthead { padding-left: 14px; padding-right: 14px; }
+  .quickpost { padding-left: 14px; padding-right: 14px; }
+  .post { padding-left: 14px; padding-right: 14px; }
 }
 
 // ── Compact (500–988px) — icon sidebar, no right panel ─────────────────────
@@ -117,9 +114,6 @@
     --right-panel-width: 350px;
   }
 }
-
-// ── Bottom nav — disabled (X uses persistent icon sidebar instead) ─────────
-.bottom-nav { display: none !important; }
 
 // ── FAB (mobile compose, <500px only) ──────────────────────────────────────
 .fab-compose {
