@@ -33,14 +33,14 @@
   padding: 15px 26px;
   border-bottom: 1px solid var(--line-2);
 
-  // Scaffold rows: control visible but not wired. Dim the body and disable
-  // pointer events on the control so users see the preference doesn't persist.
+  // Scaffold rows: control visible but not wired. The button is `disabled`
+  // in TS (blocks both mouse and keyboard); dim the body here so users see
+  // the preference is not yet active.
   &.is-scaffold {
     .settings-row__main,
     .toggle-switch,
     .segmented { opacity: 0.55; }
-    .toggle-switch,
-    .segmented__btn { pointer-events: none; }
+    .toggle-switch { cursor: not-allowed; }
   }
 }
 

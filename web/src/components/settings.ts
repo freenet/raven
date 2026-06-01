@@ -41,6 +41,22 @@ function row(
   }
   r.appendChild(main);
   r.appendChild(control);
+  if (opts.scaffold) {
+    // CSS `pointer-events:none` would only block mouse — disable every
+    // focusable control under the row so Tab+Space can't flip a visual
+    // on-state that does not persist anywhere.
+    for (const el of control.querySelectorAll<HTMLButtonElement>("button")) {
+      el.disabled = true;
+      el.setAttribute("aria-disabled", "true");
+      el.tabIndex = -1;
+    }
+    if (control.tagName === "BUTTON") {
+      const btn = control as HTMLButtonElement;
+      btn.disabled = true;
+      btn.setAttribute("aria-disabled", "true");
+      btn.tabIndex = -1;
+    }
+  }
   return r;
 }
 
