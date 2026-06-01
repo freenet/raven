@@ -167,4 +167,6 @@ hash as `BLAKE3(wasm_bytes)`. Both are required for the node to locate the deleg
 
 ## License
 
-Freenet Microblogging is open-source software. See [LICENSE](LICENSE) for details.
+Licensed under the GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later). See
+[`COPYING`](COPYING) for the full GPL text and [`COPYING.LESSER`](COPYING.LESSER) for the LGPL
+additional terms.
