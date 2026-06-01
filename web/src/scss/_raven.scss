@@ -1,5 +1,5 @@
 // Editorial reading surface — feed/post/masthead/tabs/quickpost.
-// Replaces the older .post-card / .tab-bar / inline .compose-box look.
+// Editorial replacement for the original feed kit.
 // Tokens defined per data-attribute on <html> in index.ts (size, actions,
 // surface, avatars); the matching variants live at the bottom of this file.
 
@@ -363,7 +363,7 @@
 [data-avatars="ink"] .post__avatar,
 [data-avatars="ink"] .quickpost__avatar,
 [data-avatars="ink"] .sidebar-profile__avatar,
-[data-avatars="ink"] .compose-box__avatar {
+[data-avatars="ink"] .compose-modal__avatar {
   background: var(--ink-0);
   border-color: transparent;
   color: var(--surface-0);

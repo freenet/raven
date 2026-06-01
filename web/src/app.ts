@@ -29,7 +29,7 @@ export function createApp(cb: AppCallbacks): HTMLElement {
   app.className = "app-layout";
 
   const mainArea = document.createElement("div");
-  mainArea.style.cssText = "flex:1;min-width:0;display:flex;flex-direction:column;";
+  mainArea.className = "app-layout__main";
 
   let currentView: SidebarView = "feed";
 
@@ -144,14 +144,6 @@ export function createApp(cb: AppCallbacks): HTMLElement {
   // Right panel
   const rightCol = document.createElement("div");
   rightCol.className = "right-panel-col";
-  rightCol.style.cssText = [
-    "width:var(--right-panel-width, 320px)",
-    "flex-shrink:0",
-    "padding:0 18px",
-    "min-height:100vh",
-    "border-left:1px solid var(--line)",
-    "background:transparent",
-  ].join(";");
   rightCol.appendChild(createRightPanel({ onNavigate: navigate }));
   app.appendChild(rightCol);
 

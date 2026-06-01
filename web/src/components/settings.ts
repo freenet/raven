@@ -6,14 +6,32 @@ function truncateKey(key: string): string {
   return `${key.slice(0, 14)}…${key.slice(-8)}`;
 }
 
-function row(label: string, desc: string | null, control: HTMLElement): HTMLElement {
+interface RowOpts {
+  /** Mark as scaffold-only — the control is visible but not yet wired to the
+   *  backend. Dims the row and tags it with a "Coming soon" badge so users
+   *  don't think the preference persists. */
+  scaffold?: boolean;
+}
+
+function row(
+  label: string,
+  desc: string | null,
+  control: HTMLElement,
+  opts: RowOpts = {},
+): HTMLElement {
   const r = document.createElement("div");
-  r.className = "settings-row";
+  r.className = opts.scaffold ? "settings-row is-scaffold" : "settings-row";
   const main = document.createElement("div");
   main.className = "settings-row__main";
   const lab = document.createElement("div");
   lab.className = "settings-row__label";
   lab.textContent = label;
+  if (opts.scaffold) {
+    const badge = document.createElement("span");
+    badge.className = "settings-row__scaffold-badge";
+    badge.textContent = "Coming soon";
+    lab.appendChild(badge);
+  }
   main.appendChild(lab);
   if (desc) {
     const d = document.createElement("div");
@@ -139,6 +157,7 @@ export function createSettings(): HTMLElement {
         "Discoverable on the network",
         "Let others find you by handle in Explore",
         toggle(true, () => undefined),
+        { scaffold: true },
       ),
     ),
   );
@@ -203,8 +222,8 @@ export function createSettings(): HTMLElement {
   screen.appendChild(section("Network", "What the decentralized layer shows you"));
   screen.appendChild(
     list(
-      row("Show routing & provenance", "Hop trails and signed marks on every post", toggle(true, () => undefined)),
-      row("Relay for the network", "Cache and forward records for nearby peers", toggle(false, () => undefined)),
+      row("Show routing & provenance", "Hop trails and signed marks on every post", toggle(true, () => undefined), { scaffold: true }),
+      row("Relay for the network", "Cache and forward records for nearby peers", toggle(false, () => undefined), { scaffold: true }),
     ),
   );
 
@@ -212,10 +231,10 @@ export function createSettings(): HTMLElement {
   screen.appendChild(section("Notifications", "Choose what reaches you"));
   screen.appendChild(
     list(
-      row("Mentions & replies", null, toggle(true, () => undefined)),
-      row("Likes", null, toggle(true, () => undefined)),
-      row("Reposts", null, toggle(false, () => undefined)),
-      row("New followers", null, toggle(true, () => undefined)),
+      row("Mentions & replies", null, toggle(true, () => undefined), { scaffold: true }),
+      row("Likes", null, toggle(true, () => undefined), { scaffold: true }),
+      row("Reposts", null, toggle(false, () => undefined), { scaffold: true }),
+      row("New followers", null, toggle(true, () => undefined), { scaffold: true }),
     ),
   );
 

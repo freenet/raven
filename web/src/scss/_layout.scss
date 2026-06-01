@@ -37,3 +37,22 @@
   background: rgba(255, 255, 255, 0.55);
   border-right: 1px solid var(--line);
 }
+
+// Main column wrapper inside the app layout — holds either the feed,
+// a thread, or another full-screen view.
+.app-layout__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+// Right column wrapping the right-panel card list.
+.right-panel-col {
+  width: var(--right-panel-width, 320px);
+  flex-shrink: 0;
+  padding: 0 18px;
+  min-height: 100vh;
+  border-left: 1px solid var(--line);
+  background: transparent;
+}

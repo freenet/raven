@@ -47,7 +47,7 @@ export function createRightPanel(cb: RightPanelCallbacks = {}): HTMLElement {
     </div>
   `;
   const trendBody = document.createElement("div");
-  trendBody.style.cssText = "padding:14px 16px;font-family:var(--font-body);font-size:13px;color:var(--ink-3);line-height:1.5;";
+  trendBody.className = "panel-card__body";
   trendBody.textContent = "Topics will surface here once discovery indexing comes online.";
   trending.appendChild(trendBody);
   const trendMore = document.createElement("a");
@@ -67,7 +67,7 @@ export function createRightPanel(cb: RightPanelCallbacks = {}): HTMLElement {
     </div>
   `;
   const followBody = document.createElement("div");
-  followBody.style.cssText = "padding:14px 16px;font-family:var(--font-body);font-size:13px;color:var(--ink-3);line-height:1.5;";
+  followBody.className = "panel-card__body";
   followBody.textContent = "Suggestions appear once you start following or post content others react to.";
   follows.appendChild(followBody);
 
@@ -81,16 +81,16 @@ export function createRightPanel(cb: RightPanelCallbacks = {}): HTMLElement {
     </div>
   `;
   const aboutBody = document.createElement("div");
-  aboutBody.style.cssText = "padding:14px 16px 16px;display:flex;flex-direction:column;gap:12px;";
+  aboutBody.className = "about-card__body";
   const desc = document.createElement("p");
-  desc.style.cssText = "font-family:var(--font-body);font-size:13px;color:var(--ink-2);line-height:1.6;letter-spacing:-0.005em;";
+  desc.className = "about-card__desc";
   desc.textContent = "A decentralized social network. Your data, your keys, your control. No servers, no trackers.";
   const link = document.createElement("a");
   link.href = "https://freenet.org";
   link.target = "_blank";
   link.rel = "noopener noreferrer";
   link.textContent = "freenet.org →";
-  link.style.cssText = "font-family:var(--font-mono);font-size:9.5px;letter-spacing:0.1em;text-transform:uppercase;color:var(--accent);text-decoration:none;";
+  link.className = "about-card__link";
   aboutBody.appendChild(desc);
   aboutBody.appendChild(link);
   about.appendChild(aboutBody);
