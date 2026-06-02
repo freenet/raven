@@ -467,6 +467,23 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// First UPDATE onto empty state: `current_version` defaults to 0, so any
+    /// signed state with `version >= 1` must be accepted (the on-chain PUT path
+    /// and the very first facade publish both rely on this). version 0 is
+    /// independently rejected by `verify_full`, exercised in
+    /// `version_zero_rejected`.
+    #[test]
+    fn update_onto_empty_state_accepts_version_one() {
+        let (sk, vk) = make_keypair();
+        let first = make_state(pointer_v(1, 0x01), b"L", &sk);
+        let result = FacadeContract::update_state(
+            params(&vk),
+            State::from(Vec::new()),
+            vec![UpdateData::State(State::from(first))],
+        );
+        assert!(result.is_ok());
+    }
+
     /// Regression for the BLOCKER review-finding: `update_state` must run the
     /// same signature/caps/version-zero verification as `validate_state`.
     /// Otherwise an attacker can push a state with a higher version and a

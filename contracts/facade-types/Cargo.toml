@@ -12,10 +12,13 @@ description = "Shared FacadePointer / FacadeMetadata / signed_payload for the fr
 # workspace dep bump from re-resolving facade transitive deps and rotating the
 # facade wasm bytes (the stable contract id is the entire point — issue #45).
 #
-# Pin (`=x.y.z`) any dep whose minor bump could change serialized output:
-# ed25519-dalek (signature wire format) is the obvious risk. serde 1.x is
-# conservative about its format, so a loose `1` spec is acceptable there.
+# Pin (`=x.y.z`) every dep that influences the facade wasm bytes — the stable
+# contract id depends on byte-determinism. ed25519-dalek (signature wire format)
+# is the obvious risk; serde is pinned too so a transparent minor bump can never
+# silently re-resolve and rotate the bytes, even though its serialization format
+# is stable in practice. Bumping a pin is a deliberate act paired with a snapshot
+# regeneration (which rotates the id and breaks bookmarks).
 
 [dependencies]
 ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc", "serde"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "=1.0.228", features = ["derive"] }
