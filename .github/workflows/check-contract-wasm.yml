@@ -5,6 +5,8 @@ on:
     paths:
       - "web/**"
       - "contracts/**"
+      - "scripts/check-facade-byte-equal.sh"
+      - "scripts/build-facade-snapshot-linux.sh"
       - "delegates/**"
       - "tools/web-container-sign/**"
       - "published-contract/**"
@@ -18,6 +20,8 @@ on:
     paths:
       - "web/**"
       - "contracts/**"
+      - "scripts/check-facade-byte-equal.sh"
+      - "scripts/build-facade-snapshot-linux.sh"
       - "delegates/**"
       - "tools/web-container-sign/**"
       - "published-contract/**"
@@ -83,4 +87,23 @@ jobs:
         with:
           name: published-contract-rebuilt
           path: published-contract/
+          retention-days: 14
+
+      # Issue #45 Phase 4: the facade contract id is the stable bookmarkable
+      # URL (hash of facade.wasm + facade.parameters). Guard facade.wasm
+      # byte-equality so a dep/rustc change can't silently rotate the id and
+      # orphan every bookmark. No-ops (warn + pass) until the facade snapshot
+      # is bootstrapped — see RELEASING.md §"One-time facade publish".
+      - name: Verify facade wasm byte-equality (issue #45)
+        id: facade-verify
+        run: bash scripts/check-facade-byte-equal.sh
+
+      # On drift, upload the canonical CI-built facade.wasm so an operator can
+      # recompute facade-id.txt and commit a deliberate snapshot refresh.
+      - name: Upload rebuilt facade.wasm on drift
+        if: failure() && steps.facade-verify.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: facade-wasm-rebuilt-${{ github.sha }}
+          path: contracts/facade/target/wasm32-unknown-unknown/release/freenet_microblogging_facade.wasm
           retention-days: 14
