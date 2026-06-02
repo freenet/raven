@@ -1,4 +1,23 @@
 #!/usr/bin/env bash
+# End-to-end PRODUCTION release driver for freenet-microblogging (raven).
+#
+# Runs the whole production-release workflow as one command, stopping at
+# each irreversible action for confirmation. See RELEASING.md for the
+# narrative runbook.
+#
+# Preconditions (checked up front, fail fast):
+#   • clean working tree on `main`
+#   • tag vX.Y.Z does not already exist (local or origin)
+#   • production key present (WEB_CONTAINER_KEY_FILE or default path)
+#   • fdev, cargo-make, gh, GNU tar installed
+#   • a network-connected Freenet node reachable (NOT a `freenet local`
+#     sandbox — production publishes go to the real network)
+#   • cargo make test + clippy pass
+#
+# Usage:
+#     scripts/release.sh 0.1.0
+#     scripts/release.sh 0.1.0 --yes   # auto-confirm all prompts
+
 set -euo pipefail
 
 VERSION="${1:-}"
@@ -22,45 +41,92 @@ fi
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 
+TAG="v$VERSION"
+FREENET_PORT="${FREENET_PORT:-7509}"
+
 confirm() {
     $ASSUME_YES && return 0
     read -r -p "$1 [y/N] " reply
     [[ "$reply" =~ ^[Yy]$ ]]
 }
 
+die() { echo "error: $*" >&2; exit 1; }
+
+# ─── Monotonic signing version ───────────────────────────────────────────────
+#
+# The on-chain web-container contract rejects any UPDATE whose version is
+# <= the currently-published version (web/container/src/lib.rs). We derive a
+# monotonic u32 from the release semver: major*1_000_000 + minor*1_000 + patch.
+# This is deterministic, ties to the tag, and increases with every semver bump
+# (minor/patch each capped at 999, which is plenty). The historical scheme —
+# commit-hash bits — was effectively random and could sign a LOWER version
+# than the previous release, which the contract silently rejected.
+SEMVER_CORE="${VERSION%%-*}"   # drop any -rc.N suffix for the numeric pack
+IFS='.' read -r MAJ MIN PAT <<<"$SEMVER_CORE"
+if [ "$MIN" -gt 999 ] || [ "$PAT" -gt 999 ]; then
+    die "minor/patch > 999 not supported by the packed version scheme ($VERSION)"
+fi
+WEBAPP_VERSION=$(( MAJ * 1000000 + MIN * 1000 + PAT ))
+[ "$WEBAPP_VERSION" -gt 0 ] || die "packed version must be > 0 (got $WEBAPP_VERSION for $VERSION)"
+export WEBAPP_VERSION
+
 # ─── 1. Preflight ──────────────────────────────────────────────────────────────
 echo "── preflight ─────────────────────────────────────────────────────────────"
 
-[ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || {
-    echo "error: not on main" >&2; exit 1; }
+[ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || die "not on main"
 
-git diff --quiet && git diff --cached --quiet || {
-    echo "error: working tree dirty" >&2; exit 1; }
+git diff --quiet && git diff --cached --quiet || die "working tree dirty"
 
 git fetch origin --tags
-if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-    echo "error: tag v$VERSION already exists locally" >&2; exit 1
+if git rev-parse "$TAG" >/dev/null 2>&1; then
+    die "tag $TAG already exists locally (git tag -d $TAG to re-run)"
 fi
-if git ls-remote --tags origin "v$VERSION" | grep -q "v$VERSION"; then
-    echo "error: tag v$VERSION already exists on origin" >&2; exit 1
+if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+    die "tag $TAG already exists on origin"
 fi
 
 KEY_FILE="${WEB_CONTAINER_KEY_FILE:-$HOME/.config/freenet-microblogging/web-container-keys.toml}"
-[ -f "$KEY_FILE" ] || { echo "error: production key missing at $KEY_FILE" >&2; exit 1; }
+[ -f "$KEY_FILE" ] || die "production key missing at $KEY_FILE (run scripts/generate-production-key.sh)"
 
 for cmd in fdev cargo-make gh; do
-    command -v "$cmd" >/dev/null 2>&1 || { echo "error: $cmd not on PATH" >&2; exit 1; }
+    command -v "$cmd" >/dev/null 2>&1 || die "$cmd not on PATH"
 done
 
 if ! command -v gtar >/dev/null 2>&1 && ! tar --version 2>/dev/null | grep -qi 'gnu tar'; then
-    echo "error: GNU tar required (macOS: brew install gnu-tar)" >&2; exit 1
+    die "GNU tar required (macOS: brew install gnu-tar)"
 fi
 
-if ! curl -fsS --max-time 3 "http://127.0.0.1:50509/v1/contract/info" >/dev/null 2>&1 \
-   && ! nc -z 127.0.0.1 50509 2>/dev/null; then
-    echo "error: local Freenet node unreachable on 127.0.0.1:50509" >&2; exit 1
+# Production publishes go to the REAL network, not a `freenet local` sandbox.
+# Probe the HTTP gateway; warn (don't hard-fail) so an operator pointing at a
+# non-default bind can still proceed deliberately.
+if curl -fsS --max-time 3 "http://127.0.0.1:${FREENET_PORT}/" >/dev/null 2>&1 \
+   || nc -z 127.0.0.1 "$FREENET_PORT" 2>/dev/null; then
+    echo "  ✓ Freenet node reachable on :${FREENET_PORT}"
+else
+    echo "  ⚠️  could not reach a Freenet node at http://127.0.0.1:${FREENET_PORT}"
+    echo "     Production publishes need \`freenet network\` (NOT \`freenet local\`)."
+    echo "     Override the probe port with FREENET_PORT=... if your node binds elsewhere."
+    confirm "Continue anyway?" || { echo "aborted"; exit 0; }
 fi
-echo "preflight ✓"
+
+# Monotonicity guard: if the contract is already published, its current state
+# version must be < the version we are about to sign, or the UPDATE will be
+# rejected on-network. Best-effort — only checks when we can read it back.
+if [ -f published-contract/contract-id.txt ]; then
+    CUR_ID=$(cat published-contract/contract-id.txt)
+    SUMMARY=$(curl -fsS --max-time 5 \
+        "http://127.0.0.1:${FREENET_PORT}/v1/contract/$CUR_ID/state-summary" 2>/dev/null || echo "")
+    if [[ "$SUMMARY" =~ ([0-9]+) ]]; then
+        PUBLISHED_VERSION="${BASH_REMATCH[1]}"
+        if [ "$WEBAPP_VERSION" -le "$PUBLISHED_VERSION" ]; then
+            die "packed version $WEBAPP_VERSION (from $VERSION) is <= currently-published version $PUBLISHED_VERSION.
+The contract would reject this UPDATE. Bump the release version."
+        fi
+        echo "  ✓ signing version $WEBAPP_VERSION > published $PUBLISHED_VERSION"
+    fi
+fi
+
+echo "preflight ✓ (signing version $WEBAPP_VERSION for $VERSION)"
 
 # ─── 2. Test gate ──────────────────────────────────────────────────────────────
 echo "── tests ─────────────────────────────────────────────────────────────────"
@@ -71,12 +137,12 @@ echo "tests ✓"
 # ─── 3. First confirmation ─────────────────────────────────────────────────────
 cat <<EOF
 
-This will perform 6 IRREVERSIBLE steps for v$VERSION:
-  1. Build + sign webapp with PRODUCTION key
+This will perform IRREVERSIBLE steps for $TAG:
+  1. Build + sign webapp with PRODUCTION key (version $WEBAPP_VERSION)
   2. Update published-contract/ with new contract ID
   3. Publish webapp to the live Freenet network
   4. Commit published-contract/ on main
-  5. Create annotated tag v$VERSION with auto-generated notes
+  5. Create annotated tag $TAG with auto-generated notes
   6. Push commit + tag to origin
 
 EOF
@@ -86,57 +152,72 @@ confirm "Proceed?" || { echo "aborted"; exit 0; }
 echo "── publish-production ────────────────────────────────────────────────────"
 cargo make publish-production
 
-# ─── 5. Verify snapshot changed ────────────────────────────────────────────────
-if git diff --quiet -- published-contract/; then
-    echo "error: published-contract/ did not change — nothing to release" >&2
-    exit 1
-fi
-
 NEW_ID=$(cat published-contract/contract-id.txt)
 echo
 echo "── new contract id: $NEW_ID ────────────────────────────────"
-git --no-pager diff --stat -- published-contract/
+
+# ─── 5. Snapshot diff (unchanged-bytes is OK) ──────────────────────────────────
+SNAPSHOT_CHANGED=1
+if git diff --quiet -- published-contract/; then
+    SNAPSHOT_CHANGED=0
+    echo "  ⚠️  published-contract/ unchanged — wasm + parameters bit-identical to last release."
+    echo "      A reproducible build can leave the snapshot byte-equal; the signature carries"
+    echo "      the new version $WEBAPP_VERSION and was re-published. Will tag $TAG against HEAD"
+    echo "      without an empty release commit."
+else
+    git --no-pager diff --stat -- published-contract/
+fi
 
 # ─── 6. Second confirmation ────────────────────────────────────────────────────
-confirm "Commit published-contract/ and proceed to tag?" || {
-    echo "aborted — published-contract/ left modified for inspection"; exit 0; }
-
-# ─── 7. Commit ─────────────────────────────────────────────────────────────────
-git add published-contract/
-git commit -m "release: v$VERSION
+if [ "$SNAPSHOT_CHANGED" = "1" ]; then
+    confirm "Commit published-contract/ and proceed to tag?" || {
+        echo "aborted — published-contract/ left modified for inspection"; exit 0; }
+    git add published-contract/
+    git commit -m "release: $TAG
 
 Contract ID: $NEW_ID
+Signed version: $WEBAPP_VERSION
 "
+else
+    confirm "Tag current HEAD as $TAG (no snapshot commit)?" || { echo "aborted"; exit 0; }
+fi
 
-# ─── 8. Tag ────────────────────────────────────────────────────────────────────
+# ─── 7. Tag ────────────────────────────────────────────────────────────────────
 PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
 if [ -n "$PREV_TAG" ]; then
     NOTES=$(git log --pretty=format:"- %s (%h)" "$PREV_TAG"..HEAD)
+    RANGE="since $PREV_TAG"
 else
     NOTES=$(git log --pretty=format:"- %s (%h)" HEAD)
+    RANGE="initial release"
 fi
 
-git tag -a "v$VERSION" -m "v$VERSION
+git tag -a "$TAG" -m "$TAG
 
 Contract ID: $NEW_ID
+Signed version: $WEBAPP_VERSION
 
-Changes since $PREV_TAG:
+Changes $RANGE:
 $NOTES
 "
 
-# ─── 9. Third confirmation ─────────────────────────────────────────────────────
+# ─── 8. Third confirmation + push ──────────────────────────────────────────────
 echo
 echo "── ready to push ────────────────────────────────────────────────────────"
 echo "  git push origin main"
-echo "  git push origin v$VERSION"
+echo "  git push origin $TAG"
 confirm "Push?" || {
-    echo "stopped before push — run \`git push origin main && git push origin v$VERSION\` when ready"
+    echo "stopped before push — run \`git push origin main && git push origin $TAG\` when ready"
     exit 0
 }
 
 git push origin main
-git push origin "v$VERSION"
+git push origin "$TAG"
 
 echo
-echo "── released v$VERSION ────────────────────────────────────────────────────"
-echo "  contract id: $NEW_ID"
+echo "── released $TAG ──────────────────────────────────────────────────────────"
+echo "  contract id:     $NEW_ID"
+echo "  signed version:  $WEBAPP_VERSION"
+echo
+echo "Next: wait ~30s for propagation, then"
+echo "  scripts/smoke-test-production.sh"

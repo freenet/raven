@@ -277,10 +277,19 @@ if [ ! -f "$KEY_FILE" ]; then
     echo "error: $KEY_FILE not found — run \`cargo make generate-web-container-keys\` first" >&2
     exit 1
 fi
-short=$(git -C "$ROOT" rev-parse --short=8 HEAD)
-version=$(( $(printf '%d' "0x$short") & 0x7fffffff ))
-if [ "$version" -eq 0 ]; then version=1; fi
-echo "signing with version $version (from commit $short)"
+# Monotonic version (see sign-webapp): the contract rejects non-increasing
+# updates. Commit count is monotonic with history; never use commit-hash bits
+# (random → can decrease → UPDATE rejected on a persistent local node). Honour
+# WEBAPP_VERSION when an explicit value is wanted.
+if [ -n "${WEBAPP_VERSION:-}" ]; then
+    version="$WEBAPP_VERSION"
+    version_src="WEBAPP_VERSION"
+else
+    version=$(git -C "$ROOT" rev-list --count HEAD)
+    version_src="commit count"
+fi
+if [ "$version" -le 0 ]; then version=1; fi
+echo "signing TEST webapp, version $version (from $version_src)"
 cargo run --quiet -p web-container-sign -- sign \
     --input "$ROOT/target/webapp/webapp.tar.xz" \
     --output "$ROOT/target/webapp/webapp.metadata" \
@@ -307,10 +316,25 @@ if [ ! -f "$KEY_FILE" ]; then
     echo "  WEB_CONTAINER_KEY_FILE=/path/to/keys.toml cargo make sign-webapp" >&2
     exit 1
 fi
-short=$(git -C "$ROOT" rev-parse --short=8 HEAD)
-version=$(( $(printf '%d' "0x$short") & 0x7fffffff ))
-if [ "$version" -eq 0 ]; then version=1; fi
-echo "signing with PRODUCTION key at $KEY_FILE, version $version (from commit $short)"
+# The on-chain web-container contract enforces a monotonically increasing
+# version (web/container/src/lib.rs: `new_version <= current_version` is
+# rejected with InvalidUpdate). The signing version MUST therefore never go
+# backwards between releases. scripts/release.sh derives it from the release
+# semver and exports WEBAPP_VERSION; honour that when present.
+#
+# Fallback (manual/dev sign with no WEBAPP_VERSION): use the linear commit
+# count, which is monotonic with history. NEVER fall back to commit-hash bits
+# — those are effectively random and let release N+1 sign a LOWER version than
+# release N, which the contract silently rejects and the publish never lands.
+if [ -n "${WEBAPP_VERSION:-}" ]; then
+    version="$WEBAPP_VERSION"
+    version_src="WEBAPP_VERSION (release semver)"
+else
+    version=$(git -C "$ROOT" rev-list --count HEAD)
+    version_src="commit count (dev fallback)"
+fi
+if [ "$version" -le 0 ]; then version=1; fi
+echo "signing with PRODUCTION key at $KEY_FILE, version $version (from $version_src)"
 cargo run --quiet -p web-container-sign -- sign \
     --input "$ROOT/target/webapp/webapp.tar.xz" \
     --output "$ROOT/target/webapp/webapp.metadata" \

@@ -19,11 +19,17 @@
    brew install gnu-tar gh    # macOS — Linux ships GNU tar
    ```
 
-4. Confirm local Freenet node reaches the network:
+4. Start a **network-connected** Freenet node in another terminal.
+   Production publishes go to the real network, NOT a `freenet local`
+   sandbox:
 
    ```bash
-   freenet local --ws-api-address 127.0.0.1
+   freenet network
    ```
+
+   Wait until it reports connected peers. The release script probes its
+   HTTP gateway on `127.0.0.1:7509`; override with `FREENET_PORT=...` if
+   your node binds elsewhere.
 
 ## Cutting a release
 
@@ -33,10 +39,38 @@ scripts/release.sh 0.1.0
 
 The script enforces:
 - clean tree on `main`
-- tag does not already exist
-- production key + tools present
-- node reachable at `127.0.0.1:50509`
+- tag does not already exist (local or origin)
+- production key + tools (`fdev`, `cargo-make`, `gh`, GNU tar) present
+- a Freenet node reachable at `127.0.0.1:7509` (warns + asks if not)
+- the signing version it will use is **greater than** the
+  currently-published version (see below)
 - `cargo make test` and `cargo make clippy` pass
+
+### Signing version (monotonicity)
+
+The on-chain web-container contract rejects any update whose version is
+`<=` the currently-published one (`web/container/src/lib.rs`). The release
+script derives a monotonic `u32` from the release semver —
+`major*1_000_000 + minor*1_000 + patch` (so `0.1.0 → 1000`, `0.2.0 →
+2000`, `1.0.0 → 1000000`) — and exports it as `WEBAPP_VERSION` for the
+sign step. Minor and patch are each capped at 999.
+
+Because the version is tied to the semver, **always bump the release
+version** between releases; re-running with the same version produces the
+same signing version and the network rejects the re-publish as a
+non-increasing update. (The old commit-hash scheme produced random,
+sometimes-decreasing versions and could silently fail to land.)
+
+If `release.sh` finds the contract already published with a version
+`>=` the one it's about to sign, it aborts in preflight and tells you to
+bump.
+
+### Unchanged snapshot
+
+A reproducible build can leave `published-contract/` byte-identical to the
+previous release (only the signature timestamp + version differ). The
+script detects this, skips the empty snapshot commit, and tags HEAD
+directly instead of aborting.
 
 It then prompts 3 times before destructive steps:
 1. Before publishing to the live network
