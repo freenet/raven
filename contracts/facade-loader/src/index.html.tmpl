@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<meta http-equiv="cache-control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="pragma" content="no-cache" />
+<meta http-equiv="expires" content="0" />
+<title>Raven</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0c0e12;color:#e6e8eb;font:14px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;}
+  main{display:flex;align-items:center;justify-content:center;height:100%;flex-direction:column;gap:1rem;}
+  .spinner{width:28px;height:28px;border:3px solid #2a2f3a;border-top-color:#7aa2f7;border-radius:50%;animation:spin 0.9s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  small{opacity:0.5;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  a{color:#7aa2f7;}
+</style>
+</head>
+<body>
+<main>
+  <div class="spinner" aria-hidden="true"></div>
+  <div>Loading Raven…</div>
+  <small id="target">__CURRENT_APP_ID__</small>
+  <noscript>JavaScript is required. Visit <a id="fallback" href="#">the current app contract</a> directly.</noscript>
+</main>
+<script>
+(function () {
+  // Issue #45 facade loader.
+  // CURRENT_APP_ID is substituted by scripts/build-loader.sh at publish time.
+  var CURRENT_APP_ID = "__CURRENT_APP_ID__";
+
+  // Build the redirect URL relative to the current gateway origin so the loader
+  // works on whichever node served it (local sandbox, iso harness, production
+  // peer). Path shape `/v1/contract/web/<id>/` matches the gateway routing used
+  // everywhere else in this repo.
+  var here = window.location;
+  var target = here.protocol + "//" + here.host + "/v1/contract/web/" + CURRENT_APP_ID + "/";
+
+  var fb = document.getElementById("fallback");
+  if (fb) fb.href = target;
+
+  // The gateway serves contract URLs as a shell page with the contract content
+  // in a sandboxed iframe. The shell page sets `X-Frame-Options: DENY`, so a
+  // same-window `location.replace` from inside the sandbox would try to load the
+  // next contract's shell page *inside our iframe*, which Firefox/Chrome block
+  // as a clickjacking defense.
+  //
+  // The shell exposes a cross-contract navigation primitive via postMessage
+  // (`__freenet_shell__: 'navigate'`), which performs a top-level navigation in
+  // the same tab. We use that when we're framed.
+  //
+  // When the loader is opened standalone (no parent frame, e.g. a developer
+  // fetching the loader directly), fall back to a same-window location replace
+  // so the UX still works.
+  var framed = false;
+  try { framed = window.parent !== window; } catch (e) { framed = true; }
+
+  if (framed) {
+    window.parent.postMessage({
+      __freenet_shell__: true,
+      type: 'navigate',
+      href: target
+    }, '*');
+  } else {
+    // Use replace() so the loader URL doesn't pollute browser history; the
+    // user's bookmarked facade URL stays the canonical entry point.
+    window.location.replace(target);
+  }
+})();
+</script>
+</body>
+</html>

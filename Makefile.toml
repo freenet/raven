@@ -524,3 +524,220 @@ echo "wiped local Freenet node state"
 [tasks.republish-fresh]
 description = "Wipe node state then run publish-all. Stop run-node first, then restart it before this."
 dependencies = ["clean-node", "publish-all"]
+
+# ─── Facade contract (issue #45): stable bookmarkable URL across releases ────
+#
+# The facade is a contract whose id stays stable; its signed state points at the
+# CURRENT web-container's contract id. Users bookmark the facade URL; each
+# release flips the pointer via UPDATE. The facade crates live OUTSIDE the
+# workspace (own Cargo.lock) so dep churn can't rotate the facade wasm bytes.
+#
+# Facade pointer version: reuse WEBAPP_VERSION (the packed-semver the release
+# driver signs the web container with) so the facade advances in lockstep with
+# releases. Standalone/dev signs fall back to the monotonic commit count — never
+# a wall-clock or random value.
+
+[tasks.build-facade-loader]
+description = "Render the facade loader HTML with a baked CURRENT_APP_ID (defaults to the committed contract id)"
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+APP_ID="${FACADE_CURRENT_APP_ID:-}"
+if [ -z "$APP_ID" ]; then
+    if [ ! -f "$ROOT/published-contract/contract-id.txt" ]; then
+        echo "error: FACADE_CURRENT_APP_ID unset and published-contract/contract-id.txt missing" >&2
+        echo "       run \`cargo make update-published-contract\` first or set FACADE_CURRENT_APP_ID" >&2
+        exit 1
+    fi
+    APP_ID=$(cat "$ROOT/published-contract/contract-id.txt")
+fi
+bash "$ROOT/scripts/build-loader.sh" "$APP_ID"
+'''
+
+[tasks.build-facade]
+description = "Build the facade contract WASM (stable across releases; own workspace + Cargo.lock)"
+dependencies = ["build-facade-loader"]
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+# Build against the facade-local manifest with its own target/ so the wasm is
+# co-located with its lockfile and never pollutes the workspace target/.
+cd "$ROOT/contracts/facade"
+cargo build --profile "${BUILD_PROFILE}" --target "${CONTRACT_TARGET}" \
+    --no-default-features --features freenet-main-contract
+'''
+
+[tasks.pack-facade-loader]
+description = "Pack the rendered facade loader (dist/index.html) into a tar.xz the gateway serves as a webapp"
+dependencies = ["build-facade-loader"]
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+APP_ID="${FACADE_CURRENT_APP_ID:-$(cat "$ROOT/published-contract/contract-id.txt")}"
+DIST_DIR="$ROOT/contracts/facade-loader/dist"
+LOADER_HTML="$DIST_DIR/index.html"
+if [ ! -f "$LOADER_HTML" ]; then
+    echo "error: $LOADER_HTML missing (build-facade-loader should have produced it)" >&2
+    exit 1
+fi
+# Sanity: the rendered HTML MUST embed the current_app_id we're about to sign
+# over, otherwise the facade pointer redirects users to a different app than the
+# loader actually fetches.
+if ! grep -q "$APP_ID" "$LOADER_HTML"; then
+    echo "error: $LOADER_HTML does not embed current_app_id '$APP_ID'." >&2
+    echo "       Re-render with: FACADE_CURRENT_APP_ID=$APP_ID cargo make build-facade-loader" >&2
+    exit 1
+fi
+mkdir -p "$ROOT/target/facade"
+# GNU tar for reproducibility (matches compress-webapp). The gateway's
+# WebApp::try_from runs XzDecoder → tar.unpack over these bytes.
+if command -v gtar >/dev/null 2>&1; then
+    TAR=gtar
+elif tar --version 2>/dev/null | grep -qi 'gnu tar'; then
+    TAR=tar
+else
+    echo "warning: GNU tar not found — facade loader archive will not be byte-identical" >&2
+    echo "         across machines (signing is per-build anyway)." >&2
+    TAR=""
+fi
+OUT="$ROOT/target/facade/loader.tar.xz"
+if [ -n "$TAR" ]; then
+    "$TAR" --sort=name --mtime='2024-01-01 00:00:00 UTC' \
+        --owner=0 --group=0 --numeric-owner \
+        -C "$DIST_DIR" -cJf "$OUT" index.html
+else
+    tar -C "$DIST_DIR" -cJf "$OUT" index.html
+fi
+echo "wrote $OUT ($(wc -c < "$OUT") bytes)"
+'''
+
+[tasks.sign-facade-state-test]
+description = "Sign a facade state blob with the committed TEST key (current_app_id from published-contract)"
+dependencies = ["pack-facade-loader"]
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+KEY_FILE="$ROOT/test-contract/web-container-keys.toml"
+if [ ! -f "$KEY_FILE" ]; then
+    echo "error: $KEY_FILE not found — run \`cargo make generate-web-container-keys\`" >&2
+    exit 1
+fi
+APP_ID="${FACADE_CURRENT_APP_ID:-$(cat "$ROOT/published-contract/contract-id.txt")}"
+LOADER="$ROOT/target/facade/loader.tar.xz"
+[ -f "$LOADER" ] || { echo "error: $LOADER missing (pack-facade-loader should have produced it)" >&2; exit 1; }
+if [ -n "${WEBAPP_VERSION:-}" ]; then version="$WEBAPP_VERSION"; else version=$(git -C "$ROOT" rev-list --count HEAD); fi
+mkdir -p "$ROOT/target/facade"
+cargo run --quiet -p web-container-sign -- sign-facade-state \
+    --loader "$LOADER" --current-app-id "$APP_ID" --version "$version" \
+    --key-file "$KEY_FILE" \
+    --output "$ROOT/target/facade/facade.state" \
+    --parameters "$ROOT/target/facade/facade.parameters"
+echo "TEST facade state signed at version $version pointing at $APP_ID"
+'''
+
+[tasks.sign-facade-state]
+description = "Sign a facade state blob with the PRODUCTION key (current_app_id from published-contract)"
+dependencies = ["pack-facade-loader"]
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+KEY_FILE="${WEB_CONTAINER_KEY_FILE:-$HOME/.config/freenet-microblogging/web-container-keys.toml}"
+if [ ! -f "$KEY_FILE" ]; then
+    echo "error: production key file not found at $KEY_FILE" >&2
+    echo "       generate one out of band with scripts/generate-production-key.sh" >&2
+    exit 1
+fi
+APP_ID="${FACADE_CURRENT_APP_ID:-$(cat "$ROOT/published-contract/contract-id.txt")}"
+LOADER="$ROOT/target/facade/loader.tar.xz"
+[ -f "$LOADER" ] || { echo "error: $LOADER missing (pack-facade-loader should have produced it)" >&2; exit 1; }
+if [ -n "${WEBAPP_VERSION:-}" ]; then version="$WEBAPP_VERSION"; else version=$(git -C "$ROOT" rev-list --count HEAD); fi
+mkdir -p "$ROOT/target/facade"
+cargo run --quiet -p web-container-sign -- sign-facade-state \
+    --loader "$LOADER" --current-app-id "$APP_ID" --version "$version" \
+    --key-file "$KEY_FILE" \
+    --output "$ROOT/target/facade/facade.state" \
+    --parameters "$ROOT/target/facade/facade.parameters"
+echo "PRODUCTION facade state signed at version $version pointing at $APP_ID"
+'''
+
+[tasks.update-published-facade]
+description = "Refresh published-contract/facade.{wasm,parameters} + facade-id.txt from a fresh facade build"
+dependencies = ["build-facade", "sign-facade-state-test"]
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+WASM="$ROOT/contracts/facade/target/${CONTRACT_TARGET}/release/freenet_microblogging_facade.wasm"
+PARAMS="$ROOT/target/facade/facade.parameters"
+[ -f "$WASM" ]   || { echo "error: $WASM not found" >&2; exit 1; }
+[ -f "$PARAMS" ] || { echo "error: $PARAMS not found" >&2; exit 1; }
+contract_id=$(CARGO_TARGET_DIR="$ROOT/target" fdev get-contract-id --code "$WASM" --parameters "$PARAMS")
+[ -n "$contract_id" ] || { echo "error: fdev get-contract-id returned empty id" >&2; exit 1; }
+mkdir -p "$ROOT/published-contract"
+cp "$WASM"   "$ROOT/published-contract/facade.wasm"
+cp "$PARAMS" "$ROOT/published-contract/facade.parameters"
+printf '%s\n' "$contract_id" > "$ROOT/published-contract/facade-id.txt"
+echo "published-contract/ facade refreshed:"
+echo "  facade-id.txt    = $contract_id"
+echo "  facade.wasm      = $(wc -c < "$ROOT/published-contract/facade.wasm") bytes"
+echo ""
+echo "NOTE: facade-id.txt MUST stay stable across releases. If this id differs"
+echo "      from what's committed, the facade wasm or parameters drifted —"
+echo "      investigate before committing (it breaks every bookmark)."
+'''
+
+[tasks.publish-facade-test]
+description = "Publish (PUT) the facade to the local sandbox — first-time publish only"
+dependencies = ["build-facade", "sign-facade-state-test"]
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+WASM="$ROOT/published-contract/facade.wasm"
+PARAMS="$ROOT/published-contract/facade.parameters"
+STATE="$ROOT/target/facade/facade.state"
+[ -f "$WASM" ] && [ -f "$PARAMS" ] || { echo "error: facade wasm/parameters missing — run \`cargo make update-published-facade\` first" >&2; exit 1; }
+[ -f "$STATE" ] || { echo "error: $STATE missing — sign-facade-state-test should have produced it" >&2; exit 1; }
+PORT="${FREENET_PORT:-7509}"
+fdev --port "$PORT" publish --code "$WASM" --parameters "$PARAMS" contract --state "$STATE"
+'''
+
+[tasks.publish-facade]
+description = "Publish (PUT) the facade to the live network — ONE-TIME prod publish only"
+dependencies = ["build-facade", "sign-facade-state"]
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+WASM="$ROOT/published-contract/facade.wasm"
+PARAMS="$ROOT/published-contract/facade.parameters"
+STATE="$ROOT/target/facade/facade.state"
+[ -f "$WASM" ] && [ -f "$PARAMS" ] || { echo "error: facade wasm/parameters missing — run \`cargo make update-published-facade\` first" >&2; exit 1; }
+[ -f "$STATE" ] || { echo "error: $STATE missing — sign-facade-state should have produced it" >&2; exit 1; }
+# ONE-SHOT. The facade contract id MUST stay byte-stable forever (it's the
+# bookmarkable URL). Per-release pointer flips use `fdev execute update
+# --as-state` inside scripts/release.sh, NOT this task.
+echo "publishing facade $(cat "$ROOT/published-contract/facade-id.txt") to the live network"
+fdev publish --code "$WASM" --parameters "$PARAMS" contract --state "$STATE"
+'''
+
+[tasks.update-facade-state-test]
+description = "UPDATE the facade state on the local sandbox (per-release pointer flip, test key)"
+dependencies = ["sign-facade-state-test"]
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+PORT="${FREENET_PORT:-7509}"
+FACADE_ID=$(cat "$ROOT/published-contract/facade-id.txt")
+STATE="$ROOT/target/facade/facade.state"
+echo "UPDATEing facade state at $FACADE_ID (port $PORT)"
+# --as-state: the facade update_state only matches UpdateData::State. Without it
+# fdev sends UpdateData::Delta and the contract rejects InvalidUpdate.
+fdev --port "$PORT" execute update --as-state "$FACADE_ID" "$STATE"
+'''

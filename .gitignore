@@ -8,6 +8,9 @@ node_modules/
 **/build/freenet/
 /build/
 /target/webapp/
+# Facade loader is rendered per-publish from src/index.html.tmpl with the
+# current_app_id baked in (issue #45) — the rendered dist/ is an artifact.
+contracts/facade-loader/dist/
 web/dist/
 web/delegate_key.txt
 web/delegate_key_bytes.json

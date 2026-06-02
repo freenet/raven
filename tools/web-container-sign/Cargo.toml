@@ -11,6 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 freenet-microblogging-common = { workspace = true }
+# Path dep on the out-of-workspace facade-types crate. Pulling it into this
+# host-only signer's lockfile does NOT affect the facade contract wasm bytes —
+# the contract builds in its own workspace with its own Cargo.lock (issue #45).
+freenet-microblogging-facade-types = { path = "../../contracts/facade-types" }
 ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "serde", "rand_core", "pem", "std"] }
 ciborium = "0.2.2"
 rand = { version = "0.8.5", features = ["std", "std_rng"] }
@@ -22,3 +26,7 @@ anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Integration test: feed signer output into the on-chain validator to catch
+# framing/endianness drift between signer and contract (issue #45).
+freenet-microblogging-facade = { path = "../../contracts/facade" }
+freenet-stdlib = { workspace = true }
