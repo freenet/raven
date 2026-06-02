@@ -1,0 +1,24 @@
+[package]
+name = "freenet-microblogging-facade-types"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+publish = false
+description = "Shared FacadePointer / FacadeMetadata / signed_payload for the freenet-microblogging facade contract (issue #45)"
+
+# Standalone crate — NOT a workspace member (see root Cargo.toml `exclude`).
+# The facade contract depends on this crate via path; the signer consumes it
+# the same way. Keeping it outside the workspace + tightly pinned stops a
+# workspace dep bump from re-resolving facade transitive deps and rotating the
+# facade wasm bytes (the stable contract id is the entire point — issue #45).
+#
+# Pin (`=x.y.z`) every dep that influences the facade wasm bytes — the stable
+# contract id depends on byte-determinism. ed25519-dalek (signature wire format)
+# is the obvious risk; serde is pinned too so a transparent minor bump can never
+# silently re-resolve and rotate the bytes, even though its serialization format
+# is stable in practice. Bumping a pin is a deliberate act paired with a snapshot
+# regeneration (which rotates the id and breaks bookmarks).
+
+[dependencies]
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc", "serde"] }
+serde = { version = "=1.0.228", features = ["derive"] }

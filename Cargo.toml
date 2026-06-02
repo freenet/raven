@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["common", "contracts/*", "delegates/*", "web/container", "tools/web-container-sign"]
+# The facade crates (issue #45) are INTENTIONALLY outside the workspace so
+# workspace lockfile churn cannot rotate the facade contract's wasm bytes — its
+# whole purpose is a stable contract id across releases. They carry their own
+# Cargo.lock and pin every wasm-affecting dep with `=x.y.z`. The `contracts/*`
+# glob above would otherwise pull them in, so exclude them explicitly.
+exclude = ["contracts/facade", "contracts/facade-types", "contracts/facade-loader"]
 
 [profile.dev.package."*"]
 opt-level = 3
