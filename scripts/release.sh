@@ -92,6 +92,18 @@ for cmd in fdev cargo-make gh; do
     command -v "$cmd" >/dev/null 2>&1 || die "$cmd not on PATH"
 done
 
+# fdev must support --as-state for the facade pointer flip. Older builds
+# silently wrap the state file as UpdateData::Delta; the facade contract's
+# update_state only matches UpdateData::State and returns InvalidUpdate, so
+# the pointer never moves and the stable URL serves a stale app. Only enforced
+# when the facade has been published (facade-id.txt committed).
+if [ -f published-contract/facade-id.txt ]; then
+    if ! fdev execute update --help 2>&1 | grep -q -- '--as-state'; then
+        die "fdev does not support \`--as-state\` (required for facade UPDATE).
+Build a newer fdev: cargo install --path /path/to/freenet-core/crates/fdev"
+    fi
+fi
+
 if ! command -v gtar >/dev/null 2>&1 && ! tar --version 2>/dev/null | grep -qi 'gnu tar'; then
     die "GNU tar required (macOS: brew install gnu-tar)"
 fi
@@ -156,6 +168,50 @@ NEW_ID=$(cat published-contract/contract-id.txt)
 echo
 echo "── new contract id: $NEW_ID ────────────────────────────────"
 
+# ─── 4b. Facade pointer flip (issue #45 Phase 3) ──────────────────────────────
+#
+# The web-container contract id rotates every release, orphaning bookmarks.
+# Users hit the FACADE contract instead — a stable, bookmarkable id whose
+# signed state points at the current release's webapp. Each release we
+# re-render the loader with the new current_app_id baked in, sign a fresh
+# facade state (bumped version, production key — same key the web-container
+# uses), and UPDATE the facade contract via `fdev --as-state`.
+#
+# Conditional: only runs once published-contract/facade-id.txt exists (the
+# facade has been published once and its id committed — see RELEASING.md
+# §"One-time facade publish"). Until then it warns + skips so the rest of
+# the release still proceeds.
+if [ -f published-contract/facade-id.txt ]; then
+    FACADE_ID=$(tr -d '[:space:]' < published-contract/facade-id.txt)
+    echo
+    echo "── flipping facade pointer (issue #45) ───────────────────────────────────"
+    echo "  facade contract id: $FACADE_ID"
+    echo "  pointing at:        $NEW_ID"
+
+    FACADE_CURRENT_APP_ID="$NEW_ID" cargo make build-facade-loader
+    cargo make sign-facade-state
+
+    FACADE_STATE="$ROOT/target/facade/facade.state"
+    [ -f "$FACADE_STATE" ] || die "facade state not produced at $FACADE_STATE — sign step failed?"
+
+    if confirm "Push facade UPDATE to the network now?"; then
+        # --as-state: facade update_state only matches UpdateData::State; without
+        # it fdev sends UpdateData::Delta and the contract rejects InvalidUpdate.
+        fdev execute update --as-state "$FACADE_ID" "$FACADE_STATE"
+        echo "  ✓ facade UPDATEd — bookmarked URL stays stable across releases"
+    else
+        echo "  ⚠️  skipped facade flip — webapp $NEW_ID is published but the facade still"
+        echo "      points at the previous release. Resume manually with:"
+        echo "        FACADE_CURRENT_APP_ID=$NEW_ID cargo make sign-facade-state"
+        echo "        fdev execute update --as-state $FACADE_ID $FACADE_STATE"
+    fi
+else
+    echo
+    echo "  ⚠️  published-contract/facade-id.txt not committed — skipping facade flip."
+    echo "      Publish the facade once (RELEASING.md §\"One-time facade publish\")"
+    echo "      and commit its id to enable the stable bookmarkable URL."
+fi
+
 # ─── 5. Snapshot diff (unchanged-bytes is OK) ──────────────────────────────────
 SNAPSHOT_CHANGED=1
 if git diff --quiet -- published-contract/; then
@@ -218,6 +274,14 @@ echo
 echo "── released $TAG ──────────────────────────────────────────────────────────"
 echo "  contract id:     $NEW_ID"
 echo "  signed version:  $WEBAPP_VERSION"
+if [ -f published-contract/facade-id.txt ]; then
+    echo "  facade id:       $(tr -d '[:space:]' < published-contract/facade-id.txt) (stable bookmarkable URL)"
+fi
 echo
 echo "Next: wait ~30s for propagation, then"
 echo "  scripts/smoke-test-production.sh"
+if [ -f published-contract/facade-id.txt ]; then
+    echo
+    echo "Smoke-test the STABLE facade URL (what users bookmark — survives releases):"
+    echo "  http://127.0.0.1:${FREENET_PORT}/v1/contract/web/$(tr -d '[:space:]' < published-contract/facade-id.txt)/"
+fi
