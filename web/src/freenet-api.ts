@@ -36,6 +36,11 @@ interface ContractPost {
   author_handle: string;
   content: string;
   timestamp: number;
+  // Content address of the post this replies to, empty/absent for top-level
+  // posts. Matches the Rust `Post.reply_to` field. The global index MAY hold
+  // replies (its acceptance is self-verification only — see the contract doc),
+  // so a strictly-top-level public timeline filters on this at render time.
+  reply_to?: string;
   // Content address of the quoted post (quote repost), empty/absent otherwise.
   // Matches the Rust `Post.quoted_post` additive field.
   quoted_post?: string;
@@ -65,6 +70,15 @@ interface UserShardState {
   posts?: ContractPost[];
   profile?: unknown;
   follows?: Record<string, unknown>;
+}
+
+// Global-index (public-timeline) state (matches Rust `GlobalIndexShard`). Unlike
+// the user shard, `posts` is a MAP keyed by content-address id (Rust
+// `BTreeMap<String, Post>`), NOT a Vec — so the read side iterates
+// `Object.values(posts)`. `#[serde(default)]` on the contract makes `{}` and
+// `{"posts":{}}` both decode to an empty timeline.
+interface GlobalIndexState {
+  posts?: Record<string, ContractPost>;
 }
 
 // A like record (matches Rust `common::thread::LikeRecord`). signer_pubkey is
@@ -198,6 +212,10 @@ export interface FreenetCallbacks {
   onRepostUpdated?: (repost: RepostState) => void;
   /** Optional: live quote-repost count for a post, from its thread shard. */
   onQuoteUpdated?: (quote: QuoteState) => void;
+  /** Optional: full public-timeline snapshot from the global-index GET. */
+  onGlobalPostsLoaded?: (posts: Post[]) => void;
+  /** Optional: a single live public-timeline post from a global-index delta. */
+  onNewGlobalPost?: (post: Post) => void;
 }
 
 export class FreenetConnection {
@@ -259,6 +277,12 @@ export class FreenetConnection {
    * the first opt-in share; null when no code hash is injected (offline / dev).
    */
   private globalIndexKey: ContractKey | null = null;
+  /**
+   * Base58 instance id of {@link globalIndexKey}, for response key matching on
+   * the read side. Mirrors {@link userShardInstanceId}; set when the singleton
+   * key is first derived in {@link globalIndexKeyOrNull}.
+   */
+  private globalIndexInstanceId: string | null = null;
   /** Set once the global index is confirmed instantiated (GET-probe or PUT). */
   private globalIndexEnsured = false;
   /** Collapses concurrent first-share races into one GET-probe + PUT. */
@@ -406,6 +430,24 @@ export class FreenetConnection {
         this.emitQuoteState(threadRoot, thread.quotes ?? {});
         return;
       }
+      // Global-index GET (public-timeline snapshot): the singleton's state is a
+      // MAP keyed by id (Rust BTreeMap), so iterate `Object.values`, not a Vec.
+      // The index MAY hold replies/quotes (acceptance is self-verification only),
+      // so filter to top-level posts (empty/absent reply_to) before rendering.
+      if (this.globalIndexInstanceId !== null && respId === this.globalIndexInstanceId) {
+        const stateJson = new TextDecoder("utf8").decode(
+          Uint8Array.from(response.state),
+        );
+        const rawPosts = (JSON.parse(stateJson) as GlobalIndexState).posts ?? {};
+        const posts = Object.values(rawPosts)
+          .filter((cp) => !cp.reply_to)
+          .map(contractPostToUiPost);
+        // Sort by timestamp descending (newest first) — same comparator as the
+        // user-shard path.
+        posts.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+        this.callbacks.onGlobalPostsLoaded?.(posts);
+        return;
+      }
       // The only other GET source is the owner's user shard. Drop anything else.
       if (this.userShardInstanceId === null || respId !== this.userShardInstanceId) {
         return;
@@ -431,6 +473,25 @@ export class FreenetConnection {
       const threadRoot = notifId ? this.threadInstanceToRoot.get(notifId) : undefined;
       if (threadRoot) {
         this.refreshLikes(threadRoot);
+        return;
+      }
+      // Global-index update (a post was shared to the public timeline): the
+      // delta is the externally-tagged `GlobalIndexDelta::Posts` (`{"Posts":[…]}`)
+      // — the SAME wire shape as the user-shard Posts delta — so parse it the
+      // same way and emit each (top-level) post live.
+      if (this.globalIndexInstanceId !== null && notifId === this.globalIndexInstanceId) {
+        const updateData = notification.update as UpdateData;
+        if (!updateData || updateData.updateDataType !== UpdateDataType.DeltaUpdate) return;
+        const delta = updateData.updateData as { delta: number[] } | null;
+        if (!delta) return;
+        const deltaJson = new TextDecoder("utf8").decode(Uint8Array.from(delta.delta));
+        const parsed = JSON.parse(deltaJson.replace(/\x00/g, "")) as {
+          Posts?: ContractPost[];
+        };
+        for (const cp of parsed.Posts ?? []) {
+          if (cp.reply_to) continue; // top-level public timeline only
+          this.callbacks.onNewGlobalPost?.(contractPostToUiPost(cp));
+        }
         return;
       }
       // The only other update source is the owner's user shard.
@@ -692,7 +753,47 @@ export class FreenetConnection {
     // Empty parameters → the singleton instance.
     const key = deriveShardContractKey(codeHash, new Uint8Array(0));
     this.globalIndexKey = key;
+    // Record the instance id so handleGetResponse / handleUpdateNotification can
+    // route the singleton's read + live-update responses (mirrors the user shard).
+    this.globalIndexInstanceId = key.encode();
     return key;
+  }
+
+  /**
+   * Read the public-timeline snapshot from the global index. Mirrors
+   * {@link loadState} but targets the singleton index key. Unlike a write
+   * (share), a reader MUST NOT instantiate the singleton — so there is no
+   * GET-probe/PUT here: an absent index simply rejects the GET and the timeline
+   * stays empty. No-ops when the key cannot be derived (offline / dev build).
+   */
+  loadGlobalIndex(): void {
+    const key = this.globalIndexKeyOrNull();
+    if (!this.api || !key) return;
+    // Signal that the read path actually issued a GET against the singleton.
+    // This fires whether or not the index is instantiated yet (a fresh network
+    // has no index, so the GET rejects and onGlobalPostsLoaded never fires) —
+    // so it is the reliable "read path ran on a live node" marker, distinct from
+    // the "[freenet] Loaded N …" success log emitted only on a populated index.
+    console.log("[global-index] loading public timeline");
+    this.serializedGet(new GetRequest(key, true)).catch((e) =>
+      console.error("[global-index] get failed:", e),
+    );
+    // Mirror the user-shard flow (loadUserShard + subscribeUserShard): a reader
+    // also subscribes so subsequently-shared posts arrive live as deltas.
+    this.subscribeGlobalIndex();
+  }
+
+  /**
+   * Subscribe to the global index so shared posts arrive live as
+   * {@link handleUpdateNotification} deltas. Mirrors {@link subscribeUserShard};
+   * no-ops when the key cannot be derived (offline / dev build).
+   */
+  private subscribeGlobalIndex(): void {
+    const key = this.globalIndexKeyOrNull();
+    if (!this.api || !key) return;
+    this.api
+      .subscribe(new SubscribeRequest(key, []))
+      .catch((e) => console.error("[global-index] subscribe failed:", e));
   }
 
   /** Fetch the bundled raw global-index-shard WASM bytes (served at dist root). */

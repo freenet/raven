@@ -5,6 +5,7 @@ import { createApp } from "./app";
 import { FreenetConnection, type LikeState, type RepostState, type QuoteState } from "./freenet-api";
 import { Post } from "./types";
 import { createOnboarding } from "./components/onboarding";
+import { createPostCard } from "./components/post-card";
 import {
   getIdentity,
   createIdentity,
@@ -44,9 +45,25 @@ const appRoot = document.getElementById("app")!;
 // ---------------------------------------------------------------------------
 let localPosts: Post[] = [];
 const knownPostIds = new Set<string>();
+// Public-timeline (global-index) buffer. Independent of identity: it feeds the
+// logged-out landing feed AND the logged-in Home → Discover tab. Mirrors the
+// localPosts / knownPostIds pair above.
+let globalPosts: Post[] = [];
+const globalPostIds = new Set<string>();
 let appElement: HTMLElement | null = null;
+// The read-only public timeline mounted UNDER the onboarding overlay so a fresh
+// (logged-out) visitor lands on live network posts instead of a blank page.
+// Created lazily by showOnboarding(); torn down by renderApp() once identity is
+// known and the full app takes over.
+let landingElement: (HTMLElement & { updateGlobalPosts: (posts: Post[]) => void }) | null = null;
 let appRendered = false;
 let delegateTimeoutId: ReturnType<typeof setTimeout> | null = null;
+// onStatusChange("connected") fires on every WebSocket (re)open. The global
+// index read/subscribe must start exactly once — a reconnect re-issuing the GET
+// would re-run the snapshot merge (harmless now that it merges) and, worse,
+// re-subscribe to the singleton key. Mirror the user-shard's one-shot init
+// guard (userShardInitOwner) with a simple latch.
+let globalIndexStarted = false;
 
 // ---------------------------------------------------------------------------
 // Feed helpers
@@ -63,6 +80,49 @@ function refreshFeed(): void {
   (appElement as AppEl | null)?.updatePosts?.(localPosts);
 }
 
+// app.ts exposes updateGlobalPosts on the app element (the UI agent adds it) to
+// feed the Home → Discover tab. We forward defensively via optional-chaining so
+// this works regardless of whether that surface has landed yet. The same buffer
+// also drives the pre-auth landing feed when it is mounted.
+type GlobalAppEl = HTMLElement & { updateGlobalPosts?: (posts: Post[]) => void };
+
+function refreshGlobalFeed(): void {
+  (appElement as GlobalAppEl | null)?.updateGlobalPosts?.(globalPosts);
+  landingElement?.updateGlobalPosts(globalPosts);
+}
+
+// ---------------------------------------------------------------------------
+// Pre-auth landing feed (read-only public timeline)
+// ---------------------------------------------------------------------------
+// A minimal, read-only list of global-index posts shown behind the onboarding
+// overlay. Intentionally NOT the full createApp(): logged-out visitors have no
+// delegate/identity, so there is no compose/like/repost/quote — those actions
+// require signing. Mounting this into appRoot keeps the page from being blank
+// while the onboarding overlay (a separate document.body element) sits on top.
+function createLandingFeed(): HTMLElement & {
+  updateGlobalPosts: (posts: Post[]) => void;
+} {
+  const wrap = document.createElement("main");
+  wrap.className = "feed-column screen landing-feed";
+
+  const list = document.createElement("div");
+  // Reuse the in-app feed's styled list class so the landing list inherits the
+  // same spacing/borders (.feed-list has no SCSS rules; .feed__posts does).
+  list.className = "feed__posts";
+  wrap.appendChild(list);
+
+  const el = wrap as HTMLElement & {
+    updateGlobalPosts: (posts: Post[]) => void;
+  };
+  el.updateGlobalPosts = (posts: Post[]) => {
+    list.replaceChildren();
+    // Read-only: pass no callbacks so cards have no actionable affordances for
+    // a logged-out visitor.
+    for (const post of posts) list.appendChild(createPostCard(post));
+  };
+  return el;
+}
+
 // ---------------------------------------------------------------------------
 // Render the app (called once identity is known)
 // ---------------------------------------------------------------------------
@@ -74,6 +134,10 @@ function renderApp(identity: Identity): void {
   // Remove onboarding/splash if present
   document.querySelector(".onboarding-overlay")?.remove();
   document.querySelector(".splash-screen")?.remove();
+  // The full app replaces the read-only landing feed; drop it so we don't stack
+  // two feeds in appRoot.
+  landingElement?.remove();
+  landingElement = null;
 
   connection.setUser(identity.publicKey, identity.displayName, identity.handle);
 
@@ -121,6 +185,10 @@ function renderApp(identity: Identity): void {
 
   // Load posts now that app is rendered
   connection.loadState();
+  // Hand any already-buffered public-timeline posts to the app's Discover tab
+  // (they may have arrived while the landing feed was showing). Live updates
+  // continue to flow via refreshGlobalFeed().
+  refreshGlobalFeed();
 }
 
 // ---------------------------------------------------------------------------
@@ -161,10 +229,57 @@ const connection = new FreenetConnection({
     localPosts = [post, ...localPosts];
     refreshFeed();
   },
+  onGlobalPostsLoaded: (posts: Post[]) => {
+    console.log(`[freenet] Loaded ${posts.length} public-timeline posts`);
+    // MERGE, do not replace. The global index is multi-writer, and the
+    // subscribe fires right after the GET is queued — so a live delta
+    // (onNewGlobalPost) can land in globalPosts BEFORE this snapshot arrives.
+    // If the node served a state that predates that share, a blind
+    // `globalPosts = posts` would silently drop the just-seen post forever
+    // (its id also purged from the dedup set, so no later delta re-adds it).
+    // Keep any buffered post whose id is not in the snapshot, union, re-sort
+    // newest-first, and rebuild the dedup set from the union. (The user-shard
+    // loadState path overwrites safely only because the owner is the sole
+    // writer; the public firehose has no such guarantee.)
+    const snapshotIds = new Set(posts.map((p) => p.id));
+    const survivors = globalPosts.filter((p) => !snapshotIds.has(p.id));
+    globalPosts = [...posts, ...survivors].sort(
+      (a, b) => b.timestamp.getTime() - a.timestamp.getTime(),
+    );
+    globalPostIds.clear();
+    for (const post of globalPosts) globalPostIds.add(post.id);
+    refreshGlobalFeed();
+  },
+  onNewGlobalPost: (post: Post) => {
+    if (globalPostIds.has(post.id)) return;
+    globalPostIds.add(post.id);
+    // Insert then re-sort newest-first to preserve the buffer invariant the GET
+    // snapshot establishes. A live delta is normally the newest post (prepend
+    // alone would suffice), but the global index is multi-writer and deltas can
+    // arrive out of timestamp order — sorting keeps Discover/landing ordering
+    // correct regardless. (The single-writer user-shard onNewPost can prepend
+    // safely; the public firehose cannot assume monotonic arrival.)
+    globalPosts = [post, ...globalPosts].sort(
+      (a, b) => b.timestamp.getTime() - a.timestamp.getTime(),
+    );
+    refreshGlobalFeed();
+  },
   onStatusChange: (status) => {
     console.log(`[freenet] Status: ${status}`);
 
     if (status === "connected") {
+      // Start the public-timeline read path independent of identity, so even a
+      // logged-out visitor sees live network posts on the landing feed.
+      // loadGlobalIndex() also subscribes internally (load → subscribe, mirror
+      // of initUserShard). It is fire-and-forget (it swallows its own errors)
+      // and runs before the delegate wiring so it never blocks or races the
+      // identity flow. Guarded to once per page so a reconnect does not
+      // re-subscribe to the singleton key.
+      if (!globalIndexStarted) {
+        globalIndexStarted = true;
+        connection.loadGlobalIndex();
+      }
+
       // Wire delegate and request identity
       wireDelegateAndRequestIdentity();
     }
@@ -429,6 +544,16 @@ function showOnboarding(): void {
   if (appRendered) return;
   // Remove splash
   document.querySelector(".splash-screen")?.remove();
+
+  // Mount the read-only public timeline UNDER the overlay so the page isn't
+  // blank while logged out. The overlay (appended to document.body below) is a
+  // full-screen element that layers on top of appRoot. Seed it with whatever
+  // global posts have already arrived; refreshGlobalFeed() keeps it live.
+  if (!landingElement) {
+    landingElement = createLandingFeed();
+    appRoot.appendChild(landingElement);
+    landingElement.updateGlobalPosts(globalPosts);
+  }
 
   const onboarding = createOnboarding((displayName: string, secretKey?: string) => {
     const identity = createIdentity(displayName, secretKey);
