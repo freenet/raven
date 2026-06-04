@@ -134,7 +134,25 @@
   border-top: 1px solid var(--line-2);
 }
 
-.compose-modal__tools { display: flex; gap: 4px; }
+.compose-modal__tools { display: flex; gap: 4px; align-items: center; }
+
+.compose-modal__share {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  font-size: 12px;
+  color: var(--ink-3);
+  cursor: pointer;
+  user-select: none;
+
+  &:hover { color: var(--ink-2); }
+}
+
+.compose-modal__share-check {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
 
 .compose-modal__tool {
   width: 30px;

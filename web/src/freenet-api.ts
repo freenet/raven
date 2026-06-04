@@ -50,6 +50,13 @@ interface PendingPostDraft {
   timestamp: number;
   /** Set for a quote repost: the content address of the quoted post. */
   quoted_post: string;
+  /**
+   * Whether the author opted to also share this post to the public-timeline
+   * global index (opt-in). Carried on the draft so {@link completePublish} —
+   * which matches by nonce — knows whether to mirror the signed post into the
+   * global index after the primary user-shard publish.
+   */
+  shareToGlobal: boolean;
 }
 
 // User-shard state (matches Rust `UserShard`). Only `posts` is consumed by the
@@ -245,6 +252,17 @@ export class FreenetConnection {
   private threadKeys = new Map<string, ContractKey>();
   /** Reverse map: thread instance id (base58) → root post id, for GET routing. */
   private threadInstanceToRoot = new Map<string, string>();
+  /**
+   * The public-timeline global index key. Unlike user/thread shards this is a
+   * fixed-key SINGLETON (parameters = empty bytes), so there is exactly one
+   * instance: key = blake3(global_index_code_hash || <empty>). Lazily derived on
+   * the first opt-in share; null when no code hash is injected (offline / dev).
+   */
+  private globalIndexKey: ContractKey | null = null;
+  /** Set once the global index is confirmed instantiated (GET-probe or PUT). */
+  private globalIndexEnsured = false;
+  /** Collapses concurrent first-share races into one GET-probe + PUT. */
+  private globalIndexEnsurePromise: Promise<void> | null = null;
   /** Likes awaiting a delegate `SignedLike`, keyed by nonce. */
   private pendingLikes: PendingLike[] = [];
   /** Per-thread debounce timers coalescing like-refresh GETs (root id → timer). */
@@ -658,6 +676,112 @@ export class FreenetConnection {
   }
 
   /**
+   * The public-timeline global index key, or null when it cannot be derived
+   * (no code hash injected — offline / dev build). The global index is a
+   * SINGLETON: empty parameters, so its key is blake3(code_hash || <empty>).
+   * Mirrors {@link threadKeyFor}'s DEV_MODE_NO_CONTRACT_HASH short-circuit so an
+   * un-built / offline env disables index writes gracefully.
+   */
+  private globalIndexKeyOrNull(): ContractKey | null {
+    if (this.globalIndexKey) return this.globalIndexKey;
+    const codeHash =
+      typeof __GLOBAL_INDEX_SHARD_CODE_HASH__ !== "undefined"
+        ? __GLOBAL_INDEX_SHARD_CODE_HASH__
+        : null;
+    if (!codeHash || codeHash === "DEV_MODE_NO_CONTRACT_HASH") return null;
+    // Empty parameters → the singleton instance.
+    const key = deriveShardContractKey(codeHash, new Uint8Array(0));
+    this.globalIndexKey = key;
+    return key;
+  }
+
+  /** Fetch the bundled raw global-index-shard WASM bytes (served at dist root). */
+  private async fetchGlobalIndexWasm(): Promise<Uint8Array> {
+    const resp = await fetch("./global_index_shard.wasm");
+    if (!resp.ok) {
+      throw new Error(`failed to fetch global_index_shard.wasm: ${resp.status}`);
+    }
+    return new Uint8Array(await resp.arrayBuffer());
+  }
+
+  /**
+   * Ensure the singleton global index is instantiated on the node: GET-probe,
+   * and PUT the container with empty parameters if absent. Awaits the PUT before
+   * returning, so a following UpdateRequest is not dropped against a
+   * never-instantiated contract (the thread-shard M-3 hazard). `globalIndexEnsured`
+   * + `globalIndexEnsurePromise` collapse concurrent first-share races into one
+   * probe + PUT.
+   *
+   * CAVEAT (verify in the WASM-in-node tier, issue #34): the GET-then-PUT-if-
+   * absent probe assumes a GET against a never-instantiated singleton *rejects*
+   * (→ we PUT). If instead it resolves with empty/default state, we'd mark
+   * ensured and skip the PUT, and the first UPDATE could land against an
+   * uninstantiated contract. A spurious re-PUT is a harmless no-op (CRDT merge),
+   * so the safe-but-unconfirmed behavior is the rejecting one. This is the same
+   * unverified seam the parameterized shards carry; it cannot be exercised
+   * without a live node (library tests don't model node GET semantics).
+   */
+  private async ensureGlobalIndex(key: ContractKey): Promise<void> {
+    const api = this.api;
+    if (!api) throw new Error("no api");
+    if (this.globalIndexEnsured) return;
+    if (this.globalIndexEnsurePromise) return this.globalIndexEnsurePromise;
+    this.globalIndexEnsurePromise = (async () => {
+      try {
+        await this.serializedGet(new GetRequest(key, false));
+        this.globalIndexEnsured = true;
+        return; // already instantiated
+      } catch {
+        // not found / timeout → PUT below (a spurious re-PUT merges to a no-op)
+      }
+      const wasm = await this.fetchGlobalIndexWasm();
+      const codeHashBytes = key.codePart();
+      const code = new ContractCodeT(
+        Array.from(wasm),
+        codeHashBytes ? Array.from(codeHashBytes) : [],
+      );
+      // Singleton: empty parameters (matches the contract's blake3(code || <>)).
+      const contract = new WasmContractV1(code, [], key);
+      const container = new ContractContainer(
+        WasmContractType.WasmContractV1,
+        contract,
+      );
+      // State shape mirrors the contract's BTreeMap<String,Post> — an OBJECT
+      // ({"posts":{}}), like the thread shard's {replies:{},…}, NOT the
+      // user-shard's {posts:[]} Vec.
+      const initialState = new TextEncoder().encode(JSON.stringify({ posts: {} }));
+      await api.put(
+        new PutRequest(container, Array.from(initialState), undefined, false, false),
+      );
+      this.globalIndexEnsured = true;
+    })();
+    try {
+      await this.globalIndexEnsurePromise;
+    } finally {
+      this.globalIndexEnsurePromise = null;
+    }
+  }
+
+  /**
+   * Mirror an already-signed post into the public-timeline global index
+   * (opt-in). Reuses the SAME signed {@link ContractPost} the user-shard publish
+   * built — it self-verifies, so the index re-verifies and accepts it. No-ops
+   * gracefully when the index key cannot be derived (offline / dev). The index
+   * delta is the externally-tagged `GlobalIndexDelta::Posts` form.
+   */
+  async shareToGlobalIndex(post: ContractPost): Promise<void> {
+    const key = this.globalIndexKeyOrNull();
+    if (!this.api || !key) return; // offline / no code hash → graceful no-op
+    await this.ensureGlobalIndex(key);
+    const deltaBytes = new TextEncoder().encode(JSON.stringify({ Posts: [post] }));
+    const update = new UpdateData(
+      UpdateDataType.DeltaUpdate,
+      new DeltaUpdate(Array.from(deltaBytes)),
+    );
+    await this.api.update(new UpdateRequest(key, update));
+  }
+
+  /**
    * Like or unlike a post. Derives/instantiates the post's thread shard, then
    * asks the delegate to sign a `LikeRecord`; the matching `SignedLike` is
    * routed to {@link completeLike}, which folds it into the thread shard via
@@ -930,8 +1054,8 @@ export class FreenetConnection {
    * (Mirrors mail's pending-send pattern; delegate responses are not correlated
    * per-request, so we hold the draft until the signature returns.)
    */
-  async publishPost(content: string): Promise<boolean> {
-    return this.publishPostInternal(content, "");
+  async publishPost(content: string, shareToGlobal = false): Promise<boolean> {
+    return this.publishPostInternal(content, "", shareToGlobal);
   }
 
   /**
@@ -943,13 +1067,17 @@ export class FreenetConnection {
    */
   async quotePost(quotedPostId: string, content: string): Promise<boolean> {
     if (!quotedPostId) return false;
-    return this.publishPostInternal(content, quotedPostId);
+    // A quote-repost is engagement on an existing post (it folds a QuoteRef into
+    // the quoted post's thread shard), not a fresh public-timeline post, so it
+    // never opts into the global index.
+    return this.publishPostInternal(content, quotedPostId, false);
   }
 
   /** Shared publish path; `quotedPost` empty for an ordinary post. */
   private async publishPostInternal(
     content: string,
     quotedPost: string,
+    shareToGlobal: boolean,
   ): Promise<boolean> {
     // Posts go to the owner's user shard, instantiated once the identity is
     // known. No shard → cannot publish.
@@ -969,6 +1097,7 @@ export class FreenetConnection {
       content,
       timestamp,
       quoted_post: quotedPost,
+      shareToGlobal,
     };
     this.pendingPosts.push(draft);
 
@@ -1041,6 +1170,15 @@ export class FreenetConnection {
       if (draft.quoted_post) {
         this.recordQuoteRef(draft.quoted_post, post.id).catch((e) =>
           console.error("[thread] recordQuoteRef failed:", e),
+        );
+      }
+      // If the author opted in, also mirror the signed post into the public
+      // global index. Best-effort and fire-and-forget: the primary user-shard
+      // publish above is already done, so a failure (or offline / no code hash)
+      // here must NEVER fail the publish or change the return value.
+      if (draft.shareToGlobal) {
+        this.shareToGlobalIndex(post).catch((e) =>
+          console.error("[global-index] share failed (post still published):", e),
         );
       }
       return true;

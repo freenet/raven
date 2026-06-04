@@ -78,8 +78,8 @@ function renderApp(identity: Identity): void {
   connection.setUser(identity.publicKey, identity.displayName, identity.handle);
 
   appElement = createApp({
-    publish: (content: string) => {
-      connection.publishPost(content).then((ok) => {
+    publish: (content: string, shareToGlobal: boolean) => {
+      connection.publishPost(content, shareToGlobal).then((ok) => {
         if (ok) {
           console.log("[freenet] Post published");
           setTimeout(() => connection.loadState(), 300);

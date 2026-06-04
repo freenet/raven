@@ -34,9 +34,14 @@ export interface ComposeOptions {
   buttonLabel?: string;
 }
 
-/** Open a compose modal. `onSubmit(content)` fires with trimmed text on Post click. */
+/**
+ * Open a compose modal. `onSubmit(content, shareToGlobal)` fires with trimmed
+ * text on Post click; `shareToGlobal` is true when the author ticked "share to
+ * public timeline" (plain compose only — never offered for a quote). For a quote
+ * the modal does not render the toggle and always passes `false`.
+ */
 export function openComposeModal(
-  onSubmit: (content: string) => void,
+  onSubmit: (content: string, shareToGlobal: boolean) => void,
   opts: ComposeOptions = {},
 ): void {
   document.querySelector(".compose-modal-overlay")?.remove();
@@ -124,6 +129,23 @@ export function openComposeModal(
   imgTool.innerHTML = ICON_IMAGE;
   tools.appendChild(imgTool);
 
+  // "Share to public timeline" opt-in — plain compose only. A quote-repost is
+  // engagement on an existing post (folded into the quoted post's thread shard),
+  // not a fresh public-timeline post, so the toggle is not offered for quotes.
+  let shareToggle: HTMLInputElement | null = null;
+  if (!opts.quoted) {
+    const shareLabel = document.createElement("label");
+    shareLabel.className = "compose-modal__share";
+    shareToggle = document.createElement("input");
+    shareToggle.type = "checkbox";
+    shareToggle.className = "compose-modal__share-check";
+    const shareText = document.createElement("span");
+    shareText.textContent = "Share to public timeline";
+    shareLabel.appendChild(shareToggle);
+    shareLabel.appendChild(shareText);
+    tools.appendChild(shareLabel);
+  }
+
   const meta = document.createElement("div");
   meta.className = "compose-modal__meta";
 
@@ -166,7 +188,7 @@ export function openComposeModal(
     const content = textarea.value.trim();
     if (content.length > MAX_CHARS) return;
     if (content.length === 0 && !opts.quoted) return;
-    onSubmit(content);
+    onSubmit(content, shareToggle?.checked ?? false);
     close();
   }
 
