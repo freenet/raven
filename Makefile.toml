@@ -15,7 +15,9 @@ ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
 cargo clean
 rm -rf "$ROOT/web/dist" "$ROOT/web/build" "$ROOT/build" "$ROOT/target/webapp"
 rm -f "$ROOT/web/user_shard_code_hash.txt" "$ROOT/web/thread_shard_code_hash.txt" \
+      "$ROOT/web/global_index_shard_code_hash.txt" \
       "$ROOT/web/public/user_shard.wasm" "$ROOT/web/public/thread_shard.wasm" \
+      "$ROOT/web/public/global_index_shard.wasm" \
       "$ROOT/web/delegate_key.txt" \
       "$ROOT/web/delegate_key_bytes.json" "$ROOT/web/delegate_code_hash_bytes.json"
 '''
@@ -52,6 +54,24 @@ CARGO_TARGET_DIR="$ROOT/target" fdev build
 # id, each thread derives a distinct key at runtime. __THREAD_SHARD_CODE_HASH__
 # is injected from web/thread_shard_code_hash.txt by vite.
 bash "$ROOT/scripts/mirror-shard-wasm.sh" "$ROOT" freenet_microblogging_thread_shard thread_shard
+'''
+
+[tasks.build-global-index-shard]
+description = "Build global-index-shard contract WASM + code_hash"
+script_runner = "bash"
+script = '''
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY}"
+cd "$ROOT/contracts/global-index-shard"
+CARGO_TARGET_DIR="$ROOT/target" fdev build
+# Mirror the RAW wasm + code hash into web/ and verify b3sum == code hash.
+# The global index is a fixed-key SINGLETON (parameters = empty bytes): one
+# instance for the whole network, key blake3(code_hash || <empty>), derived in
+# the web app at runtime. We still ship the RAW wasm like user/thread (NOT the
+# inbox build-only pattern) because the web app PUTs the singleton container on
+# demand to instantiate it. __GLOBAL_INDEX_SHARD_CODE_HASH__ is injected from
+# web/global_index_shard_code_hash.txt by vite.
+bash "$ROOT/scripts/mirror-shard-wasm.sh" "$ROOT" freenet_microblogging_global_index_shard global_index_shard
 '''
 
 [tasks.build-inbox-shard]
@@ -101,7 +121,7 @@ echo "identity hash=$hash key=$key_hex"
 
 [tasks.build-contracts]
 description = "Build all contracts + delegates (WASM + code_hash files)"
-dependencies = ["build-user-shard", "build-thread-shard", "build-inbox-shard", "build-identity"]
+dependencies = ["build-user-shard", "build-thread-shard", "build-global-index-shard", "build-inbox-shard", "build-identity"]
 
 [tasks.build-web-container]
 description = "Build web/container Rust crate (WASM)"

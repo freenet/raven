@@ -19,6 +19,8 @@ web/user_shard_code_hash.txt
 web/public/user_shard.wasm
 web/thread_shard_code_hash.txt
 web/public/thread_shard.wasm
+web/global_index_shard_code_hash.txt
+web/public/global_index_shard.wasm
 web/model_code_hash.txt
 
 # Playwright

@@ -11,7 +11,7 @@ import { getIdentity } from "./identity";
 import { Post } from "./types";
 
 export interface AppCallbacks {
-  publish: (content: string) => void;
+  publish: (content: string, shareToGlobal: boolean) => void;
   like: (postId: string, liked: boolean) => void;
   repost: (postId: string, reposted: boolean) => void;
   quote: (postId: string, content: string) => void;
@@ -35,9 +35,11 @@ export function createApp(cb: AppCallbacks): HTMLElement {
 
   function openCompose(quoted?: Post): void {
     if (quoted) {
+      // Quote modal does not offer the share toggle; ignore the (always-false)
+      // shareToGlobal arg.
       openComposeModal((content) => cb.quote(quoted.id, content), { quoted });
     } else {
-      openComposeModal((content) => cb.publish(content));
+      openComposeModal((content, shareToGlobal) => cb.publish(content, shareToGlobal));
     }
   }
 

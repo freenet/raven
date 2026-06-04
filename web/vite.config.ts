@@ -12,6 +12,7 @@ export default defineConfig({
   define: {
     __USER_SHARD_CODE_HASH__: JSON.stringify(readFileOrDefault("user_shard_code_hash.txt", "DEV_MODE_NO_CONTRACT_HASH")),
     __THREAD_SHARD_CODE_HASH__: JSON.stringify(readFileOrDefault("thread_shard_code_hash.txt", "DEV_MODE_NO_CONTRACT_HASH")),
+    __GLOBAL_INDEX_SHARD_CODE_HASH__: JSON.stringify(readFileOrDefault("global_index_shard_code_hash.txt", "DEV_MODE_NO_CONTRACT_HASH")),
     __DELEGATE_KEY__: JSON.stringify(readFileOrDefault("delegate_key.txt", "")),
     __DELEGATE_KEY_BYTES__: readFileOrDefault("delegate_key_bytes.json", "[]"),
     __DELEGATE_CODE_HASH_BYTES__: readFileOrDefault("delegate_code_hash_bytes.json", "[]"),
