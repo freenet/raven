@@ -9,6 +9,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_MAKE_VERSION: "0.37.18"
   FDEV_VERSION: "0.3.212"
+  # Node binary for the node-backed E2E tier. Keep roughly in lockstep with
+  # FDEV_VERSION (same Freenet release line).
+  FREENET_VERSION: "0.2.68"
 
 jobs:
   build-and-test:
@@ -124,5 +127,76 @@ jobs:
           name: playwright-report
           path: |
             web/tests/playwright-report
+            web/tests/test-results
+          retention-days: 14
+
+  # Node-backed E2E: boots a real Freenet node, publishes the webapp + identity
+  # delegate + shards, and drives the SERVED app through Playwright (the only
+  # tier exercising browser -> live node -> delegate -> contract). Heavier than
+  # the offline tiers and depends on an external node binary, so it is
+  # NON-BLOCKING (continue-on-error) — a signal job, not a merge gate. Tracked in
+  # issue #34.
+  node-e2e:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            web/tests/package-lock.json
+      - name: Cache cargo-installed binaries
+        id: cache-bins
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-make
+            ~/.cargo/bin/cargo-binstall
+            ~/.cargo/bin/fdev
+            ~/.cargo/bin/freenet
+            ~/.cargo/bin/b3sum
+          key: ${{ runner.os }}-cargo-bins-make-${{ env.CARGO_MAKE_VERSION }}-fdev-${{ env.FDEV_VERSION }}-fn-${{ env.FREENET_VERSION }}-nodee2e
+      - name: Install cargo-binstall
+        if: steps.cache-bins.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@cargo-binstall
+      - name: Install cargo-make + fdev + freenet + b3sum
+        if: steps.cache-bins.outputs.cache-hit != 'true'
+        run: |
+          cargo binstall -y --force --version ${{ env.CARGO_MAKE_VERSION }} cargo-make
+          cargo binstall -y --force --version ${{ env.FDEV_VERSION }} fdev || \
+            cargo install fdev --version ${{ env.FDEV_VERSION }} --locked
+          cargo binstall -y --force --version ${{ env.FREENET_VERSION }} freenet || \
+            cargo install freenet --version ${{ env.FREENET_VERSION }} --locked
+          cargo binstall -y --force b3sum || cargo install b3sum --locked
+      - name: Install web + test npm deps
+        run: |
+          npm install --prefix web
+          npm install --prefix web/tests
+      - name: Cache Playwright browsers
+        id: cache-playwright
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-1.48.0-chromium-nodee2e
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: web/tests
+      - name: Run node-backed E2E
+        run: PLAYWRIGHT_PROJECT=chromium cargo make test-ui-node-e2e
+      - name: Upload node-e2e report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-node
+          path: |
+            web/tests/playwright-report-node
             web/tests/test-results
           retention-days: 14

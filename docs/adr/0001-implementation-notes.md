@@ -589,15 +589,30 @@ per-slice reviews could not see:
   like / non-owner post in a peer's state must not propagate to an honest
   replica), and cross-shard key consistency (a user-shard post's content id is the
   thread-shard param, and a reply bound to it lands only on that thread).
-- **Deferred — WASM-in-node e2e**: these integration tests drive the contract as a
-  Rust library, not the compiled WASM inside a running node, so they do not catch
-  WASM-compilation or transport differences. A real-node tier (via the
-  `freenet:linux-test` / `freenet:local-dev` skills — publish the shards, drive
-  reply/like/quote + two-peer sync over the live WS) is the next testing slice;
-  it is heavier and not a per-PR CI fit. It is the only tier that can confirm the
-  load-bearing `ensureThreadShard` GET-rejects-on-uninstantiated assumption above
-  and catch WASM-trap / node-vs-JS key-derivation drift. **Tracked as issue #34**
-  (not only this note).
+- **Node-backed browser E2E (first slice landed).** `scripts/node-e2e.sh` +
+  `cargo make test-ui-node-e2e` boot a fresh, isolated Freenet node, publish the
+  identity delegate + packaged web container + shards to it, and run the
+  Playwright specs under `web/tests/node-e2e/` against the node-SERVED webapp
+  (`/v1/contract/web/<CID>/`). This is the only tier that exercises the real
+  browser → live node → delegate → contract path: the served loader mounts the
+  app in a sandboxed iframe, opens a live WS to `/v1/contract/command`, wires the
+  identity delegate, and drives onboarding → identity → app-shell. Live-delegate
+  console signals (`Connected to Freenet node`, `Delegate connection wired`,
+  `No identity in delegate — show onboarding`) are asserted so a spec cannot pass
+  in offline/mock mode. Runs as a **non-blocking** CI job (`node-e2e`,
+  `continue-on-error`) since it needs an external node binary and is heavier than
+  per-PR gating. Does **not yet** confirm delegate identity *persistence* across
+  reload, the GET-rejects-on-uninstantiated assumption, WASM-trap, or node-vs-JS
+  key-derivation drift — those stay in the contract tier below.
+- **Deferred — WASM-in-node contract e2e**: the contract `integration` tests drive
+  the contract as a Rust library, not the compiled WASM inside a running node, so
+  they do not catch WASM-compilation or transport differences. A contract-level
+  real-node tier (via the `freenet:linux-test` / `freenet:local-dev` skills —
+  publish the shards, drive reply/like/quote + two-peer sync over the live WS) is
+  the next slice beneath the browser E2E above. It is the only tier that can
+  confirm the load-bearing `ensureThreadShard` / `ensureGlobalIndex`
+  GET-rejects-on-uninstantiated assumption and catch WASM-trap / node-vs-JS
+  key-derivation drift. **Tracked as issue #34** (not only this note).
 - **Delegate unit coverage (added in the holistic-review pass).** The identity
   delegate now has unit tests (`delegates/identity/src/lib.rs`): export→import seed
   round-trip, and the delegate's `SignPost`/`SignLike` outputs verify under the

@@ -531,6 +531,15 @@ fi
 cd "$ROOT/web/tests" && BASE_URL="http://localhost:$PORT" npx playwright test
 '''
 
+[tasks.test-ui-node-e2e]
+description = "Node-backed E2E: boot a throwaway node, publish, run Playwright against the SERVED webapp, tear down"
+dependencies = ["build", "build-contracts"]
+script_runner = "bash"
+script = '''
+set -euo pipefail
+bash "${CARGO_MAKE_WORKING_DIRECTORY}/scripts/node-e2e.sh"
+'''
+
 [tasks.clean-node]
 description = "Wipe local Freenet node state (macOS paths). Stop the node first."
 script_runner = "bash"
