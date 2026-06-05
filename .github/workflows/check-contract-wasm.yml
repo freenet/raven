@@ -32,7 +32,7 @@ on:
       - "rust-toolchain.toml"
 
 env:
-  FDEV_VERSION: "0.3.212"
+  FDEV_VERSION: "0.3.232"
 
 jobs:
   verify-published-contract:
