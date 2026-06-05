@@ -99,17 +99,43 @@ export function createFeed(
   postList.className = "feed__posts";
 
   let currentPosts: Post[] = [...initialPosts];
+  // Public-timeline (global-index) posts, shown under the Discover tab.
+  let discoverPosts: Post[] = [];
 
   function renderPosts(): void {
     postList.innerHTML = "";
     if (activeTab === "discover") {
-      const note = document.createElement("div");
-      note.className = "following-note";
-      note.innerHTML = `
-        <div class="following-note__title">Discover is quiet right now</div>
-        <div class="following-note__sub">New voices from across the network will surface here as you explore.</div>
-      `;
-      postList.appendChild(note);
+      if (discoverPosts.length === 0) {
+        const note = document.createElement("div");
+        note.className = "following-note";
+        note.innerHTML = `
+          <div class="following-note__title">No public posts yet</div>
+          <div class="following-note__sub">Public posts from across the network will appear here.</div>
+        `;
+        postList.appendChild(note);
+        return;
+      }
+
+      // Best-effort quoted-card resolution: only over discoverPosts. A quote
+      // whose target is not in the public timeline (e.g. a reply — those are
+      // filtered out upstream, or a post not present in the global index)
+      // renders without its quoted card. Richer resolution would need a
+      // per-target thread-shard fetch; out of scope for the read/render slice.
+      const resolveQuoted = (id: string): Post | undefined =>
+        discoverPosts.find((p) => p.id === id);
+
+      discoverPosts.forEach((post, i) => {
+        postList.appendChild(
+          createPostCard(post, {
+            onLike: callbacks.onLike,
+            onRepost: callbacks.onRepost,
+            onQuote: callbacks.onQuote,
+            onOpen: callbacks.onOpen,
+            resolveQuoted,
+            lead: i === 0,
+          }),
+        );
+      });
       return;
     }
 
@@ -163,11 +189,16 @@ export function createFeed(
   const feedEl = feed as HTMLElement & {
     postList: HTMLDivElement;
     updatePosts: (posts: Post[]) => void;
+    updateDiscoverPosts: (posts: Post[]) => void;
   };
   feedEl.postList = postList;
   feedEl.updatePosts = (updatedPosts: Post[]) => {
     currentPosts = updatedPosts;
     renderPosts();
+  };
+  feedEl.updateDiscoverPosts = (updatedPosts: Post[]) => {
+    discoverPosts = updatedPosts;
+    if (activeTab === "discover") renderPosts();
   };
 
   return feed;

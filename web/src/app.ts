@@ -19,7 +19,10 @@ export interface AppCallbacks {
   reply?: (rootPostId: string, content: string) => void;
 }
 
-type FeedEl = HTMLElement & { updatePosts: (p: Post[]) => void };
+type FeedEl = HTMLElement & {
+  updatePosts: (p: Post[]) => void;
+  updateDiscoverPosts: (p: Post[]) => void;
+};
 
 export function createApp(cb: AppCallbacks): HTMLElement {
   const posts: Post[] = [];
@@ -152,6 +155,7 @@ export function createApp(cb: AppCallbacks): HTMLElement {
   // Public surface used by index.ts to push updates.
   const appEl = app as unknown as HTMLElement & {
     updatePosts: (updatedPosts: Post[]) => void;
+    updateGlobalPosts: (updatedPosts: Post[]) => void;
     addPost: (post: Post) => void;
   };
 
@@ -159,6 +163,10 @@ export function createApp(cb: AppCallbacks): HTMLElement {
     posts.length = 0;
     posts.push(...updatedPosts);
     feed.updatePosts(updatedPosts);
+  };
+
+  appEl.updateGlobalPosts = (updatedPosts: Post[]) => {
+    feed.updateDiscoverPosts(updatedPosts);
   };
 
   appEl.addPost = (post: Post) => {

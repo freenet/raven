@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { GetRequest, GetResponse } from "@freenetorg/freenet-stdlib";
+import type {
+  GetRequest,
+  GetResponse,
+  UpdateNotification,
+} from "@freenetorg/freenet-stdlib";
+import { UpdateDataType } from "@freenetorg/freenet-stdlib";
 
 // ---------------------------------------------------------------------------
 // Mocking approach
@@ -123,6 +128,8 @@ function makeConnection() {
     onLikeUpdated: ReturnType<typeof vi.fn>;
     onRepostUpdated: ReturnType<typeof vi.fn>;
     onQuoteUpdated: ReturnType<typeof vi.fn>;
+    onGlobalPostsLoaded: ReturnType<typeof vi.fn>;
+    onNewGlobalPost: ReturnType<typeof vi.fn>;
   } = {
     onPostsLoaded: vi.fn(),
     onNewPost: vi.fn(),
@@ -130,6 +137,8 @@ function makeConnection() {
     onLikeUpdated: vi.fn(),
     onRepostUpdated: vi.fn(),
     onQuoteUpdated: vi.fn(),
+    onGlobalPostsLoaded: vi.fn(),
+    onNewGlobalPost: vi.fn(),
   };
   const conn = new FreenetConnection(callbacks as unknown as FreenetCallbacks);
   conn.connect();
@@ -766,6 +775,205 @@ describe("FreenetConnection", () => {
       expect(reEmit.postId).toBe(rootId);
       expect(reEmit.count).toBe(2); // two reposted:true records
       expect(reEmit.repostedByMe).toBe(true); // owner is among them
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Global-index (public-timeline) READ path.
+  // -------------------------------------------------------------------------
+  // The write side (shareToGlobalIndex / ensureGlobalIndex) already has the
+  // singleton key wiring; these cover the read side: loadGlobalIndex() issues a
+  // serialised GET against the singleton key, handleGetResponse routes that
+  // response (state = a MAP keyed by id, a Rust BTreeMap) to onGlobalPostsLoaded,
+  // and a live update notification with a `{"Posts":[…]}` delta on that same key
+  // routes to onNewGlobalPost. We drive everything through the captured handler
+  // exactly like the user-shard/thread GET tests above.
+  describe("global-index read path", () => {
+    // A ContractPost as it appears on-wire inside the global index map. Mirrors
+    // the Rust `Post` json fields (incl. `reply_to`). `id` is the map key.
+    function gPost(
+      overrides: Partial<{
+        id: string;
+        content: string;
+        timestamp: number;
+        reply_to: string;
+      }> = {},
+    ): Record<string, unknown> {
+      return {
+        id: overrides.id ?? "g1",
+        author_pubkey: OWNER_VK,
+        author_name: "Alice",
+        author_handle: "alice",
+        content: overrides.content ?? "hello timeline",
+        timestamp: overrides.timestamp ?? 1000,
+        reply_to: overrides.reply_to ?? "",
+        quoted_post: "",
+        signature: "sig",
+      };
+    }
+
+    /** Encode a global-index state map ({"posts": {<id>: Post}}) as state bytes. */
+    function globalStateBytes(posts: Record<string, unknown>): number[] {
+      return Array.from(
+        new TextEncoder().encode(JSON.stringify({ posts })),
+      );
+    }
+
+    /**
+     * Trigger loadGlobalIndex() and return the GET it issued. The hash file is
+     * present in the repo, so __GLOBAL_INDEX_SHARD_CODE_HASH__ is a real hash and
+     * globalIndexKeyOrNull() derives + registers the singleton instance id — so
+     * the response we feed back routes to the global-index branch.
+     */
+    async function loadGlobalAndGetProbe(
+      conn: FreenetConnection,
+      api: FakeWsApi,
+    ): Promise<Deferred<GetResponse>> {
+      const before = api.getCalls.length;
+      conn.loadGlobalIndex();
+      await flush();
+      expect(api.getCalls.length).toBe(before + 1);
+      return api.getCalls[api.getCalls.length - 1];
+    }
+
+    it("a global-index GET maps the posts MAP and emits onGlobalPostsLoaded newest-first", async () => {
+      const { conn, api, callbacks } = makeConnection();
+      const probe = await loadGlobalAndGetProbe(conn, api);
+
+      // Two top-level posts keyed by id; the older one is listed first in the
+      // map to prove the read side sorts by timestamp desc (not map order).
+      const posts = {
+        old: gPost({ id: "old", content: "older", timestamp: 1000 }),
+        new: gPost({ id: "new", content: "newer", timestamp: 5000 }),
+      };
+      api.handler.onContractGet({
+        key: probe.req.key,
+        state: globalStateBytes(posts),
+      } as unknown as GetResponse);
+
+      expect(callbacks.onGlobalPostsLoaded).toHaveBeenCalledTimes(1);
+      const emitted = callbacks.onGlobalPostsLoaded.mock.calls[0][0] as Array<{
+        id: string;
+        content: string;
+      }>;
+      expect(emitted.map((p) => p.id)).toEqual(["new", "old"]); // newest first
+      expect(emitted[0].content).toBe("newer");
+
+      // Routing isolation: the user-shard callback must NOT fire for this GET.
+      expect(callbacks.onPostsLoaded).not.toHaveBeenCalled();
+    });
+
+    it("an empty index ({\"posts\":{}}) emits onGlobalPostsLoaded([])", async () => {
+      const { conn, api, callbacks } = makeConnection();
+      const probe = await loadGlobalAndGetProbe(conn, api);
+
+      api.handler.onContractGet({
+        key: probe.req.key,
+        state: globalStateBytes({}),
+      } as unknown as GetResponse);
+
+      expect(callbacks.onGlobalPostsLoaded).toHaveBeenCalledTimes(1);
+      expect(callbacks.onGlobalPostsLoaded.mock.calls[0][0]).toEqual([]);
+    });
+
+    it("filters reply posts out of the timeline (top-level only)", async () => {
+      const { conn, api, callbacks } = makeConnection();
+      const probe = await loadGlobalAndGetProbe(conn, api);
+
+      // The index MAY hold replies (acceptance is self-verification only); the
+      // read side filters on a non-empty reply_to to keep the timeline top-level.
+      const posts = {
+        top: gPost({ id: "top", reply_to: "" }),
+        reply: gPost({ id: "reply", reply_to: "some-parent" }),
+      };
+      api.handler.onContractGet({
+        key: probe.req.key,
+        state: globalStateBytes(posts),
+      } as unknown as GetResponse);
+
+      const emitted = callbacks.onGlobalPostsLoaded.mock.calls[0][0] as Array<{
+        id: string;
+      }>;
+      expect(emitted.map((p) => p.id)).toEqual(["top"]);
+    });
+
+    it("a global-index delta notification ({\"Posts\":[…]}) emits onNewGlobalPost", async () => {
+      const { conn, api, callbacks } = makeConnection();
+      // loadGlobalIndex registers the singleton instance id used to route both
+      // the GET response AND subsequent live-update notifications.
+      const probe = await loadGlobalAndGetProbe(conn, api);
+
+      const post = gPost({ id: "live-1", content: "fresh share" });
+      const deltaBytes = Array.from(
+        new TextEncoder().encode(JSON.stringify({ Posts: [post] })),
+      );
+      // The handler reads notification.update as a property-shaped UpdateData
+      // ({ updateDataType, updateData: { delta } }) — same shape the production
+      // unpacked notification exposes; mirror it as a plain object.
+      api.handler.onContractUpdateNotification({
+        key: probe.req.key,
+        update: {
+          updateDataType: UpdateDataType.DeltaUpdate,
+          updateData: { delta: deltaBytes },
+        },
+      } as unknown as UpdateNotification);
+
+      expect(callbacks.onNewGlobalPost).toHaveBeenCalledTimes(1);
+      const emitted = callbacks.onNewGlobalPost.mock.calls[0][0] as {
+        id: string;
+        content: string;
+      };
+      expect(emitted.id).toBe("live-1");
+      expect(emitted.content).toBe("fresh share");
+
+      // Routing isolation: the user-shard live-update callback must NOT fire.
+      expect(callbacks.onNewPost).not.toHaveBeenCalled();
+    });
+
+    it("routing isolation: a user-shard GET does NOT fire the global callback", async () => {
+      const { conn, api, callbacks } = makeConnection();
+
+      // Establish + load the user shard (sets userShardInstanceId, issues GETs).
+      conn.setUser(OWNER_VK, "Alice", "alice");
+      await flush();
+      const probe = api.getCalls[0]; // the user-shard probe GET
+      probe.resolve({} as GetResponse); // exists -> no PUT
+      await flush();
+      await flush();
+      // loadUserShard's GET carries the user-shard state (a Vec under `posts`).
+      expect(api.getCalls.length).toBe(2);
+      const loadGet = api.getCalls[1];
+
+      api.handler.onContractGet({
+        key: loadGet.req.key,
+        state: Array.from(
+          new TextEncoder().encode(
+            JSON.stringify({ posts: [gPost({ id: "u1" })] }),
+          ),
+        ),
+      } as unknown as GetResponse);
+
+      // The user-shard branch fired; the global-index branch must NOT have.
+      expect(callbacks.onPostsLoaded).toHaveBeenCalledTimes(1);
+      expect(callbacks.onGlobalPostsLoaded).not.toHaveBeenCalled();
+    });
+
+    it("loadGlobalIndex() is a no-op before connect() (no GET, no throw)", () => {
+      // globalIndexKeyOrNull() returns null only when the build hash is the dev
+      // sentinel/undefined — which can't be forced here (it's a compile-time
+      // vite `define`). The other no-op guard is `!this.api`: before connect(),
+      // the WS client doesn't exist, so loadGlobalIndex() must quietly return
+      // without issuing a GET (and without throwing). This is the path an
+      // offline/unconnected reader hits.
+      const conn = new FreenetConnection({
+        onPostsLoaded: vi.fn(),
+        onNewPost: vi.fn(),
+        onStatusChange: vi.fn(),
+      } as unknown as FreenetCallbacks);
+      // No connect() — this.api is null.
+      expect(() => conn.loadGlobalIndex()).not.toThrow();
+      // No FakeWsApi instance was created (connect not called) and thus no GET.
+      expect(FakeWsApi.instances.length).toBe(0);
     });
   });
 });
