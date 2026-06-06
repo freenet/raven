@@ -49,7 +49,14 @@ fi
 
 echo "smoke-testing $URL"
 cd "$ROOT/web/tests"
-BASE_URL="$URL" npx playwright test production-liveness.spec.ts
+# The node-served liveness spec lives under node-e2e/ (asserts the iframe loader
+# + live-network onboarding), so it needs the node config — the default config
+# ignores node-e2e/ and points at the offline vite preview. We drive an already
+# node-served URL here, so we DON'T want playwright.node.config.ts's webServer /
+# global-setup (that boots its own node); target the spec file directly with a
+# minimal inline config via --config is overkill, so reuse the node config but
+# only the spec, with BASE_URL pinned to the live URL.
+BASE_URL="$URL" npx playwright test --config playwright.node.config.ts node-e2e/production-liveness.spec.ts
 
 echo ""
 echo "✅ liveness check passed against $URL"

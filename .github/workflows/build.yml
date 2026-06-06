@@ -8,10 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_MAKE_VERSION: "0.37.18"
-  FDEV_VERSION: "0.3.212"
+  FDEV_VERSION: "0.3.232"
   # Node binary for the node-backed E2E tier. Keep roughly in lockstep with
   # FDEV_VERSION (same Freenet release line).
-  FREENET_VERSION: "0.2.68"
+  FREENET_VERSION: "0.2.70"
 
 jobs:
   build-and-test:
