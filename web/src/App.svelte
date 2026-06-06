@@ -1,0 +1,203 @@
+<script lang="ts">
+  /**
+   * App.svelte — replaces app.ts createApp() orchestration AND the index.ts
+   * onboarding/splash/landing routing. Top-level component mounted by main.ts.
+   *
+   * Global SCSS (styles.scss) is imported in main.ts, NOT here, so this file
+   * stays pure. Every class referenced below is a GLOBAL SCSS class — do NOT
+   * use scoped <style>.
+   */
+  import { APP_NAME, APP_LOGO_URL } from "./branding";
+  import {
+    status,
+    appRendered,
+    showOnboarding,
+    identity,
+    posts,
+    globalPosts,
+    keyExportSecret,
+    publish,
+    like,
+    repost,
+    quote,
+    completeOnboarding,
+  } from "./stores/freenet";
+  import type { Post } from "./types";
+  import type { SidebarView } from "./components/sidebar";
+
+  // Child components (created in the next phase at these target paths).
+  import Sidebar from "./components/Sidebar.svelte";
+  import RightPanel from "./components/RightPanel.svelte";
+  import Feed from "./components/Feed.svelte";
+  import Explore from "./components/Explore.svelte";
+  import Notifications from "./components/Notifications.svelte";
+  import Profile from "./components/Profile.svelte";
+  import Settings from "./components/Settings.svelte";
+  import Thread from "./components/Thread.svelte";
+  import ComposeModal from "./components/ComposeModal.svelte";
+  import OnboardingOverlay from "./components/OnboardingOverlay.svelte";
+  import LandingFeed from "./components/LandingFeed.svelte";
+  import KeyExportModal from "./components/KeyExportModal.svelte";
+
+  // ---- Local view state (runes) ----
+  let currentView = $state<SidebarView>("feed");
+  // When set, thread view replaces the routed view (element-type contract is
+  // still `main.feed-column` inside Thread).
+  let threadRoot = $state<Post | null>(null);
+  // Compose modal control (was app.ts openCompose / openComposeModal).
+  let composeState = $state<{ open: boolean; quoted?: Post }>({ open: false });
+
+  // Follow set — app.ts kept a (currently always-empty) followedPubkeys set
+  // and passed it through to Feed/PostCard for the following-note affordances.
+  const followedPubkeys = new Set<string>();
+
+  // Thread replies: app.ts openThread surfaced the posts that quote the root.
+  let threadReplies = $derived(
+    threadRoot
+      ? $posts.filter((p) => p.quotedPostId === threadRoot!.id)
+      : [],
+  );
+
+  // My posts for the profile view (app.ts navigate "profile" logic).
+  let myPosts = $derived(
+    $identity
+      ? $posts.filter(
+          (p) => p.author.publicKey && p.author.publicKey === $identity!.publicKey,
+        )
+      : [],
+  );
+
+  // ---- Navigation (mirrors app.ts navigate, including the profile guard) ----
+  function navigate(view: SidebarView): void {
+    threadRoot = null;
+    // app.ts navigate falls back to feed when "profile" is requested without an
+    // identity. Apply the same guard up front.
+    if (view === "profile" && !$identity) {
+      currentView = "feed";
+      return;
+    }
+    currentView = view;
+  }
+
+  function openThread(post: Post): void {
+    threadRoot = post;
+  }
+
+  // app.ts wired Thread's reply callback as `cb.reply?.(...)`, but index.ts
+  // never supplied a `reply` callback to createApp — so replies were a no-op
+  // until the #12 backend lands. Preserve that exact behavior here.
+  function onThreadReply(_rootPostId: string, _content: string): void {
+    // intentionally no-op (reply backend not yet wired)
+  }
+
+  // ---- Compose ----
+  function openCompose(quoted?: Post): void {
+    composeState = { open: true, quoted };
+  }
+
+  function onComposeSubmit(content: string, shareToGlobal: boolean): void {
+    const quoted = composeState.quoted;
+    composeState = { open: false };
+    if (quoted) {
+      // Quote modal does not offer the share toggle; ignore shareToGlobal.
+      quote(quoted.id, content);
+    } else {
+      publish(content, shareToGlobal);
+    }
+  }
+</script>
+
+{#if !$appRendered && $status === "connecting"}
+  <!-- SPLASH (was index.ts showSplash; inline styles kept verbatim) -->
+  <div class="splash-screen" style="display:flex;align-items:center;justify-content:center;height:100vh;">
+    <div style="text-align:center;display:flex;flex-direction:column;align-items:center;gap:16px">
+      <img
+        src={APP_LOGO_URL}
+        alt="{APP_NAME} logo"
+        draggable="false"
+        style="width:72px;height:72px;object-fit:contain;user-select:none"
+      />
+      <div style="display:flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:9.5px;letter-spacing:0.14em;text-transform:uppercase;color:var(--ink-3)">
+        <span class="live-dot"></span>
+        <span>Connecting to Freenet</span>
+      </div>
+    </div>
+  </div>
+{:else if !$appRendered && $showOnboarding}
+  <!-- ONBOARDING + read-only LANDING feed mounted simultaneously -->
+  <LandingFeed posts={$globalPosts} />
+  <OnboardingOverlay
+    onComplete={(name, secret) => completeOnboarding(name, secret)}
+  />
+{:else if $appRendered}
+  <!-- APP SHELL (was createApp) -->
+  <div class="app-layout">
+    <Sidebar
+      activeView={currentView}
+      onNavigate={(view) => navigate(view)}
+      onCompose={() => openCompose()}
+    />
+    <div class="app-layout__main">
+      {#if threadRoot}
+        <Thread
+          root={threadRoot}
+          replies={threadReplies}
+          onBack={() => (threadRoot = null)}
+          onReply={onThreadReply}
+        />
+      {:else if currentView === "feed"}
+        <Feed
+          posts={$posts}
+          discoverPosts={$globalPosts}
+          {followedPubkeys}
+          onCompose={() => openCompose()}
+          onOpen={(post) => openThread(post)}
+          onLike={(postId, liked) => like(postId, liked)}
+          onRepost={(postId, reposted) => repost(postId, reposted)}
+          onQuote={(post) => openCompose(post)}
+        />
+      {:else if currentView === "explore"}
+        <Explore />
+      {:else if currentView === "notifications"}
+        <Notifications />
+      {:else if currentView === "profile"}
+        <Profile
+          user={{
+            displayName: $identity!.displayName,
+            handle: $identity!.handle,
+            publicKey: $identity!.publicKey,
+          }}
+          posts={myPosts}
+          onLike={(postId, liked) => like(postId, liked)}
+          onRepost={(postId, reposted) => repost(postId, reposted)}
+          onQuote={(post) => openCompose(post)}
+          onOpen={(post) => openThread(post)}
+          onSettings={() => navigate("settings")}
+        />
+      {:else if currentView === "settings"}
+        <Settings />
+      {/if}
+    </div>
+    <div class="right-panel-col">
+      <RightPanel onNavigate={(view) => navigate(view)} />
+    </div>
+  </div>
+{/if}
+
+<!-- Compose modal (was app.ts openCompose -> body-appended modal) -->
+{#if composeState.open}
+  <ComposeModal
+    open={composeState.open}
+    quoted={composeState.quoted}
+    onSubmit={(content, shareToGlobal) => onComposeSubmit(content, shareToGlobal)}
+    onClose={() => (composeState = { open: false })}
+  />
+{/if}
+
+<!-- Key export modal (was index.ts showKeyExportModal). Visible iff non-null. -->
+{#if $keyExportSecret != null}
+  <KeyExportModal
+    secret={$keyExportSecret}
+    onClose={() => keyExportSecret.set(null)}
+  />
+{/if}

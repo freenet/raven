@@ -1,5 +1,6 @@
 /// <reference types="vitest/config" />
 import { defineConfig } from "vite";
+import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { readFileSync, existsSync } from "fs";
 import { resolve } from "path";
 
@@ -9,6 +10,7 @@ function readFileOrDefault(filename: string, fallback: string): string {
 }
 
 export default defineConfig({
+  plugins: [svelte()],
   define: {
     __USER_SHARD_CODE_HASH__: JSON.stringify(readFileOrDefault("user_shard_code_hash.txt", "DEV_MODE_NO_CONTRACT_HASH")),
     __THREAD_SHARD_CODE_HASH__: JSON.stringify(readFileOrDefault("thread_shard_code_hash.txt", "DEV_MODE_NO_CONTRACT_HASH")),
