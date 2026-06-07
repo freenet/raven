@@ -1,6 +1,10 @@
 import { blake3 } from "@noble/hashes/blake3";
 import bs58 from "bs58";
 import { ContractKey } from "@freenetorg/freenet-stdlib";
+import {
+  ContractKeyT,
+  ContractInstanceIdT,
+} from "@freenetorg/freenet-stdlib/common";
 
 // Derive a parameterized contract's instance id exactly as the Freenet node
 // does. The node computes (freenet-stdlib `ContractKey::generate_id` /
@@ -79,5 +83,52 @@ export function deriveShardContractKey(
   return new ContractKey(
     instance.bytes as unknown as ConstructorParameters<typeof ContractKey>[0],
     codeBytes,
+  );
+}
+
+/**
+ * Build the PACKABLE (`…T`) ContractKey for the same parameterized instance.
+ *
+ * `deriveShardContractKey` returns a `ContractKey` (the flatbuffer READER
+ * class), which is correct for GET/UPDATE/subscribe — those requests take a
+ * `ContractKey`. But a `PutRequest`'s container nests a `WasmContractV1T`, whose
+ * `key` field must serialize via `.pack()`. A reader `ContractKey` has no
+ * `.pack()`, so packing it throws `FlatBuffers: field 8 must be set` (field 8 =
+ * the WasmContractV1 `key`). The PUT path must therefore use the `…T` builder
+ * variants. This returns the matching `ContractKeyT` from the same bytes.
+ */
+export function deriveShardContractKeyT(
+  codeHashBase58: string,
+  parameters: Uint8Array,
+): ContractKeyT {
+  const instance = deriveInstanceId(codeHashBase58, parameters);
+  const codeBytes = decodeCodeHash(codeHashBase58);
+  return new ContractKeyT(
+    new ContractInstanceIdT(Array.from(instance.bytes)),
+    Array.from(codeBytes),
+  );
+}
+
+/**
+ * Like {@link deriveShardContractKeyT} but from the raw 32-byte code hash (e.g.
+ * an existing reader key's `codePart()`) instead of its base58 form — for PUT
+ * sites that already hold a `ContractKey` and just need the packable twin.
+ */
+export function shardContractKeyTFromParts(
+  codeHashBytes: Uint8Array,
+  parameters: Uint8Array,
+): ContractKeyT {
+  if (codeHashBytes.length !== 32) {
+    throw new Error(
+      `code hash must be 32 bytes, got ${codeHashBytes.length}`,
+    );
+  }
+  const concat = new Uint8Array(codeHashBytes.length + parameters.length);
+  concat.set(codeHashBytes, 0);
+  concat.set(parameters, codeHashBytes.length);
+  const instanceBytes = blake3(concat);
+  return new ContractKeyT(
+    new ContractInstanceIdT(Array.from(instanceBytes)),
+    Array.from(codeHashBytes),
   );
 }

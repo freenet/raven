@@ -19,6 +19,9 @@ function instrument(page: Page) {
   const ws: string[] = [];
   const logs: string[] = [];
   page.on("websocket", (s) => ws.push(s.url()));
+  // page.on("console") only surfaces the TOP frame. The app runs inside the
+  // sandboxed iframe, so its logs (identity / publish / global-index share)
+  // arrive on the FRAME's console — capture both or the share path is invisible.
   page.on("console", (m) => logs.push(`[${m.type()}] ${m.text()}`));
   page.on("pageerror", (e) => logs.push(`[pageerror] ${e.message}`));
   return { ws, logs };
@@ -236,17 +239,16 @@ test("logged-in: Home -> Discover tab renders the global index (not the old stub
     .toBeTruthy();
 });
 
-// SKIPPED — deferred to the #50 contract-persistence tier. This is the full
-// write->index->read round-trip: compose with "share to public timeline" ON,
-// then read the post back out of the global index. It does not pass reliably on
-// a single live node in this slice: the share UPDATE instantiates the singleton
-// on first write, but the post is not observable via a subsequent GET within a
-// generous window — the same uninstantiated-singleton / subscribe-before-PUT /
-// single-node propagation seam #50 tracks (delegate-persistence and
-// GET-on-uninstantiated are the sibling unknowns). The read/render path itself
-// is proven by the two specs above (landing-feed live GET signal + Discover-tab
-// render). Kept (not deleted) so it activates once #50 lands the contract tier.
-test.skip("round-trip: a shared post reaches the Discover timeline", async ({ page }) => {
+// Full write->index->render round-trip: compose with "share to public timeline"
+// ON, then see the post in the Discover tab (same session). This was long
+// skipped as a presumed #50 propagation seam, but the real blocker was a client
+// bug: every shard PUT (user/thread/global-index) built its PutRequest with
+// `relatedContracts = undefined`, and that flatbuffer field is REQUIRED — so the
+// Put failed to serialize ("field 8 must be set") and NO shard was ever
+// instantiated from the browser. With that fixed (RelatedContractsT([]) + the
+// packable `…T` container tables), the singleton instantiates on first share and
+// the sharer's own subscription delivers the post back into Discover.
+test("round-trip: a shared post reaches the Discover timeline", async ({ page }) => {
   // register (or reuse the shared identity) -> compose with the public-timeline
   // toggle ON -> reload -> the post should surface in the Discover tab.
   await page.goto("", { waitUntil: "domcontentloaded" });
@@ -265,24 +267,19 @@ test.skip("round-trip: a shared post reaches the Discover timeline", async ({ pa
   await postBtn.click();
   await expect(a.locator(".compose-modal-overlay")).toBeHidden({ timeout: 15_000 });
 
-  // The post lands on the owner's user shard immediately (Following). The share
-  // to the global index is fire-and-forget and instantiates the singleton on
-  // first write. Rather than depend on a live subscription delivering the delta
-  // BEFORE the index existed (subscribe ran pre-instantiation — that
-  // delivery-after-instantiate seam is the deferred #50 tier), reload the page:
-  // a fresh boot re-derives the key and re-GETs the now-populated index
-  // deterministically, exercising this PR's read/render path against real data.
-  // Allow brief propagation for the share UPDATE to commit before reloading.
-  await page.waitForTimeout(5_000);
-  await page.reload({ waitUntil: "domcontentloaded" });
-  const a2 = await ensureAppShell(page, "RoundTrip Tester");
-  const discoverTab = a2.locator(".feed-tab", { hasText: "Discover" });
+  // SAME-SESSION read (what a real user sees — they don't reload after posting):
+  // the sharer already subscribed to the global index at boot, so its own shared
+  // post arrives back as a live UPDATE delta and renders in Discover. This proves
+  // the full write→instantiate→index→render path on a live node without relying
+  // on a fresh-boot GET of the just-instantiated singleton (the cross-session
+  // reload-GET tail is the still-open single-node #50 seam).
+  const discoverTab = a.locator(".feed-tab", { hasText: "Discover" });
   await expect(discoverTab).toBeVisible({ timeout: 30_000 });
   await discoverTab.click();
   await expect
-    .poll(async () => a2.locator(".feed__posts").getByText(marker).count(), {
-      timeout: 60_000,
-      message: "shared post did not surface in the Discover timeline after reload",
+    .poll(async () => a.locator(".feed__posts").getByText(marker).count(), {
+      timeout: 90_000,
+      message: "shared post did not surface in the Discover timeline (same session)",
     })
     .toBeGreaterThan(0);
 });
