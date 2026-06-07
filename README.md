@@ -2,9 +2,11 @@
 
 Freenet Microblogging is a decentralized Twitter/X-like application built on
 [Freenet](https://freenet.org), designed to provide censorship-resistant social networking where
-users own their data. It features a web-based interface built with TypeScript and Vite, Rust/WASM
-per-user/per-thread shard contracts for posts, social graph, replies, likes and notifications, and
-an ML-DSA-65 (post-quantum) identity delegate for cryptographic signing.
+users own their data. It features a web-based interface built with Svelte 5 and Vite, Rust/WASM
+per-user/per-thread shard contracts for posts, social graph, replies, likes and notifications, a
+singleton global-index contract for the public timeline, and an ML-DSA-65 (post-quantum) identity
+delegate for cryptographic signing. A stable "facade" contract gives users a bookmarkable URL that
+survives every release.
 
 ![Screenshot of microblogging interface](docs/screenshot.png)
 
@@ -13,15 +15,19 @@ an ML-DSA-65 (post-quantum) identity delegate for cryptographic signing.
 - [x] User shard: owner-writes posts (windowed, content-addressed), profile (LWW), follows (per-key seq merge)
 - [x] Thread shard: anyone-writes replies, likes, quotes (each record self-verifying), per root post
 - [x] Inbox shard: anyone-writes notifications, owner-prunes via signed ops
+- [x] Global-index shard: singleton public-timeline contract (opt-in share), merge-not-replace reconcile
 - [x] ML-DSA-65 (post-quantum) identity delegate with keypair generation and signing
-- [x] Web UI with feed, compose box, profile, sidebar, dark/light mode
+- [x] Svelte 5 web UI with feed, compose box, profile, sidebar, dark/light mode
 - [x] Onboarding flow with identity creation and import
 - [x] Real-time post updates via contract subscription
-- [x] Wire posts + likes to shard contracts (user shard / thread shard)
+- [x] Wire posts + likes + reposts/quotes to shard contracts (user shard / thread shard)
+- [x] Public timeline: landing feed + Discover tab backed by the global-index shard
+- [x] Facade contract — stable bookmarkable URL that survives release contract-id rotation
 - [ ] Wire follows UI to the user shard (Following tab exists but empty)
-- [ ] Wire replies UI + delegate reply signing to the thread shard
-- [ ] Wire notifications UI to the inbox shard
-- [ ] Post search and filtering
+- [ ] Wire replies UI + delegate reply signing to the thread shard (`onThreadReply` is a no-op, pending #12)
+- [ ] Wire notifications UI to the inbox shard (contract done; UI renders mock records)
+- [ ] Handle registry: handle → pubkey resolution (no registry contract yet)
+- [ ] Real "who to follow" + search backed by the social graph / an index (currently mock/local-filter)
 - [ ] Media attachments
 - [ ] GhostKey support for anonymous posting
 
@@ -113,8 +119,10 @@ cd web && npm run dev
 - [contracts/user-shard](contracts/user-shard/): per-owner shard — posts, profile, follows (owner-writes)
 - [contracts/thread-shard](contracts/thread-shard/): per-root-post shard — replies, likes, quotes (anyone-writes)
 - [contracts/inbox-shard](contracts/inbox-shard/): per-owner shard — notifications (anyone-writes, owner-prunes)
-- [delegates/identity](delegates/identity/): ML-DSA-65 identity delegate (keygen, post/like signing)
-- [web](web/): TypeScript + Vite web application
+- [contracts/global-index-shard](contracts/global-index-shard/): singleton — public timeline / Discover feed (opt-in share)
+- [contracts/facade](contracts/facade/): stable bookmarkable URL; signed pointer to the current webapp contract id
+- [delegates/identity](delegates/identity/): ML-DSA-65 identity delegate (keygen, post/like/repost/quote signing)
+- [web](web/): Svelte 5 + Vite web application
 
 ### Architecture
 
@@ -123,7 +131,7 @@ The system is built using:
 - **Freenet Contracts**: Rust/WASM contracts with commutative merge for conflict-free replication
 - **Freenet Delegates**: Client-side WASM modules for identity and cryptographic operations
 - **freenet-stdlib**: TypeScript SDK for WebSocket communication with the Freenet node
-- **Vite**: Fast build toolchain for the web app, served as a webapp contract
+- **Svelte 5 + Vite**: reactive UI (runes) over a framework-agnostic WS/contract store layer, built and served as a webapp contract
 - **ML-DSA-65** (FIPS 204): post-quantum signatures for identity and all signed records
 - **BLAKE3**: content-addressable post ids, contract key derivation, delegate key computation
 
