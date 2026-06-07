@@ -3,8 +3,9 @@
   import { toggleTheme } from "../theme";
   import { exportIdentity } from "../identity";
   import { identity } from "../stores/freenet";
+  import type { SidebarView } from "./view-types";
 
-  export type SidebarView = "feed" | "explore" | "notifications" | "profile" | "settings";
+  export type { SidebarView };
 
   interface Props {
     onNavigate: (view: SidebarView) => void;

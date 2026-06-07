@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ExploreItem } from "./explore";
+  import type { ExploreItem } from "./view-types";
 
   const ICON_SEARCH = `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
   <circle cx="11" cy="11" r="7"/>

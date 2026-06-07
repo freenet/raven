@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { NotificationRecord } from "./notifications";
+  import type { NotificationRecord } from "./view-types";
 
   let { records = [] }: { records?: NotificationRecord[] } = $props();
 

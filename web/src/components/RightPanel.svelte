@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { SidebarView } from "./sidebar";
+  import type { SidebarView } from "./view-types";
 
   let { onNavigate }: { onNavigate?: (view: SidebarView) => void } = $props();
 </script>

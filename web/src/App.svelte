@@ -23,7 +23,7 @@
     completeOnboarding,
   } from "./stores/freenet";
   import type { Post } from "./types";
-  import type { SidebarView } from "./components/sidebar";
+  import type { SidebarView } from "./components/view-types";
 
   // Child components (created in the next phase at these target paths).
   import Sidebar from "./components/Sidebar.svelte";
