@@ -70,6 +70,12 @@ WEBAPP_VERSION=$(( MAJ * 1000000 + MIN * 1000 + PAT ))
 [ "$WEBAPP_VERSION" -gt 0 ] || die "packed version must be > 0 (got $WEBAPP_VERSION for $VERSION)"
 export WEBAPP_VERSION
 
+# Pin the sidebar version chip (web/vite.config.ts reads APP_VERSION) to the
+# release tag. Without this the webapp builds BEFORE the git tag is created, so
+# `git describe` bakes a stale `vPREV-N-gHASH` string instead of the clean
+# `vX.Y.Z` we're releasing.
+export APP_VERSION="$TAG"
+
 # ─── 1. Preflight ──────────────────────────────────────────────────────────────
 echo "── preflight ─────────────────────────────────────────────────────────────"
 
