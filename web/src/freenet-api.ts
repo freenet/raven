@@ -1,9 +1,7 @@
 import {
   FreenetWsApi,
   ContractKey,
-  ContractContainer,
   ContractType as WasmContractType,
-  WasmContractV1,
   GetRequest,
   GetResponse,
   PutRequest,
@@ -19,11 +17,26 @@ import {
   HostError,
   ResponseHandler,
 } from "@freenetorg/freenet-stdlib";
-// ContractCodeT is the constructable flatbuffer code table (with .pack()). It
-// is not re-exported from the package root, only the /common subpath.
-import { ContractCodeT } from "@freenetorg/freenet-stdlib/common";
+// The constructable (`…T`) flatbuffer tables carry `.pack()`; the reader classes
+// (ContractCode/WasmContractV1/ContractContainer) do NOT, so anything nested in
+// a PutRequest container must be a `…T` or packing throws "field N must be set".
+// These are re-exported only from the /common subpath, not the package root.
+import {
+  ContractCodeT,
+  WasmContractV1T,
+  ContractContainerT,
+} from "@freenetorg/freenet-stdlib/common";
+// A PutRequest's `relatedContracts` (flatbuffer field 8) is REQUIRED, not
+// optional — passing `undefined` makes the Put message fail to serialize with
+// "FlatBuffers: field 8 must be set". An empty RelatedContractsT satisfies it.
+import { RelatedContractsT } from "@freenetorg/freenet-stdlib/client-request";
 import { Post } from "./types";
-import { deriveShardContractKey, hexToBytes } from "./shard-key";
+import {
+  deriveShardContractKey,
+  deriveShardContractKeyT,
+  shardContractKeyTFromParts,
+  hexToBytes,
+} from "./shard-key";
 import { signPost, signLike, signRepost, signQuoteRef } from "./identity";
 
 // Contract post format (matches Rust `common::post::Post`). Signature and
@@ -624,12 +637,12 @@ export class FreenetConnection {
       Array.from(wasm),
       codeHashBytes ? Array.from(codeHashBytes) : [],
     );
-    const contract = new WasmContractV1(
-      code,
-      Array.from(vkBytes),
-      this.userShardKey,
-    );
-    const container = new ContractContainer(
+    // The container nests packable `…T` tables. Build the key as a ContractKeyT
+    // from the same derivation — a reader ContractKey has no .pack() and would
+    // throw "field 8 must be set" when the PutRequest serializes.
+    const keyT = deriveShardContractKeyT(codeHashBase58, vkBytes);
+    const contract = new WasmContractV1T(code, Array.from(vkBytes), keyT);
+    const container = new ContractContainerT(
       WasmContractType.WasmContractV1,
       contract,
     );
@@ -640,7 +653,7 @@ export class FreenetConnection {
     const req = new PutRequest(
       container,
       Array.from(initialState),
-      undefined,
+      new RelatedContractsT([]),
       false,
       false,
     );
@@ -722,9 +735,15 @@ export class FreenetConnection {
       codeHashBytes ? Array.from(codeHashBytes) : [],
     );
     // Parameter = UTF-8 bytes of the root post id (matches the contract).
-    const params = Array.from(new TextEncoder().encode(rootPostId));
-    const contract = new WasmContractV1(code, params, key);
-    const container = new ContractContainer(
+    const paramBytes = new TextEncoder().encode(rootPostId);
+    const params = Array.from(paramBytes);
+    // Packable key twin (the reader `key` has no .pack() — see putUserShard).
+    const keyT = shardContractKeyTFromParts(
+      codeHashBytes ?? new Uint8Array(0),
+      paramBytes,
+    );
+    const contract = new WasmContractV1T(code, params, keyT);
+    const container = new ContractContainerT(
       WasmContractType.WasmContractV1,
       contract,
     );
@@ -732,7 +751,7 @@ export class FreenetConnection {
       JSON.stringify({ replies: {}, likes: {}, quotes: {}, reposts: {} }),
     );
     await this.api.put(
-      new PutRequest(container, Array.from(initialState), undefined, false, false),
+      new PutRequest(container, Array.from(initialState), new RelatedContractsT([]), false, false),
     );
   }
 
@@ -842,8 +861,13 @@ export class FreenetConnection {
         codeHashBytes ? Array.from(codeHashBytes) : [],
       );
       // Singleton: empty parameters (matches the contract's blake3(code || <>)).
-      const contract = new WasmContractV1(code, [], key);
-      const container = new ContractContainer(
+      // Packable key twin (the reader `key` has no .pack() — see putUserShard).
+      const keyT = shardContractKeyTFromParts(
+        codeHashBytes ?? new Uint8Array(0),
+        new Uint8Array(0),
+      );
+      const contract = new WasmContractV1T(code, [], keyT);
+      const container = new ContractContainerT(
         WasmContractType.WasmContractV1,
         contract,
       );
@@ -852,7 +876,7 @@ export class FreenetConnection {
       // user-shard's {posts:[]} Vec.
       const initialState = new TextEncoder().encode(JSON.stringify({ posts: {} }));
       await api.put(
-        new PutRequest(container, Array.from(initialState), undefined, false, false),
+        new PutRequest(container, Array.from(initialState), new RelatedContractsT([]), false, false),
       );
       this.globalIndexEnsured = true;
     })();
@@ -880,6 +904,13 @@ export class FreenetConnection {
       new DeltaUpdate(Array.from(deltaBytes)),
     );
     await this.api.update(new UpdateRequest(key, update));
+    // The boot-time loadGlobalIndex() subscribed to the singleton BEFORE this
+    // share instantiated it (a fresh network has no index until the first
+    // share), so that pre-instantiation subscription does not deliver this
+    // post's delta back. Re-load now: GET the just-instantiated singleton and
+    // re-subscribe, so the sharer sees their own post in Discover this session
+    // without a reload. Best-effort — the post is already published regardless.
+    this.loadGlobalIndex();
   }
 
   /**
