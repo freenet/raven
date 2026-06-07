@@ -488,6 +488,13 @@ echo "────────────────────────�
 description = "End-to-end PRODUCTION publish (use scripts/release.sh, not directly)"
 dependencies = [
     "build",
+    # Register the identity delegate on the production node. The delegate key
+    # the webapp targets is derived deterministically from the delegate wasm
+    # code hash, so re-registering each release is idempotent (same delegate
+    # id, identities preserved). WITHOUT this the live node has no delegate:
+    # GetIdentity/CreateIdentity get no reply, the app falls back to
+    # "Anonymous" and posts can never be signed (see PR fixing this).
+    "publish-identity",
     "update-published-contract-prod",
     "publish-webapp",
 ]
