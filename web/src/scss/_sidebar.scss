@@ -258,6 +258,12 @@
   color: var(--ink-3);
 }
 
+.sidebar-status__version {
+  color: var(--ink-4, var(--ink-3));
+  opacity: 0.65;
+  padding-left: 21px; // align text with the dotted rows above
+}
+
 .live-dot {
   width: 5px;
   height: 5px;

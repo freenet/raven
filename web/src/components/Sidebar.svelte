@@ -17,6 +17,11 @@
 
   let { onNavigate, onCompose, activeView, notifCount = 0 }: Props = $props();
 
+  // Build version baked at compile time from the git tag (see vite.config.ts).
+  // Shown bottom-left so a stale published-contract is visible at a glance.
+  const APP_VERSION: string =
+    typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "dev";
+
   const ICON_HOME = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
   <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
   <polyline points="9 22 9 12 15 12 15 22"/>
@@ -169,6 +174,9 @@
     </div>
     <div class="sidebar-status__row">
       <span class="live-dot live-dot--static"></span><span>{keyText}</span>
+    </div>
+    <div class="sidebar-status__row sidebar-status__version" title="Webapp build version">
+      <span>{APP_VERSION}</span>
     </div>
   </div>
 </aside>

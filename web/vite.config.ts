@@ -2,11 +2,31 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { readFileSync, existsSync } from "fs";
+import { execSync } from "child_process";
 import { resolve } from "path";
 
 function readFileOrDefault(filename: string, fallback: string): string {
   const filePath = resolve(__dirname, filename);
   return existsSync(filePath) ? readFileSync(filePath, "utf-8").trim() : fallback;
+}
+
+// Build version shown in the sidebar (mirrors freenet-email's version chip).
+// Source of truth is the latest git tag (releases are tagged vX.Y.Z); falls
+// back to the short commit hash, then "dev". A visible version stops us
+// chasing ghost bugs from a stale published-contract on one side.
+function buildVersion(): string {
+  const env = process.env.APP_VERSION;
+  if (env) return env.startsWith("v") ? env : `v${env}`;
+  try {
+    return execSync("git describe --tags --always --dirty", {
+      cwd: __dirname,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+  } catch {
+    return "dev";
+  }
 }
 
 export default defineConfig({
@@ -19,6 +39,7 @@ export default defineConfig({
     __DELEGATE_KEY_BYTES__: readFileOrDefault("delegate_key_bytes.json", "[]"),
     __DELEGATE_CODE_HASH_BYTES__: readFileOrDefault("delegate_code_hash_bytes.json", "[]"),
     __OFFLINE_MODE__: JSON.stringify(process.env.VITE_OFFLINE_MODE === "1"),
+    __APP_VERSION__: JSON.stringify(buildVersion()),
   },
   css: {
     preprocessorOptions: {
