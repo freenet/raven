@@ -5,6 +5,8 @@ import type {
   UpdateNotification,
 } from "@freenetorg/freenet-stdlib";
 import { UpdateDataType } from "@freenetorg/freenet-stdlib";
+import * as flatbuffers from "flatbuffers";
+import { buildShardPutRequest } from "./freenet-api";
 
 // ---------------------------------------------------------------------------
 // Mocking approach
@@ -974,6 +976,58 @@ describe("FreenetConnection", () => {
       expect(() => conn.loadGlobalIndex()).not.toThrow();
       // No FakeWsApi instance was created (connect not called) and thus no GET.
       expect(FakeWsApi.instances.length).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Shard PUT serialization (regression guard for the "field 8 must be set"
+  // bug, freenet/raven#56). Every browser-side shard instantiation goes through
+  // buildShardPutRequest(); if its container reverts to reader tables, or
+  // relatedContracts goes back to `undefined`, the PutRequest fails to
+  // SERIALIZE — which silently broke ALL post persistence. These pack the real
+  // request (no node) so a regression fails here instantly instead of only on
+  // the slow, flaky live-node round-trip.
+  // -------------------------------------------------------------------------
+  describe("buildShardPutRequest — serialization", () => {
+    // 32-byte code hash + representative params/state for each shard shape.
+    const codeHash = new Uint8Array(32).fill(7);
+    const wasm = new Uint8Array(64).fill(1);
+
+    function packs(req: ReturnType<typeof buildShardPutRequest>): number {
+      const builder = new flatbuffers.Builder(1024);
+      builder.finish(req.pack(builder));
+      return builder.asUint8Array().length;
+    }
+
+    it("packs a user-shard PUT (owner-VK params, {posts:[]} state)", () => {
+      const params = new Uint8Array(1952).fill(3); // ML-DSA-65 VK-sized
+      const state = new TextEncoder().encode(JSON.stringify({ posts: [] }));
+      expect(packs(buildShardPutRequest(wasm, codeHash, params, state))).toBeGreaterThan(0);
+    });
+
+    it("packs a thread-shard PUT (root-post-id params)", () => {
+      const params = new TextEncoder().encode("some-root-post-id");
+      const state = new TextEncoder().encode(
+        JSON.stringify({ replies: {}, likes: {}, quotes: {}, reposts: {} }),
+      );
+      expect(packs(buildShardPutRequest(wasm, codeHash, params, state))).toBeGreaterThan(0);
+    });
+
+    it("packs a global-index PUT (singleton, EMPTY params)", () => {
+      // The empty-params singleton is the case that most resembles the original
+      // bug shape; pinning it guards the field-8 regression specifically.
+      const params = new Uint8Array(0);
+      const state = new TextEncoder().encode(JSON.stringify({ posts: {} }));
+      expect(packs(buildShardPutRequest(wasm, codeHash, params, state))).toBeGreaterThan(0);
+    });
+
+    it("does not throw the 'field 8 must be set' flatbuffer error", () => {
+      // The exact failure the bug produced. Assert it never recurs for any of
+      // the three shard shapes.
+      for (const params of [new Uint8Array(0), new Uint8Array(32).fill(9)]) {
+        const state = new TextEncoder().encode("{}");
+        expect(() => packs(buildShardPutRequest(wasm, codeHash, params, state))).not.toThrow();
+      }
     });
   });
 });
