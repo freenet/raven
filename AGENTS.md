@@ -220,6 +220,10 @@ halves disagree and a peer can inject state the updater would never produce.
 
 ### Every write path verifies — there is no "trusted" delta (review CRITICAL, #27)
 
+Public-write shards (any party may submit an entry, which self-verifies on
+every path — see each contract's module doc): `thread-shard` and
+`inbox-shard`. `user-shard` is owner-writes only (VK-param match, below).
+
 A contract has multiple ways state enters it: `UpdateData::Delta`,
 `UpdateData::State` (a full-state merge), `StateAndDelta`, and any sync delta from
 `get_state_delta`. **All of them carry attacker-controlled bytes** — a peer can
