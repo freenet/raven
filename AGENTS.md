@@ -2,11 +2,12 @@
 
 ## Overview
 
-Decentralized Twitter/X-like microblogging application built on Freenet. Uses a
-TypeScript web UI with Vite, parameterized Rust WASM shard contracts (per-owner /
-per-thread) for posts/profile/follows/likes/notifications, an ML-DSA-65 identity
-delegate for signing, and the `@freenetorg/freenet-stdlib`
-TypeScript SDK for WebSocket communication with a Freenet node.
+Decentralized Twitter/X-like microblogging application built on Freenet. Svelte
+web UI (Vite), parameterized Rust WASM shard contracts (per-owner / per-thread)
+for posts/profile/follows/likes/notifications, an ML-DSA-65 identity delegate
+for signing, and the `@freenetorg/freenet-stdlib` TypeScript SDK for WebSocket
+communication with a Freenet node. Real UI source is under `web/src/` (Svelte
+components in `web/src/components/*.svelte`, entry point `web/src/main.ts`).
 
 ## Quick Reference
 
@@ -16,7 +17,7 @@ TypeScript SDK for WebSocket communication with a Freenet node.
 # Build
 cargo make build                # Full build: contracts + UI + web container
 cargo make build-contracts      # user/thread/inbox shards + identity (WASM + code hashes)
-cargo make build-ui             # Vite/TypeScript build (depends on build-contracts)
+cargo make build-ui              # Vite/TypeScript build (depends on build-contracts)
 cargo make build-web-container  # web/container Rust → WASM
 cargo make build-ui-offline     # Vite build with mock data (no Freenet node) — for CI
 
@@ -51,126 +52,10 @@ cargo make test-ui-playwright        # Run E2E suite
 cargo make run-node             # Local Freenet node
 ```
 
-### Repository Structure
-
-```
-freenet-microblogging/
-├── contracts/                  # Parameterized shard contracts (ADR-0001)
-│   ├── user-shard/             # Per-owner: posts, profile, follows (owner-writes)
-│   ├── thread-shard/           # Per-root-post: replies, likes, quotes (anyone-writes)
-│   └── inbox-shard/            # Per-owner: notifications (anyone-writes, owner-prunes)
-├── delegates/
-│   └── identity/               # Identity delegate (Rust → WASM)
-│       ├── src/lib.rs          # ML-DSA-65 keypair, post/like signing
-│       ├── Cargo.toml
-│       └── freenet.toml
-├── web/                        # TypeScript web frontend
-│   ├── index.html              # App entry point (Vite serves this)
-│   ├── vite.config.ts          # Vite bundler config
-│   ├── src/
-│   │   ├── index.ts            # Entry: mounts app shell
-│   │   ├── app.ts              # App shell: assembles 3-column layout
-│   │   ├── types.ts            # Post, User, TrendingTopic interfaces
-│   │   ├── mock-data.ts        # Mock posts/users for development
-│   │   ├── theme.ts            # Dark/light mode toggle
-│   │   ├── utils.ts            # formatRelativeTime helper
-│   │   ├── vite-env.d.ts       # Vite type declarations
-│   │   ├── components/
-│   │   │   ├── sidebar.ts      # Logo, nav, theme toggle, post CTA
-│   │   │   ├── feed.ts         # Tab bar, compose, post list, filtering
-│   │   │   ├── compose-box.ts  # Textarea, char counter, post button
-│   │   │   ├── post-card.ts    # Post card with actions, timestamps
-│   │   │   ├── right-panel.ts  # Search, trending, who-to-follow
-│   │   │   └── bottom-nav.ts   # Mobile bottom navigation
-│   │   └── scss/
-│   │       ├── styles.scss     # Main entry (imports all partials)
-│   │       ├── _variables.scss # CSS custom properties (design tokens)
-│   │       ├── _reset.scss     # Minimal reset
-│   │       ├── _layout.scss    # 3-column grid
-│   │       ├── _sidebar.scss   # Sidebar styles
-│   │       ├── _feed.scss      # Feed, compose, post cards
-│   │       ├── _right-panel.scss # Trending, follow cards
-│   │       ├── _buttons.scss   # Button variants
-│   │       ├── _dark-mode.scss # Dark mode overrides
-│   │       └── _responsive.scss # Mobile/tablet breakpoints
-│   ├── container/              # Web contract container (Rust → WASM)
-│   │   └── src/lib.rs
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── freenet.toml
-├── Cargo.toml                  # Workspace root
-├── Makefile.toml               # Build orchestration (cargo-make)
-├── DESIGN.md                   # Visual design system specification
-├── CLAUDE.md                   # → points to this file
-└── AGENTS.md                   # This file (single source of truth)
-```
-
-### Key Dependencies
-
-| Dependency | Purpose |
-|-----------|---------|
-| `@freenetorg/freenet-stdlib` | Freenet TypeScript SDK — WebSocket API, FlatBuffers types |
-| `vite` | Build tool and dev server |
-| `vitest` | Test runner |
-| `typescript` | Language |
-| `sass` | SCSS compilation |
-| `freenet-stdlib` (Rust) | Contract/delegate traits, WASM macros |
-| `ml-dsa` (Rust) | ML-DSA-65 (FIPS 204) signing for identity delegate + records |
-| `freenet` (cargo) | Freenet node binary |
-| `fdev` (cargo) | Freenet developer tools (build, publish, inspect) |
-
-### Architecture
-
-- **Shard contracts** (`contracts/{user,thread,inbox}-shard/`): Rust WASM CRDTs,
-  each parameterized (owner VK or root post id) so its key is
-  `blake3(code_hash || parameters)` and it is instantiated on demand by the web
-  app. user-shard = owner-writes posts/profile/follows; thread-shard =
-  anyone-writes replies/likes/quotes (self-verifying records); inbox-shard =
-  anyone-writes notifications, owner-prunes. All merges commutative. See
-  ADR-0001.
-
-- **Identity Delegate** (`delegates/identity/`): Runs locally on user's device.
-  Generates/stores an ML-DSA-65 keypair via Freenet's encrypted secret storage.
-  Signs posts and likes on request (canonical payloads built by the `common`
-  crate). Communicates with web UI via ApplicationMessage.
-
-- **Web Container** (`web/container/`): Minimal Rust WASM contract serving the
-  compiled web app as a Freenet webapp.
-
-- **Web App** (`web/src/`): TypeScript SPA with Vite. Twitter/X-like 3-column
-  layout (sidebar / feed / right panel). Components: sidebar nav, compose box
-  with 280-char limit, post cards with like/repost/reply actions, trending
-  topics, who-to-follow suggestions, dark mode toggle, responsive design with
-  mobile bottom nav and FAB.
-
-### Build Flow
-
-```
-contracts/{user,thread,inbox}-shard/src/lib.rs
-    → fdev build → WASM
-    → fdev inspect → code hash → build/<name>_shard_code_hash
-    (user + thread shards: raw WASM mirrored to web/public/<name>.wasm + code hash
-     to web/<name>_shard_code_hash.txt, via scripts/mirror-shard-wasm.sh, which
-     also asserts b3sum(raw wasm) == code hash. The app PUTs these to instantiate
-     per-owner/per-thread instances and injects the hashes via vite.config.ts.)
-
-delegates/identity/src/lib.rs
-    → fdev build --package-type delegate → WASM
-    → b3sum-derived delegate key → web/delegate_key{,_bytes,_code_hash_bytes}.{txt,json}
-
-web/src/index.ts
-    → vite build (defines: __MODEL_CONTRACT__, __DELEGATE_KEY__, __OFFLINE_MODE__)
-    → web/dist/
-
-web/dist
-    → cargo make compress-webapp → target/webapp/webapp.tar.xz (GNU tar, fixed mtime)
-    → cargo make sign-webapp{,-test} → webapp.metadata + webapp.parameters
-    → cargo make update-published-contract{,-prod} → published-contract/{wasm,parameters,contract-id.txt}
-    → cargo make publish-webapp{,-test} → fdev publish (against committed snapshot)
-```
-
-The `published-contract/` directory is committed. CI verifies it matches HEAD.
-Production releases bump the snapshot via `scripts/release.sh`.
+The Makefile also defines `build-facade`, `build-global-index-shard`,
+`publish-facade*` and related targets for contracts under `contracts/facade*`
+and `contracts/global-index-shard/` — those subsystems exist in the repo but
+aren't documented here; read `Makefile.toml` directly for their commands.
 
 ### Releasing
 
@@ -181,8 +66,8 @@ scripts/release.sh 0.1.0
 ```
 
 Three confirmation gates. Idempotent up to the commit step. The committed
-`published-contract/` snapshot is what CI and downstream consumers verify
-against, not freshly built artifacts.
+`published-contract/` snapshot (CI-verified against HEAD) is what downstream
+consumers verify against, not freshly built artifacts.
 
 ### Testing
 
@@ -194,12 +79,7 @@ cargo test -p freenet-microblogging-inbox-shard    # Inbox shard contract
 cd web && npm test                                 # Web app (Vitest)
 ```
 
-### Environment Requirements
-
-- `CARGO_TARGET_DIR` must be set (required by Makefile.toml)
-- Node.js and npm for web app
-- Rust toolchain with `wasm32-unknown-unknown` target
-- `freenet` and `fdev` CLI tools (`cargo install freenet fdev`)
+`CARGO_TARGET_DIR` must be set — required by `Makefile.toml`.
 
 ## Contract migration
 
@@ -340,6 +220,10 @@ halves disagree and a peer can inject state the updater would never produce.
 
 ### Every write path verifies — there is no "trusted" delta (review CRITICAL, #27)
 
+Public-write shards (any party may submit an entry, which self-verifies on
+every path — see each contract's module doc): `thread-shard` and
+`inbox-shard`. `user-shard` is owner-writes only (VK-param match, below).
+
 A contract has multiple ways state enters it: `UpdateData::Delta`,
 `UpdateData::State` (a full-state merge), `StateAndDelta`, and any sync delta from
 `get_state_delta`. **All of them carry attacker-controlled bytes** — a peer can
@@ -375,9 +259,8 @@ un-parameterized shard accepts nothing — a safe default, not a footgun).
 - WebSocket URL pattern: `ws://{host}/contract/command`
 - Contract keys derived from instance ID via `ContractKey.fromInstanceId()`
 - CSS follows BEM naming: `block__element--modifier`
-- SCSS uses CSS custom properties (design tokens) defined in `_variables.scss`
+- SCSS uses CSS custom properties (design tokens) defined in `web/src/scss/_variables.scss`
 - Dark mode via `[data-theme="dark"]` attribute on `<html>`
-- UI components are pure TypeScript DOM functions (no framework)
 - Posts limited to 280 characters (validated in contract + UI)
 - ML-DSA-65 (FIPS 204, post-quantum) signatures for post/op authenticity (via
   identity delegate); see ADR-0001 Phase 0. (Was Ed25519 in the prototype.)
