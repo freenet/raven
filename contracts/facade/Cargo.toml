@@ -27,7 +27,7 @@ freenet-microblogging-facade-types = { path = "../facade-types" }
 
 [dev-dependencies]
 ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
-rand = { version = "=0.8.5", features = ["std_rng", "getrandom"] }
+rand = { version = "=0.8.6", features = ["std_rng", "getrandom"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -39,7 +39,7 @@ freenet-main-contract = []
 trace = ["freenet-stdlib/trace"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rand = "=0.8.5"
+rand = "=0.8.6"
 
 # Mirror the workspace-root release profile EXACTLY. The facade builds in its
 # own workspace, so these settings are not inherited — if they drift from the
